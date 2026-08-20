@@ -40,6 +40,17 @@ eligible-for-prototype list, so no grading credit for coding them.
 - Write tests for PII filtering and delete confirmation first.
 - Ask before adding a dependency.
 
+## Git workflow
+- Never commit or push directly to `main`. All work happens on a feature
+  branch created off up-to-date `main` (e.g. `feat/pii-masking`,
+  `fix/query-timeout`).
+- Merge back into `main` with a simple merge (`git merge --no-ff` or a
+  fast-forward via PR) — no rebasing/squashing history unless asked.
+- Always ask for explicit confirmation before running `git commit`,
+  `git push`, or any merge into `main`. Show what will be committed/merged
+  first (diff or file list); don't bundle the confirmation into a single
+  "ok to do all of this?" for unrelated steps.
+
 ## Provided code
 `src/provided/bq_runner.py` was supplied by the company. Keep it as-is.
 Build our BigQuery tool as a wrapper around it that adds: SQL read-only check,
