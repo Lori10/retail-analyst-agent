@@ -1,0 +1,30 @@
+[project]
+name = "retail-agent"
+version = "0.1.0"
+description = "Add your description here"
+authors = [
+    { name = "Lorenc Zhuka", email = "lorenczhuka28@yahoo.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "db-dtypes>=1.7.1",
+    "google-cloud-bigquery>=3.43.0",
+    "google-genai>=2.19.0",
+    "langchain-core>=1.6.0",
+    "langgraph>=1.2.11",
+    "pandas>=3.0.5",
+    "pyarrow>=25.0.1",
+    "python-dotenv>=1.2.3",
+]
+
+[project.scripts]
+retail-agent = "retail_agent:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

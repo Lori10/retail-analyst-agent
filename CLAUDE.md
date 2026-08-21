@@ -11,8 +11,12 @@ Design decisions and HLD live in @docs/design.md (source of truth; update it whe
   conversation state — not added decoratively.
 - Data: BigQuery public dataset `bigquery-public-data.thelook_ecommerce`
   (orders, order_items, products, users). Read-only. Never SELECT * from users.
-- PII columns (email, first_name, last_name, street_address, latitude, longitude)
-  must never appear in any output to the user.
+- PII columns (email, first_name, last_name, street_address, latitude,
+  longitude, postal_code, user_geom) must never appear in any output to the
+  user. The last two were found by inspecting the live `users` schema — not
+  in the assignment brief's original list, added because `user_geom`
+  (GEOGRAPHY) is a direct point encoding of the same location `latitude`/
+  `longitude` carry, and `postal_code` is a standard quasi-identifier.
 - CLI chat interface. No web UI.
 - Budget: up to ~1 week (per recruiter; original ~10h estimate was wrong).
   Prefer simple and working over clever — the longer budget buys more coded

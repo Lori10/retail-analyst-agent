@@ -1,0 +1,11 @@
+*:Zone.Identifier
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+*.db
+*.sqlite3
+retail_agent.log

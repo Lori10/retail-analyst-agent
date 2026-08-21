@@ -43,7 +43,7 @@ flowchart TB
 
     subgraph Obs["Observability"]
         Logs["Structured Logs\nCloud Logging (prod) /\nJSON file (prototype)"]
-        Trace["Traces\nCloud Trace via OpenTelemetry (prod)"]
+        Trace["LLM/Agent Tracing\nLangfuse (prod, self-hosted) —\nnative LangGraph callback"]
         Dash["Dashboards & Alerts\nCloud Monitoring (prod)"]
     end
 
@@ -106,12 +106,31 @@ an IAM read-only role on the service account as the real backstop — an AST
 parser was considered and rejected as over-building against a threat model
 IAM already covers; `dry_run=True` plus a ~1GB max-bytes cap (generous
 against thelook_ecommerce's actual table sizes, well under the 1TB/month
-free tier); a query timeout; a row limit; PII column stripping via an
-**allow-list** (not a deny-list), so a newly added sensitive column on the
-underlying table fails closed instead of silently leaking; and typed error
-classification (syntax/bad-request, permission, transient/timeout,
+free tier); a query timeout; a row limit; PII column stripping applied
+post-execution, matching each returned column's bare name (case-insensitive,
+table-qualifier stripped) against a maintained PII field registry — and typed
+error classification (syntax/bad-request, permission, transient/timeout,
 empty-result) so the orchestrator can decide retry vs. self-correct vs.
 give-up instead of re-parsing a bare exception.
+
+This is name-based matching, not a true schema-driven allow-list: it can't
+tell that `first_name AS x` is PII once renamed, and it doesn't
+automatically catch a column added to the live schema tomorrow that isn't
+in the registry yet. Both gaps are accepted trade-offs, not oversights — a
+real allow-list (only pass through columns from a pre-approved safe list)
+would also silently drop legitimate computed/aggregated columns
+(`SUM(sale_price) AS total_revenue`), which an analysis agent needs to
+return constantly, so it isn't viable here without full SQL parsing (which
+§3 already rejects as over-building). The renaming gap is covered by
+defense-in-depth (the input-side guardrail and the IAM read-only role), not
+by this function. The registry itself was verified against the live
+`users` schema during prototype development, not just typed from the brief
+— that check caught two columns absent from the assignment's original PII
+list (`postal_code`, `user_geom`, a GEOGRAPHY point encoding the same
+location `latitude`/`longitude` carry) before they could leak, which is
+exactly the schema-drift scenario this control needs to survive; in
+production this check should be a scheduled job diffing the live schema
+against the registry, not a one-time manual pass.
 
 **Golden Bucket.** Question embedded at query time (`text-embedding-004`),
 top-k (e.g. k=3) cosine/ANN retrieval against Vertex AI Vector Search
@@ -147,11 +166,26 @@ This is the concrete mechanism for "CEO changes tone weekly, no redeploy"
 **Observability.** One structured JSON log line per LLM call / tool call /
 turn (conversation_id, user, intent, sql, rows_returned, tokens,
 latency_ms, error_class, self_correct_attempt). Prototype writes this shape
-to stdout/a local file; production ships the identical shape to Cloud
-Logging, with Cloud Trace (via OpenTelemetry) providing the cross-call
-trace view and Cloud Monitoring dashboards/alerts on error rate,
-self-correct rate, latency, PII-block rate, delete-confirmation rate, and
-daily cost.
+to stdout/a local file — this is the coded, zero-setup mechanism a reviewer
+can see just by running the CLI, and it's what satisfies requirement 7 in
+the prototype. Production ships the identical log shape to Cloud Logging
+(metrics/alerting substrate) *and* adds real cross-call conversation
+tracing via **Langfuse**, chosen specifically because it plugs into
+LangGraph as a native callback handler — no hand-rolled OpenTelemetry spans
+needed, since the orchestration framework already emits everything a
+tracer needs. Self-hosted Langfuse over LangSmith: this system already
+treats PII as something that must never leave its boundary, and a trace of
+prompts/SQL/tool output is exactly the kind of payload you don't want
+handed to a third-party SaaS by default; self-hosting keeps trace data in
+the same infra boundary as everything else. (LangSmith remains a valid
+alternative if the org already has LangChain-ecosystem buy-in.) Whatever
+tracer is used, it must trace **post-PII-strip** data only — tracing raw
+BigQuery output would reopen the exact leak the wrapper's PII stripping
+closes. Cloud Monitoring dashboards/alerts sit on top of the Cloud Logging
+stream for error rate, self-correct rate, latency, PII-block rate,
+delete-confirmation rate, and daily cost; Langfuse covers the
+conversation-level "what exactly happened in this exchange" deep-dive that
+raw metrics can't.
 
 ## 4. Data Flow
 
@@ -201,13 +235,18 @@ the agent reinforcing its own errors.
 
 **2. Safety & PII Masking (primary, coded).** Two independent layers: an
 input-side guardrail rejects off-topic/malicious requests before any tool
-call happens, and an output-side hard control — allow-list column
-stripping in the BQ wrapper — guarantees PII never leaves the wrapper even
-if the guardrail is bypassed and the LLM generates a query touching PII
-columns. Allow-list beats deny-list specifically because it fails closed on
-schema changes. Defense in depth: the read-only SQL check and the
-service account's IAM read-only role are independent backstops against a
-malicious or buggy query in the first place.
+call happens, and an output-side hard control — name-based PII column
+stripping in the BQ wrapper (§3) — guarantees known-PII columns never leave
+the wrapper even if the guardrail is bypassed and the LLM generates a query
+touching them. This caught a real gap during prototype development: the
+live `users` schema has two sensitive columns (`postal_code`, `user_geom`)
+absent from the assignment's original PII list, found by inspecting the
+schema directly rather than trusting the brief's list as complete — see §3
+for the full reasoning on why this is name-based matching, not a true
+allow-list, and what that trade-off does and doesn't cover. Defense in
+depth: the read-only SQL check and the service account's IAM read-only role
+are independent backstops against a malicious or buggy query in the first
+place.
 
 **3. High-Stakes Oversight (secondary, coded).** See delete path in §4.
 The resolve-then-list-then-confirm shape is the actual safeguard;
@@ -240,10 +279,14 @@ captures — turns-to-answer, clarification-request rate, self-correct
 rate, delete-confirmation abandonment rate — rather than a separate survey
 mechanism.
 
-**7. Observability (secondary, coded).** See §3. Because every log line
-carries `conversation_id`, a full exchange (every LLM call, tool call, and
-outcome) can be reconstructed by filtering on it — the concrete mechanism
-for "understand what went wrong in this exact exchange."
+**7. Observability (secondary, coded).** See §3. In the prototype: because
+every log line carries `conversation_id`, a full exchange (every LLM call,
+tool call, and outcome) can be reconstructed by filtering the JSON log —
+the concrete mechanism for "understand what went wrong in this exact
+exchange," and it requires nothing beyond running the CLI to inspect. In
+production, the same reconstruction is a Langfuse trace view rather than a
+log grep, since Langfuse attaches to LangGraph's own execution graph and
+needs no extra instrumentation code per call site.
 
 **8. Agility / Persona Management (docs-only, small prototype add if time
 allows).** See Persona Config in §3. A CEO-requested tone change ships by
@@ -258,19 +301,25 @@ data rather than a separate instrumentation surface.
 
 ## 8. Setup Instructions & Example Run
 
-*(Draft — will be finalized once `src/` is scaffolded against §9's coded
-scope.)*
-
 ```bash
 # Prerequisites: Python 3.11, uv, a GCP project with BigQuery API enabled
 gcloud auth application-default login
-export GOOGLE_CLOUD_PROJECT=<your-project-id>
-export GEMINI_API_KEY=<your-key>          # AI Studio key
-export OPENROUTER_API_KEY=<your-key>      # optional, fallback provider
+cp .env.example .env   # fill in GOOGLE_CLOUD_PROJECT and GEMINI_API_KEY
+# or export them directly — .env is picked up automatically (python-dotenv),
+# but real environment variables always take precedence over it.
 
 uv sync
 uv run retail-agent
 ```
+
+Optional env vars (defaults shown): `GEMINI_MODEL=gemini-3.6-flash`,
+`BQ_MAX_BYTES_BILLED=1000000000` (~1GB), `BQ_ROW_LIMIT=500`,
+`BQ_QUERY_TIMEOUT_SECONDS=30`.
+
+`OPENROUTER_API_KEY` / fallback wiring lands in the resilience-depth slice
+(build order step 2), not the current skeleton.
+
+Run the test suite: `uv run pytest`.
 
 Example session:
 
@@ -293,12 +342,12 @@ Agent: Deleted.
 | Requirement | Prototype (coded) | Production (design only) |
 |---|---|---|
 | 1. Hybrid Intelligence | Docs only | Vertex AI Vector Search, human-curated updates |
-| 2. Safety & PII Masking | **Coded** — guardrail + allow-list stripping | Same, at scale |
+| 2. Safety & PII Masking | **Coded** — guardrail + name-based PII stripping (schema-verified) | Same, at scale |
 | 3. High-Stakes Oversight | **Coded** — SQLite store + interrupt-based confirm | Cloud SQL, same flow |
 | 4. Continuous Improvement | Docs only | Firestore preference store; human-gated system learning |
 | 5. Resilience & Error Handling | **Coded** — typed errors, self-correct, backoff, circuit breaker | Same, at scale |
 | 6. Quality Assurance | **Coded** — golden eval set + scoring script | Same + judge-drift audits |
-| 7. Observability | **Coded** — structured JSON logs | Cloud Logging + Trace + Monitoring dashboards/alerts |
+| 7. Observability | **Coded** — structured JSON logs (stdout/file); optional Langfuse callback as a stretch add | Cloud Logging + Monitoring dashboards/alerts + Langfuse (self-hosted) for conversation-level tracing |
 | 8. Agility (Persona) | Docs only (or `persona.yaml` if time allows) | Firestore/Cloud Storage config, admin surface |
 
 5 of 8 requirements are coded (all 5 eligible for the prototype per the
