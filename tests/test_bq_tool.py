@@ -30,18 +30,11 @@ class FakeClient:
         return FakeJob(rows=self.rows)
 
 
-class FakeRunner:
-    def __init__(self, client):
-        self.client = client
-        self.dataset_id = "bigquery-public-data.thelook_ecommerce"
-
-
 def _make_tool(*, dry_run_bytes=100, rows=None, max_bytes_billed=1_000_000_000):
     if rows is None:
         rows = pd.DataFrame({"id": [1], "total_revenue": [10.0]})
     client = FakeClient(dry_run_bytes=dry_run_bytes, rows=rows)
-    runner = FakeRunner(client)
-    tool = BigQueryTool(runner=runner, max_bytes_billed=max_bytes_billed, row_limit=100, timeout_seconds=5)
+    tool = BigQueryTool(client=client, max_bytes_billed=max_bytes_billed, row_limit=100, timeout_seconds=5)
     return tool, client
 
 

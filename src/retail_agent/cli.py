@@ -1,9 +1,9 @@
 import sys
 
 from google.auth.exceptions import DefaultCredentialsError
+from google.cloud import bigquery
 from google.genai import types
 
-from provided.bq_runner import BigQueryRunner
 from retail_agent.bq_tool import BigQueryTool
 from retail_agent.config import ConfigError, load_config
 from retail_agent.errors import AgentError
@@ -34,7 +34,7 @@ def _response_text(content: types.Content) -> str:
 
 def _build_graph(config):
     try:
-        runner = BigQueryRunner(project_id=config.project_id)
+        client = bigquery.Client(project=config.project_id)
     except DefaultCredentialsError as exc:
         raise StartupError(
             "No Google Cloud credentials found. Run "
@@ -44,7 +44,7 @@ def _build_graph(config):
         raise StartupError(f"Could not connect to BigQuery: {exc}") from exc
 
     bq_tool = BigQueryTool(
-        runner=runner,
+        client=client,
         max_bytes_billed=config.max_bytes_billed,
         row_limit=config.row_limit,
         timeout_seconds=config.query_timeout_seconds,

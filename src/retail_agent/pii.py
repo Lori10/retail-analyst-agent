@@ -34,5 +34,5 @@ def strip_pii_columns(df):
 
 
 def strip_pii_schema(schema):
-    """schema: list[dict] as returned by BigQueryRunner.get_table_schema."""
+    """schema: list[dict] as returned by BigQueryTool.get_schema's field lookup."""
     return [field for field in schema if field["name"].lower() not in PII_COLUMNS]
