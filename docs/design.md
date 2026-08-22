@@ -81,24 +81,26 @@ failures/timeouts, with a cooldown before retrying Gemini — this is the
 concrete mechanism for "resilient to 3rd-party service downtime"
 (requirement 5).
 
-**BigQuery tool wrapper.** Built around the company-supplied
-`src/provided/bq_runner.py`, left unmodified per constraint. That file is a
-thin, trusted-caller client with no cost, safety, PII, or resilience
-behavior — verified by reading it directly:
+**BigQuery tool wrapper.** `src/provided/bq_runner.py` was supplied by the
+company as an example of how to query BigQuery, not a required dependency —
+it's left in the repo unused. `BigQueryTool` owns a `bigquery.Client`
+directly instead of wrapping it. The raw client (and `bq_runner.py` alike,
+since it's a thin pass-through over the same client) has no cost, safety,
+PII, or resilience behavior:
 
 - *Cost*: no dry-run/bytes estimate, no max-bytes cap, no row limit
-  (`.to_dataframe()` pulls the full result set), no timeout on
+  (an unbounded `.to_dataframe()` pulls the full result set), no timeout on
   `query_job.result()` — a runaway query has no ceiling and can hang.
-- *Safety*: `sql_query` is passed straight to `client.query()` with no
+- *Safety*: SQL is passed straight to `client.query()` with no
   statement-type check — nothing stops DML/DDL or multi-statement input at
   the application layer.
-- *PII*: `execute_query` returns whatever columns are selected, verbatim,
-  with no masking; `get_table_schema` exposes PII column names/types with
+- *PII*: query results return whatever columns are selected, verbatim,
+  with no masking; schema lookups expose PII column names/types with
   no sensitivity flag.
-- *Resilience*: both methods use a blanket `except Exception: log; raise`,
-  collapsing syntax errors, permission errors, quota errors, and transient
-  network failures into one shape — a caller can't tell "retry" from "fix
-  the SQL" from "give up" without re-parsing the raw exception.
+- *Resilience*: a bare client call raises whatever the underlying library
+  raises, collapsing syntax errors, permission errors, quota errors, and
+  transient network failures into one shape — a caller can't tell "retry"
+  from "fix the SQL" from "give up" without re-parsing the raw exception.
 
 The wrapper therefore adds: a SQL read-only keyword/regex allowlist
 (SELECT/WITH only, reject DML/DDL keywords and multi-statement input) with
@@ -210,7 +212,7 @@ only the delete itself does, keeping the added friction to one turn.
 ## 5. Error Handling & Fallback Strategies
 
 - The BQ wrapper raises typed errors instead of bare exceptions, fixing the
-  `bq_runner.py` gap described in §3.
+  raw-client gap described in §3.
 - **Syntax/bad-request** → the error text is fed back to the LLM, bounded
   to 2 self-correct retries, then a graceful "couldn't produce a valid
   query" message — never a raw stack trace, never an unbounded retry loop
