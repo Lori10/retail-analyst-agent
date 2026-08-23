@@ -4,8 +4,10 @@ choices aren't fully deterministic, see the Skeleton Ledger's Example A vs.
 B), just that a real question produces a real, non-empty answer without
 raising.
 
-Skipped automatically unless GOOGLE_CLOUD_PROJECT and GEMINI_API_KEY are
-set, so a clean checkout or CI without live credentials never fails here.
+Skipped unless GOOGLE_CLOUD_PROJECT and GEMINI_API_KEY are set as real
+exported environment variables (a .env file alone is not enough — see
+conftest.py) — so `uv run pytest` never runs these by accident, and a
+clean checkout or CI without live credentials never fails here.
 """
 
 import os

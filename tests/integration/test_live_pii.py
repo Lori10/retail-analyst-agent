@@ -7,8 +7,10 @@ postal_code/user_geom were missing from the PII registry until a live
 schema dump surfaced them, and the default_dataset bug only showed up
 against a real query. This suite re-runs that exact class of check.
 
-Skipped automatically unless GOOGLE_CLOUD_PROJECT and GEMINI_API_KEY are
-set, so a clean checkout or CI without live credentials never fails here.
+Skipped unless GOOGLE_CLOUD_PROJECT and GEMINI_API_KEY are set as real
+exported environment variables (a .env file alone is not enough — see
+conftest.py) — so `uv run pytest` never runs these by accident, and a
+clean checkout or CI without live credentials never fails here.
 """
 
 import os
