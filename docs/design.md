@@ -62,6 +62,37 @@ flowchart TB
     Trace --> Dash
 ```
 
+## 2a. Current Graph Structure (generated, not hand-drawn)
+
+The diagram above is the production system architecture — most of it
+(Golden Bucket, Reports store, Persona config) isn't coded yet. This one is
+different in kind: it's Mermaid syntax read directly off the real compiled
+`StateGraph` in `graph.py` via `graph.get_graph().draw_mermaid()`, so it
+shows exactly what's running today, not an aspiration, and can't drift out
+of sync with the code the way a hand-drawn diagram could. Regenerate it
+with `uv run python scripts/render_graph.py` any time the graph changes —
+step 3 (the delete-confirmation `interrupt()`) will add nodes here.
+
+```mermaid
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	call_model(call_model)
+	tools(tools)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> call_model;
+	call_model -.-> __end__;
+	call_model -.-> tools;
+	tools --> call_model;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
+```
+
 ## 3. Component Reasoning
 
 **Orchestrator — LangGraph.** Chosen over a hand-rolled loop because two
