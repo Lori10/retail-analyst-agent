@@ -321,7 +321,15 @@ Optional env vars (defaults shown): `GEMINI_MODEL=gemini-3.6-flash`,
 `OPENROUTER_API_KEY` / fallback wiring lands in the resilience-depth slice
 (build order step 2), not the current skeleton.
 
-Run the test suite: `uv run pytest`.
+Run the test suite: `uv run pytest`. This runs only the unit tests by
+default. `tests/integration/` — live regression checks against real
+BigQuery/Gemini (PII stripping holds even when explicitly selected, and
+one end-to-end smoke question) — deliberately requires
+`GOOGLE_CLOUD_PROJECT`/`GEMINI_API_KEY` as real *exported* environment
+variables, not just values in `.env`, so `uv run pytest` never silently
+runs live, billed calls just because `.env` happens to be configured for
+the CLI. To run them explicitly:
+`set -a && source .env && set +a && uv run pytest tests/integration`.
 
 Example session:
 
