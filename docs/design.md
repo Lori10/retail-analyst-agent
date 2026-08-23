@@ -68,10 +68,9 @@ The diagram above is the production system architecture — most of it
 (Golden Bucket, Reports store, Persona config) isn't coded yet. This one is
 different in kind: it's Mermaid syntax read directly off the real compiled
 `StateGraph` in `graph.py` via `graph.get_graph().draw_mermaid()`, so it
-shows exactly what's running today, not an aspiration, and can't drift out
-of sync with the code the way a hand-drawn diagram could. Regenerate it
-with `uv run python scripts/render_graph.py` any time the graph changes —
-step 3 (the delete-confirmation `interrupt()`) will add nodes here.
+shows exactly what's running today, not an aspiration. Regenerate it with
+`uv run python scripts/render_graph.py` any time the graph changes — step 3
+(the delete-confirmation `interrupt()`) will add nodes here.
 
 ```mermaid
 ---
@@ -92,6 +91,17 @@ graph TD;
 	classDef first fill-opacity:0
 	classDef last fill:#bfb6fc
 ```
+
+- **`call_model`** — sends the running message history plus the tool
+  schemas to Gemini and appends whatever comes back (text, a tool call, or
+  both).
+- **`tools`** — executes every tool call in the latest model message
+  against `BigQueryTool` and appends the results as `FunctionResponse`s.
+- **Solid edges** (`__start__ → call_model`, `tools → call_model`) always
+  fire. **Dashed edges** out of `call_model` are the conditional routing in
+  `route_after_model`: to `tools` if the model's reply contains a function
+  call, to `__end__` otherwise — this is the "LangGraph" orchestrator loop
+  described in §3.
 
 ## 3. Component Reasoning
 
