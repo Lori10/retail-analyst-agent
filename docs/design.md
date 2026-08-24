@@ -291,6 +291,21 @@ Coded (`errors.py`, `bq_tool.py`, `graph.py`, `llm_provider.py`,
 isinstance checks, and `errors.graceful_message_for(...)` is the single
 place user-facing copy for a failure class lives.
 
+Two independent retry mechanisms exist below, and they share vocabulary
+("transient," "retry") on purpose, since both describe the same real-world
+condition — worth naming up front so they never read as contradicting each
+other: **backoff** (inside `bq_tool.py`/the providers, via
+`resilience.bounded_backoff`) retries the *same* call automatically when
+the client's raw exception looks transient. **Self-correct** (in
+`graph.py`, gated by `self_correctable`) lets the *model* retry with a
+*different* query, only after a typed error reaches the graph. A
+`QueryTransientError`/`ProviderTransientError` is a case where the first
+already ran, twice, and failed both times — which is exactly why the
+second is `self_correctable = False` for it: not a contradiction, two
+different questions ("is retrying this call worth attempting at all" vs.
+"would a *different* query fix it") answered differently for the same
+failure, at two different points in the pipeline.
+
 - The BQ wrapper raises typed errors instead of bare exceptions, fixing the
   raw-client gap described in §3: `QuerySyntaxError` (BigQuery
   `BadRequest`/`NotFound`/`Conflict`), `QueryPermissionError`
@@ -319,17 +334,30 @@ place user-facing copy for a failure class lives.
   `FunctionResponse` asking the model to sanity-check its own filters/joins
   before accepting "zero rows" as the real answer, but a second zero-row
   result in the same turn is accepted rather than looping.
-- **Transient/timeout** (`QueryTransientError` from BigQuery,
-  `ProviderTransientError` from either LLM provider) → exponential backoff,
-  2 attempts total, via a shared `resilience.bounded_backoff(...)`
-  (`tenacity`-based) wrapper used identically in `bq_tool.py` and both
-  provider classes. This retry is entirely internal to the failing
-  component — the graph never sees it. If both attempts fail, the typed
-  transient error reaches the graph and is treated as **not**
-  self-correctable (a third identical attempt via the model can't succeed
-  where backoff already failed twice) — `QueryTransientError` routes to
-  `give_up`; `ProviderTransientError` propagates out of `graph.invoke()`
-  entirely (see next bullet).
+- **Transient/timeout** (backoff layer) → exponential backoff, 2 attempts
+  total, via a shared `resilience.bounded_backoff(...)` (`tenacity`-based)
+  policy used at all three retry sites (`bq_tool.py`, `llm_provider.py`,
+  `openrouter_provider.py`), entirely internal to the failing component —
+  the graph never sees a retry happen. The retry condition and the
+  classification step are deliberately separate: each site wraps a private
+  `_call_bq_raw`/`_generate_raw` helper that retries on the client's own
+  raw exception signal — a type tuple for `bq_tool.py` and
+  `openrouter_provider.py`, since `google.api_core.exceptions` and the
+  `openai` SDK both raise a distinct type per failure category, or a
+  `tenacity.retry_if_exception` predicate for `llm_provider.py`, since
+  `google.genai.errors` lumps every 4xx into one `ClientError` type and
+  every 5xx into one `ServerError` type, distinguishable only by a `.code`
+  attribute. Classification into the typed `AgentError` vocabulary happens
+  exactly once, in the public `_call_bq`/`generate` method, only after
+  retries are resolved one way or the other — not inside the retried call
+  itself, which would either log a failure that later succeeds on retry, or
+  make the retry condition match a synthetic type this codebase invented
+  rather than the client's real one.
+- **Transient/timeout** (self-correct layer) → once backoff is exhausted,
+  the typed `QueryTransientError`/`ProviderTransientError` reaches the
+  graph already `self_correctable = False` — `QueryTransientError` routes
+  straight to `give_up`; `ProviderTransientError` propagates out of
+  `graph.invoke()` entirely (see next bullet).
 - **LLM provider failure** → `ProviderCircuitBreaker` (in front of
   `call_model`, constructed in `cli.py` only when `OPENROUTER_API_KEY` is
   set) counts consecutive Gemini failures; at `PROVIDER_FAILURE_THRESHOLD`
