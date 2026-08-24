@@ -1,3 +1,4 @@
+import logging
 import sys
 
 from google.auth.exceptions import DefaultCredentialsError
@@ -5,10 +6,12 @@ from google.cloud import bigquery
 from google.genai import types
 
 from retail_agent.bq_tool import BigQueryTool
+from retail_agent.circuit_breaker import ProviderCircuitBreaker
 from retail_agent.config import ConfigError, load_config
 from retail_agent.errors import AgentError
 from retail_agent.graph import build_graph
 from retail_agent.llm_provider import GeminiProvider
+from retail_agent.openrouter_provider import OpenRouterProvider
 
 
 class StartupError(Exception):
@@ -49,7 +52,16 @@ def _build_graph(config):
         row_limit=config.row_limit,
         timeout_seconds=config.query_timeout_seconds,
     )
-    provider = GeminiProvider(api_key=config.gemini_api_key, model=config.gemini_model)
+    gemini = GeminiProvider(api_key=config.gemini_api_key, model=config.gemini_model)
+    if config.openrouter_api_key:
+        provider = ProviderCircuitBreaker(
+            primary=gemini,
+            fallback=OpenRouterProvider(api_key=config.openrouter_api_key, model=config.openrouter_model),
+            failure_threshold=config.provider_failure_threshold,
+            cooldown_seconds=config.provider_cooldown_seconds,
+        )
+    else:
+        provider = gemini
     return build_graph(provider, bq_tool, SYSTEM_INSTRUCTION)
 
 
@@ -59,6 +71,8 @@ def main() -> None:
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    logging.basicConfig(level=config.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
     try:
         graph = _build_graph(config)
@@ -80,8 +94,16 @@ def main() -> None:
             break
 
         user_message = types.Content(role="user", parts=[types.Part(text=user_input)])
+        turn_state = {
+            "messages": [user_message],
+            # Reset every turn: a "turn" is exactly one graph.invoke() call,
+            # so self-correct/empty-result budgets never leak across turns.
+            "self_correct_attempts": 0,
+            "empty_result_sanity_checked": False,
+            "last_tool_errors": [],
+        }
         try:
-            result = graph.invoke({"messages": [user_message]}, config=THREAD_CONFIG)
+            result = graph.invoke(turn_state, config=THREAD_CONFIG)
         except AgentError as exc:
             print(f"Agent: Sorry, I couldn't complete that — {exc}")
             continue

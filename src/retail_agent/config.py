@@ -16,6 +16,11 @@ class Config:
     max_bytes_billed: int
     row_limit: int
     query_timeout_seconds: float
+    openrouter_api_key: str | None
+    openrouter_model: str
+    provider_failure_threshold: int
+    provider_cooldown_seconds: float
+    log_level: str
 
 
 def load_config() -> Config:
@@ -41,4 +46,11 @@ def load_config() -> Config:
         max_bytes_billed=int(os.environ.get("BQ_MAX_BYTES_BILLED", 1_000_000_000)),
         row_limit=int(os.environ.get("BQ_ROW_LIMIT", 500)),
         query_timeout_seconds=float(os.environ.get("BQ_QUERY_TIMEOUT_SECONDS", 30)),
+        # OPENROUTER_API_KEY is optional by design: if unset, the CLI runs
+        # Gemini-only with no circuit breaker (nowhere to fail over to).
+        openrouter_api_key=os.environ.get("OPENROUTER_API_KEY") or None,
+        openrouter_model=os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+        provider_failure_threshold=int(os.environ.get("PROVIDER_FAILURE_THRESHOLD", 2)),
+        provider_cooldown_seconds=float(os.environ.get("PROVIDER_COOLDOWN_SECONDS", 60)),
+        log_level=os.environ.get("LOG_LEVEL", "INFO"),
     )
