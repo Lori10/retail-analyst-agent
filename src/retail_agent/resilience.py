@@ -18,15 +18,10 @@ def bounded_backoff(
     timeout errors from BigQuery or an LLM provider — never for errors a
     retry can't fix.
 
-    `retry` is a tenacity retry condition rather than a bare exception type
-    so each call site can express retryability however its underlying
-    client actually exposes it: `tenacity.retry_if_exception_type(...)` when
-    the client raises a distinct type per failure category (BigQuery's
-    `google.api_core.exceptions`, the `openai` SDK), or
-    `tenacity.retry_if_exception(predicate)` when it doesn't — `google.genai`
-    lumps every 4xx into one `ClientError` type and every 5xx into one
-    `ServerError` type, distinguished only by a `.code` attribute, so
-    type-based matching can't tell a rate limit from a bad request there.
+    `retry` takes a full tenacity retry condition rather than a bare
+    exception type so each call site can express retryability however its
+    own client actually exposes it, whether that's matching on the
+    exception's type or on its contents.
 
     Args:
         retry: A tenacity retry condition deciding which exceptions trigger
