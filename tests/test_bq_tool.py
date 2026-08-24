@@ -1,8 +1,24 @@
 import pandas as pd
 import pytest
+from google.api_core import exceptions as gax
 
+from retail_agent import bq_tool as bq_tool_module
 from retail_agent.bq_tool import BigQueryTool
-from retail_agent.errors import QueryTooExpensiveError, SQLSafetyError
+from retail_agent.errors import (
+    QueryExecutionError,
+    QueryPermissionError,
+    QuerySyntaxError,
+    QueryTooExpensiveError,
+    QueryTransientError,
+    SQLSafetyError,
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sleep(monkeypatch):
+    # bq_tool._call_bq is wrapped with a real exponential-backoff sleep by
+    # default; tests that trigger a retry would otherwise take ~1s+ each.
+    monkeypatch.setattr(bq_tool_module._call_bq.retry, "sleep", lambda seconds: None)
 
 
 class FakeJob:
@@ -28,6 +44,29 @@ class FakeClient:
         if job_config is not None and job_config.dry_run:
             return FakeJob(total_bytes_processed=self.dry_run_bytes)
         return FakeJob(rows=self.rows)
+
+
+class ScriptedClient:
+    """A fake BQ client whose `query`/`get_table` calls raise or return in a
+    pre-scripted sequence, one entry consumed per call — for exercising
+    typed-error classification and the transient-error backoff path."""
+
+    def __init__(self, script):
+        self._script = list(script)
+        self.calls = 0
+
+    def _next(self):
+        self.calls += 1
+        item = self._script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def query(self, sql, job_config=None):
+        return self._next()
+
+    def get_table(self, table_ref):
+        return self._next()
 
 
 def _make_tool(*, dry_run_bytes=100, rows=None, max_bytes_billed=1_000_000_000):
@@ -61,3 +100,64 @@ def test_successful_query_returns_pii_stripped_dataframe():
     assert list(result["dataframe"].columns) == ["id", "total_revenue"]
     assert result["row_count"] == 1
     assert len(client.queries) == 2  # dry run + real run
+
+
+def _tool_with_script(script):
+    client = ScriptedClient(script)
+    tool = BigQueryTool(client=client, max_bytes_billed=1_000_000_000, row_limit=100, timeout_seconds=5)
+    return tool, client
+
+
+def test_dry_run_bad_request_raises_query_syntax_error_without_retry():
+    tool, client = _tool_with_script([gax.BadRequest("bad sql")])
+    with pytest.raises(QuerySyntaxError):
+        tool.run_query("SELECT 1")
+    assert client.calls == 1  # syntax errors are not retried
+
+
+def test_dry_run_forbidden_raises_query_permission_error():
+    tool, client = _tool_with_script([gax.Forbidden("no access")])
+    with pytest.raises(QueryPermissionError):
+        tool.run_query("SELECT 1")
+    assert client.calls == 1
+
+
+def test_transient_execute_error_is_retried_and_succeeds():
+    rows = pd.DataFrame({"id": [1]})
+    tool, client = _tool_with_script(
+        [
+            FakeJob(total_bytes_processed=100),  # dry run
+            gax.ServerError("temporary outage"),  # execute attempt 1
+            FakeJob(rows=rows),  # execute attempt 2 (retry) succeeds
+        ]
+    )
+    result = tool.run_query("SELECT 1")
+    assert result["row_count"] == 1
+    assert client.calls == 3
+
+
+def test_transient_execute_error_exhausts_retries_and_raises():
+    tool, client = _tool_with_script(
+        [
+            FakeJob(total_bytes_processed=100),  # dry run
+            gax.ServerError("outage"),  # execute attempt 1
+            gax.ServerError("still down"),  # execute attempt 2 — budget exhausted
+        ]
+    )
+    with pytest.raises(QueryTransientError):
+        tool.run_query("SELECT 1")
+    assert client.calls == 3  # dry run + 2 execute attempts, no 3rd attempt
+
+
+def test_unclassified_exception_raises_base_query_execution_error():
+    tool, client = _tool_with_script([RuntimeError("mystery failure")])
+    with pytest.raises(QueryExecutionError):
+        tool.run_query("SELECT 1")
+    assert client.calls == 1
+
+
+def test_get_schema_not_found_raises_query_syntax_error():
+    client = ScriptedClient([gax.NotFound("no such table")])
+    tool = BigQueryTool(client=client, max_bytes_billed=1_000_000_000, row_limit=100, timeout_seconds=5)
+    with pytest.raises(QuerySyntaxError):
+        tool.get_schema("not_a_table")
