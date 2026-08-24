@@ -82,26 +82,42 @@ graph TD;
 	__start__([<p>__start__</p>]):::first
 	call_model(call_model)
 	tools(tools)
+	give_up(give_up)
 	__end__([<p>__end__</p>]):::last
 	__start__ --> call_model;
 	call_model -.-> __end__;
 	call_model -.-> tools;
-	tools --> call_model;
+	tools -.-> call_model;
+	tools -.-> give_up;
+	give_up --> __end__;
 	classDef default fill:#f2f0ff,line-height:1.2
 	classDef first fill-opacity:0
 	classDef last fill:#bfb6fc
 ```
 
 - **`call_model`** — sends the running message history plus the tool
-  schemas to Gemini and appends whatever comes back (text, a tool call, or
-  both).
+  schemas to the current LLM provider (Gemini, or OpenRouter if the circuit
+  breaker has failed over) and appends whatever comes back (text, a tool
+  call, or both).
 - **`tools`** — executes every tool call in the latest model message
-  against `BigQueryTool` and appends the results as `FunctionResponse`s.
-- **Solid edges** (`__start__ → call_model`, `tools → call_model`) always
-  fire. **Dashed edges** out of `call_model` are the conditional routing in
-  `route_after_model`: to `tools` if the model's reply contains a function
-  call, to `__end__` otherwise — this is the "LangGraph" orchestrator loop
-  described in §3.
+  against `BigQueryTool`, appends the results as `FunctionResponse`s, and
+  tracks per-turn `self_correct_attempts`/`empty_result_sanity_checked`/
+  `last_tool_errors` state (the resilience-depth mechanisms in §5).
+- **`give_up`** — terminal node reached when a tool error isn't
+  self-correctable or the self-correct budget (2 retries) is exhausted;
+  emits the error class's graceful user-facing message and ends the turn.
+- **Solid edges** (`__start__ → call_model`, `give_up → __end__`) always
+  fire. **Dashed edges** are conditional routing: out of `call_model`,
+  `route_after_model` sends the turn to `tools` if the model's reply
+  contains a function call, else `__end__`; out of `tools`,
+  `route_after_tools` sends it back to `call_model` if there were no
+  errors (or the self-correct budget isn't exhausted yet), else to
+  `give_up` — this is the bounded self-correct loop described in §5.
+  Backoff on transient BigQuery/provider errors happens beneath this graph
+  entirely, inside `bq_tool.py`/the provider classes — a `QueryTransientError`
+  or `ProviderTransientError` reaching `tools`/`call_model` means the
+  backoff attempts already ran out, so it's treated as non-self-correctable
+  here.
 
 ## 3. Component Reasoning
 
@@ -116,11 +132,27 @@ decoratively — the architecture diagram maps ~1:1 onto actual graph nodes.
 **LLM provider — Gemini primary, OpenRouter fallback, behind a common
 interface.** Gemini via Vertex AI in production (shares IAM/audit/quota
 plumbing with the BigQuery access already required); AI Studio key in the
-prototype for simplicity. OpenRouter sits behind the same interface as a
-fallback; a circuit breaker routes to it after N consecutive Gemini
-failures/timeouts, with a cooldown before retrying Gemini — this is the
-concrete mechanism for "resilient to 3rd-party service downtime"
-(requirement 5).
+prototype for simplicity. Both providers implement the same `Provider`
+protocol (`generate(contents, system_instruction, tools) ->
+GenerateContentResponse`) so `graph.py` and the circuit breaker never
+branch on which one is active. `OpenRouterProvider` (coded, in
+`openrouter_provider.py`) calls OpenRouter's OpenAI-compatible endpoint via
+the `openai` SDK pointed at OpenRouter's `base_url` — OpenRouter's own
+documented integration path, chosen over hand-rolled HTTP calls specifically
+to avoid ~60-80 lines of bespoke request/response JSON translation (role
+mapping, tool-call IDs, argument parsing) that the SDK already implements
+and tests; the SDK's own internal retry is disabled (`max_retries=0`) so
+the bounded-backoff wrapper below is the single source of retry behavior,
+not two retry policies stacking. `ProviderCircuitBreaker`
+(`circuit_breaker.py`) is a small hand-rolled, in-memory, single-process
+class — no external dependency, appropriate for a synchronous CLI
+prototype — that routes to OpenRouter after `PROVIDER_FAILURE_THRESHOLD`
+(default 2) consecutive Gemini failures, for `PROVIDER_COOLDOWN_SECONDS`
+(default 60) before Gemini is tried again; this is the concrete mechanism
+for "resilient to 3rd-party service downtime" (requirement 5). The breaker
+is only constructed when `OPENROUTER_API_KEY` is set — with no fallback
+configured, the CLI runs Gemini-only and provider failures surface directly
+as a graceful error message (see §5).
 
 **BigQuery tool wrapper.** `src/provided/bq_runner.py` was supplied by the
 company as an example of how to query BigQuery, not a required dependency —
@@ -252,21 +284,73 @@ only the delete itself does, keeping the added friction to one turn.
 
 ## 5. Error Handling & Fallback Strategies
 
+Coded (`errors.py`, `bq_tool.py`, `graph.py`, `llm_provider.py`,
+`openrouter_provider.py`, `circuit_breaker.py`, `resilience.py`). Every
+`AgentError` subclass carries a `self_correctable: bool` flag and a
+`graceful_message` — the graph routes on the flag, never on ad hoc
+isinstance checks, and `errors.graceful_message_for(...)` is the single
+place user-facing copy for a failure class lives.
+
 - The BQ wrapper raises typed errors instead of bare exceptions, fixing the
-  raw-client gap described in §3.
-- **Syntax/bad-request** → the error text is fed back to the LLM, bounded
-  to 2 self-correct retries, then a graceful "couldn't produce a valid
-  query" message — never a raw stack trace, never an unbounded retry loop
-  that inflates cost.
-- **Empty result** → one extra pass asking the model to sanity-check its
-  own query logic before "zero rows" is accepted as the real answer.
-- **Transient/timeout** → exponential backoff, 2 attempts, before
-  surfacing a "try again shortly" message.
-- **LLM provider failure** → circuit breaker switches to OpenRouter for a
-  cooldown window; logged as a provider-failover event.
-- Every failure path is logged with its error class. No path crashes the
-  CLI loop; every path terminates in either a valid answer or a bounded,
-  legible error message.
+  raw-client gap described in §3: `QuerySyntaxError` (BigQuery
+  `BadRequest`/`NotFound`/`Conflict`), `QueryPermissionError`
+  (`Forbidden`/`Unauthorized`), `QueryTransientError`
+  (`ServerError`/`TooManyRequests`/`RetryError`/timeouts), and
+  `QueryExecutionError` itself as a defensive fallback for any exception
+  type not yet classified — logged as `bq_unclassified_exception` so a
+  recurring one gets a new typed subclass added, and treated as terminal
+  (not retried) until it does.
+- **Syntax/bad-request** (`QuerySyntaxError`, also `SQLSafetyError` and
+  `QueryTooExpensiveError`) → self-correctable. The error is fed back to
+  the model as the tool's `FunctionResponse`; `graph.py`'s
+  `self_correct_attempts` counter (reset once per turn, i.e. once per
+  `graph.invoke()` call) is bumped on each self-correctable failure and
+  compared against `MAX_SELF_CORRECT_ATTEMPTS = 2` — attempt 1 and 2 route
+  back to `call_model` for a retry, attempt 3 routes to the `give_up` node
+  instead. Net effect: exactly 2 self-correct retries, 3 total SQL attempts,
+  then a graceful "couldn't produce a valid query" message — never a raw
+  stack trace, never an unbounded retry loop that inflates cost.
+- **Permission error** (`QueryPermissionError`) → not self-correctable
+  (no query rewrite fixes an IAM grant) — routes straight to `give_up` on
+  the first occurrence, no retry.
+- **Empty result** → not an exception (0 rows is a valid tool result); one
+  extra pass only, tracked by a `empty_result_sanity_checked` flag (also
+  reset per turn) — a note is injected into the first zero-row
+  `FunctionResponse` asking the model to sanity-check its own filters/joins
+  before accepting "zero rows" as the real answer, but a second zero-row
+  result in the same turn is accepted rather than looping.
+- **Transient/timeout** (`QueryTransientError` from BigQuery,
+  `ProviderTransientError` from either LLM provider) → exponential backoff,
+  2 attempts total, via a shared `resilience.bounded_backoff(...)`
+  (`tenacity`-based) wrapper used identically in `bq_tool.py` and both
+  provider classes. This retry is entirely internal to the failing
+  component — the graph never sees it. If both attempts fail, the typed
+  transient error reaches the graph and is treated as **not**
+  self-correctable (a third identical attempt via the model can't succeed
+  where backoff already failed twice) — `QueryTransientError` routes to
+  `give_up`; `ProviderTransientError` propagates out of `graph.invoke()`
+  entirely (see next bullet).
+- **LLM provider failure** → `ProviderCircuitBreaker` (in front of
+  `call_model`, constructed in `cli.py` only when `OPENROUTER_API_KEY` is
+  set) counts consecutive Gemini failures; at `PROVIDER_FAILURE_THRESHOLD`
+  (default 2) it opens and routes to `OpenRouterProvider` for
+  `PROVIDER_COOLDOWN_SECONDS` (default 60), logged as a `provider_failover`
+  event, then tries Gemini again. `call_model` itself does not catch
+  provider errors — a `ProviderError` that survives the breaker/backoff
+  propagates out of `graph.invoke()` and is caught by `cli.py`'s existing
+  top-level `except AgentError` handler, which prints the graceful message
+  and keeps the REPL loop alive; no separate graph node duplicates that
+  handling. With no `OPENROUTER_API_KEY` configured, the CLI runs
+  Gemini-only and a Gemini failure surfaces the same way once
+  backoff is exhausted.
+- Every failure path is logged (Python stdlib `logging`, structured
+  `extra=` fields — an interim shape ahead of step 4's structured JSON
+  logging, not a second logging system) with its error class:
+  `bq_call_failed`/`bq_unclassified_exception` (BQ wrapper),
+  `tool_call_error`/`agent_terminal_error` (graph), `provider_call_failed`
+  (either provider), `provider_failure`/`provider_failover` (circuit
+  breaker). No path crashes the CLI loop; every path terminates in either
+  a valid answer or a bounded, legible error message.
 
 ## 6. Requirement-by-Requirement Handling
 
@@ -357,10 +441,15 @@ uv run retail-agent
 
 Optional env vars (defaults shown): `GEMINI_MODEL=gemini-3.6-flash`,
 `BQ_MAX_BYTES_BILLED=1000000000` (~1GB), `BQ_ROW_LIMIT=500`,
-`BQ_QUERY_TIMEOUT_SECONDS=30`.
+`BQ_QUERY_TIMEOUT_SECONDS=30`, `LOG_LEVEL=INFO`.
 
-`OPENROUTER_API_KEY` / fallback wiring lands in the resilience-depth slice
-(build order step 2), not the current skeleton.
+Provider fallback / circuit breaker (resilience-depth slice, build order
+step 2 — coded): `OPENROUTER_API_KEY` (unset by default — the CLI runs
+Gemini-only with no circuit breaker when it's absent, since there's nowhere
+to fail over to), `OPENROUTER_MODEL=openai/gpt-4o-mini`,
+`PROVIDER_FAILURE_THRESHOLD=2` (consecutive Gemini failures before the
+breaker opens), `PROVIDER_COOLDOWN_SECONDS=60` (how long OpenRouter is used
+before Gemini is tried again).
 
 Run the test suite: `uv run pytest`. This runs only the unit tests by
 default. `tests/integration/` — live regression checks against real
