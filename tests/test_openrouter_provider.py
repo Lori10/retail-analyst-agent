@@ -42,7 +42,7 @@ def _provider_with_script(script):
 
 @pytest.fixture(autouse=True)
 def _no_real_sleep(monkeypatch):
-    monkeypatch.setattr(OpenRouterProvider.generate.retry, "sleep", lambda seconds: None)
+    monkeypatch.setattr(OpenRouterProvider._generate_raw.retry, "sleep", lambda seconds: None)
 
 
 def _user_content(text):

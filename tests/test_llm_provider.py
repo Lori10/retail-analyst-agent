@@ -32,7 +32,7 @@ def _provider_with_script(script):
 
 @pytest.fixture(autouse=True)
 def _no_real_sleep(monkeypatch):
-    monkeypatch.setattr(GeminiProvider.generate.retry, "sleep", lambda seconds: None)
+    monkeypatch.setattr(GeminiProvider._generate_raw.retry, "sleep", lambda seconds: None)
 
 
 def test_auth_error_raises_provider_auth_error_without_retry():

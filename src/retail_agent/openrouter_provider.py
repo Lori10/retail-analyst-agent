@@ -2,6 +2,7 @@ import json
 import logging
 
 import openai
+import tenacity
 from google.genai import types
 
 from retail_agent.errors import ProviderAuthError, ProviderError, ProviderTransientError
@@ -10,6 +11,17 @@ from retail_agent.resilience import bounded_backoff
 logger = logging.getLogger(__name__)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+# The openai SDK maps every 5xx status to InternalServerError specifically
+# (not just 500), so — unlike google-genai, which lumps all of 4xx/5xx into
+# two generic types — these four are a complete, precise "transient" set by
+# type alone: no separate status-code check is needed on top of them.
+_TRANSIENT_OPENAI_EXCEPTIONS = (
+    openai.RateLimitError,
+    openai.APITimeoutError,
+    openai.APIConnectionError,
+    openai.InternalServerError,
+)
 
 
 def _to_openai_messages(system_instruction: str, contents: list[types.Content]) -> list[dict]:
@@ -100,13 +112,12 @@ def _classify_openai_error(exc: openai.OpenAIError) -> ProviderError:
     Returns:
         `ProviderAuthError` for an authentication failure,
         `ProviderTransientError` for a rate limit, timeout, connection
-        error, or 5xx/429 status, otherwise the generic `ProviderError`.
+        error, or server error (see `_TRANSIENT_OPENAI_EXCEPTIONS`),
+        otherwise the generic `ProviderError`.
     """
     if isinstance(exc, openai.AuthenticationError):
         return ProviderAuthError(str(exc))
-    if isinstance(exc, (openai.RateLimitError, openai.APITimeoutError, openai.APIConnectionError, openai.InternalServerError)):
-        return ProviderTransientError(str(exc))
-    if isinstance(exc, openai.APIStatusError) and (exc.status_code == 429 or exc.status_code >= 500):
+    if isinstance(exc, _TRANSIENT_OPENAI_EXCEPTIONS):
         return ProviderTransientError(str(exc))
     return ProviderError(str(exc))
 
@@ -161,7 +172,20 @@ class OpenRouterProvider:
         self._client = openai.OpenAI(base_url=OPENROUTER_BASE_URL, api_key=api_key, max_retries=0)
         self._model = model
 
-    @bounded_backoff(retry_on=ProviderTransientError, attempts=2, logger=logger)
+    @bounded_backoff(retry=tenacity.retry_if_exception_type(_TRANSIENT_OPENAI_EXCEPTIONS), attempts=2, logger=logger)
+    def _generate_raw(self, messages: list[dict], openai_tools: list[dict]):
+        """Call OpenRouter directly, retrying a transient failure (any of
+        `_TRANSIENT_OPENAI_EXCEPTIONS`) via the `bounded_backoff` decorator.
+        Raises whatever the client itself raises, unclassified —
+        classification happens once, in `generate`, after retries are
+        resolved one way or the other.
+        """
+        return self._client.chat.completions.create(
+            model=self._model,
+            messages=messages,
+            tools=openai_tools or openai.NOT_GIVEN,
+        )
+
     def generate(
         self,
         contents: list[types.Content],
@@ -171,9 +195,11 @@ class OpenRouterProvider:
         """Send the conversation so far to OpenRouter and return its reply.
 
         Translates the request to and response from OpenAI's
-        chat-completions shape, classifies failures via
-        `_classify_openai_error`, and retries a transient one once (via the
-        `bounded_backoff` decorator) before letting it propagate.
+        chat-completions shape. Transient failures are retried (see
+        `_generate_raw`) before ever reaching the classification step here,
+        so this only classifies what's left: an error `_generate_raw` never
+        retried in the first place, or one that survived every retry
+        attempt.
 
         Args:
             contents: The running message history.
@@ -192,11 +218,7 @@ class OpenRouterProvider:
         messages = _to_openai_messages(system_instruction, contents)
         openai_tools = _to_openai_tools(tools)
         try:
-            response = self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                tools=openai_tools or openai.NOT_GIVEN,
-            )
+            response = self._generate_raw(messages, openai_tools)
         except openai.OpenAIError as exc:
             typed = _classify_openai_error(exc)
             logger.warning("provider_call_failed", extra={"provider": "openrouter", "error_class": type(typed).__name__})

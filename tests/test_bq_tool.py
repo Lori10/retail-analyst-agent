@@ -16,9 +16,9 @@ from retail_agent.errors import (
 
 @pytest.fixture(autouse=True)
 def _no_real_sleep(monkeypatch):
-    # bq_tool._call_bq is wrapped with a real exponential-backoff sleep by
-    # default; tests that trigger a retry would otherwise take ~1s+ each.
-    monkeypatch.setattr(bq_tool_module._call_bq.retry, "sleep", lambda seconds: None)
+    # bq_tool._call_bq_raw is wrapped with a real exponential-backoff sleep
+    # by default; tests that trigger a retry would otherwise take ~1s+ each.
+    monkeypatch.setattr(bq_tool_module._call_bq_raw.retry, "sleep", lambda seconds: None)
 
 
 class FakeJob:
@@ -154,6 +154,37 @@ def test_unclassified_exception_raises_base_query_execution_error():
     with pytest.raises(QueryExecutionError):
         tool.run_query("SELECT 1")
     assert client.calls == 1
+
+
+def test_transient_error_that_recovers_on_retry_never_logs_bq_call_failed(caplog):
+    # Classification/logging happens once, in _call_bq, only after
+    # _call_bq_raw's retries are fully resolved — a transient error that
+    # succeeds on retry should never be classified or logged as a failure.
+    rows = pd.DataFrame({"id": [1]})
+    tool, _ = _tool_with_script(
+        [
+            FakeJob(total_bytes_processed=100),
+            gax.ServerError("temporary outage"),
+            FakeJob(rows=rows),
+        ]
+    )
+    with caplog.at_level("WARNING"):
+        tool.run_query("SELECT 1")
+    assert "bq_call_failed" not in caplog.text
+
+
+def test_transient_error_that_exhausts_retries_logs_bq_call_failed_exactly_once(caplog):
+    tool, _ = _tool_with_script(
+        [
+            FakeJob(total_bytes_processed=100),
+            gax.ServerError("outage"),
+            gax.ServerError("still down"),
+        ]
+    )
+    with caplog.at_level("WARNING"):
+        with pytest.raises(QueryTransientError):
+            tool.run_query("SELECT 1")
+    assert caplog.text.count("bq_call_failed") == 1
 
 
 def test_get_schema_not_found_raises_query_syntax_error():

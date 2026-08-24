@@ -1,5 +1,6 @@
 import logging
 
+import tenacity
 from google.api_core import exceptions as gax
 from google.cloud import bigquery
 
@@ -48,10 +49,30 @@ def _classify(exc: Exception) -> QueryExecutionError:
     return QueryExecutionError(str(exc))
 
 
-@bounded_backoff(retry_on=QueryTransientError, attempts=2, logger=logger)
+@bounded_backoff(retry=tenacity.retry_if_exception_type(_TRANSIENT_EXCEPTIONS), attempts=2, logger=logger)
+def _call_bq_raw(fn):
+    """Run a BigQuery client call, retrying it if it raises one of the raw
+    `_TRANSIENT_EXCEPTIONS` types (via the `bounded_backoff` decorator).
+    Raises whatever the client itself raises, unclassified — classification
+    happens once, in `_call_bq`, after retries are resolved one way or the
+    other.
+
+    Args:
+        fn: Zero-argument callable that performs the actual client call
+            (e.g. `client.query(...)` or `client.get_table(...)`).
+
+    Returns:
+        Whatever `fn()` returns, unchanged, on success.
+    """
+    return fn()
+
+
 def _call_bq(fn, *, stage: str):
-    """Run a BigQuery client call, classifying failures and retrying
-    transient ones (via the `bounded_backoff` decorator).
+    """Run a BigQuery client call and classify any failure into a typed
+    AgentError. Transient failures are retried (see `_call_bq_raw`) before
+    ever reaching the classification step here, so this only classifies
+    what's left: an error `_call_bq_raw` never retried in the first place,
+    or one that survived every retry attempt.
 
     Args:
         fn: Zero-argument callable that performs the actual client call
@@ -73,9 +94,7 @@ def _call_bq(fn, *, stage: str):
             bucket.
     """
     try:
-        return fn()
-    except QueryTransientError:
-        raise
+        return _call_bq_raw(fn)
     except Exception as exc:
         typed = _classify(exc)
         logger.warning("bq_call_failed", extra={"stage": stage, "error_class": type(typed).__name__})
