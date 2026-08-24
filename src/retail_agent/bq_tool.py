@@ -27,6 +27,17 @@ _TRANSIENT_EXCEPTIONS = (gax.ServerError, gax.TooManyRequests, gax.RetryError, T
 
 
 def _classify(exc: Exception) -> QueryExecutionError:
+    """Map a raw exception from the BigQuery client into a typed AgentError.
+
+    Args:
+        exc: The exception raised by a `bigquery.Client` call.
+
+    Returns:
+        A `QueryPermissionError`, `QuerySyntaxError`, or `QueryTransientError`
+        if `exc` matches a known bucket; otherwise the base
+        `QueryExecutionError`, logged as `bq_unclassified_exception` so a
+        recurring case can get its own typed subclass.
+    """
     if isinstance(exc, _PERMISSION_EXCEPTIONS):
         return QueryPermissionError(str(exc))
     if isinstance(exc, _SYNTAX_EXCEPTIONS):
@@ -39,6 +50,28 @@ def _classify(exc: Exception) -> QueryExecutionError:
 
 @bounded_backoff(retry_on=QueryTransientError, attempts=2, logger=logger)
 def _call_bq(fn, *, stage: str):
+    """Run a BigQuery client call, classifying failures and retrying
+    transient ones (via the `bounded_backoff` decorator).
+
+    Args:
+        fn: Zero-argument callable that performs the actual client call
+            (e.g. `client.query(...)` or `client.get_table(...)`).
+        stage: Short label identifying the call site, used only in the
+            `bq_call_failed` log line (e.g. `"dry_run"`, `"execute"`,
+            `"get_schema"`).
+
+    Returns:
+        Whatever `fn()` returns, unchanged, on success.
+
+    Raises:
+        QueryPermissionError: `fn()` raised a permission-denied error.
+        QuerySyntaxError: `fn()` raised a bad-request/not-found/conflict
+            error.
+        QueryTransientError: `fn()` raised a transient/timeout error on
+            every attempt.
+        QueryExecutionError: `fn()` raised an exception not in any known
+            bucket.
+    """
     try:
         return fn()
     except QueryTransientError:
@@ -50,7 +83,14 @@ def _call_bq(fn, *, stage: str):
 
 
 class BigQueryTool:
-    """Safety/cost/PII wrapper around a bigquery.Client."""
+    """Safety/cost/PII wrapper around a bigquery.Client.
+
+    Attributes:
+        max_bytes_billed: Dry-run byte cap; a query estimated over this
+            raises `QueryTooExpensiveError` before it ever runs billably.
+        row_limit: Maximum rows fetched per query.
+        timeout_seconds: Client-side wait timeout for query execution.
+    """
 
     def __init__(
         self,
@@ -60,6 +100,17 @@ class BigQueryTool:
         timeout_seconds: float,
         default_dataset: str = DEFAULT_DATASET,
     ) -> None:
+        """Initialize the wrapper around an already-authenticated client.
+
+        Args:
+            client: An authenticated `bigquery.Client`, owned directly by
+                this wrapper rather than via `provided/bq_runner.py`.
+            max_bytes_billed: See `max_bytes_billed` attribute.
+            row_limit: See `row_limit` attribute.
+            timeout_seconds: See `timeout_seconds` attribute.
+            default_dataset: Fully-qualified `project.dataset` used to
+                resolve unqualified table names in queries.
+        """
         self._client = client
         self._default_dataset = default_dataset
         self.max_bytes_billed = max_bytes_billed
@@ -67,6 +118,22 @@ class BigQueryTool:
         self.timeout_seconds = timeout_seconds
 
     def get_schema(self, table_name: str) -> list[dict]:
+        """Look up a table's column names/types, with PII columns removed.
+
+        Args:
+            table_name: Bare table name within `default_dataset` (e.g.
+                `"users"`).
+
+        Returns:
+            A list of `{"name", "type", "mode", "description"}` dicts, one
+            per non-PII column.
+
+        Raises:
+            QuerySyntaxError: The table doesn't exist.
+            QueryPermissionError: The service account lacks access.
+            QueryTransientError: The BigQuery call failed transiently on
+                every retry attempt.
+        """
         table = _call_bq(
             lambda: self._client.get_table(f"{self._default_dataset}.{table_name}"),
             stage="get_schema",
@@ -83,6 +150,30 @@ class BigQueryTool:
         return strip_pii_schema(schema)
 
     def run_query(self, sql: str) -> dict:
+        """Validate, cost-check, execute, and PII-strip a read-only query.
+
+        Order matters for cost: the read-only check runs first (free), then
+        a dry run estimates cost before anything billable happens, then the
+        real query only runs if both gates pass.
+
+        Args:
+            sql: A single read-only `SELECT`/`WITH` statement.
+
+        Returns:
+            A dict with `dataframe` (PII columns dropped), `row_count`,
+            `bytes_processed` (from the dry-run estimate), and
+            `redacted_columns` (names of any columns that were stripped).
+
+        Raises:
+            SQLSafetyError: `sql` fails the read-only allowlist.
+            QueryTooExpensiveError: The dry-run byte estimate exceeds
+                `max_bytes_billed`.
+            QuerySyntaxError: The query is malformed or references a
+                nonexistent table/column.
+            QueryPermissionError: The service account lacks access.
+            QueryTransientError: The BigQuery call failed transiently on
+                every retry attempt.
+        """
         check_read_only(sql)
 
         dry_run_config = bigquery.QueryJobConfig(

@@ -18,6 +18,20 @@ MAX_SELF_CORRECT_ATTEMPTS = 2
 
 
 class AgentState(TypedDict):
+    """LangGraph state threaded through every node.
+
+    Attributes:
+        messages: Conversation history; accumulates via `operator.add` as
+            each node appends its output.
+        self_correct_attempts: Count of self-correctable tool errors seen
+            so far this turn, reset to 0 by the caller at the start of each
+            `graph.invoke()` call.
+        empty_result_sanity_checked: Whether a zero-row `run_query` result
+            has already had a sanity-check note injected this turn.
+        last_tool_errors: Errors from the most recent `call_tools` pass
+            (replaced, not accumulated, each time it runs).
+    """
+
     messages: Annotated[list[types.Content], operator.add]
     self_correct_attempts: int
     empty_result_sanity_checked: bool
@@ -25,12 +39,32 @@ class AgentState(TypedDict):
 
 
 def _dataframe_to_records(df) -> list[dict]:
-    # Routes through JSON (not .to_dict()) so numpy/Timestamp values become
-    # plain JSON-safe types before they hit the genai SDK's proto Struct.
+    """Convert a query result DataFrame into JSON-safe records.
+
+    Routes through JSON (not `.to_dict()`) so numpy/Timestamp values become
+    plain JSON-safe types before they hit the genai SDK's proto Struct.
+
+    Args:
+        df: The (already PII-stripped) query result DataFrame.
+
+    Returns:
+        A list of plain dicts, one per row, safe to embed in a
+        `FunctionResponse`.
+    """
     return json.loads(df.to_json(orient="records", date_format="iso"))
 
 
 def _run_tool(bq_tool: BigQueryTool, name: str, args: dict) -> dict:
+    """Dispatch one model-requested tool call to `BigQueryTool`.
+
+    Args:
+        bq_tool: The wrapper to call.
+        name: Tool name, `"run_query"` or `"get_schema"`.
+        args: The model-supplied arguments for that tool.
+
+    Returns:
+        A JSON-safe payload suitable for a `FunctionResponse`.
+    """
     if name == "run_query":
         result = bq_tool.run_query(args["sql"])
         return {
@@ -44,7 +78,22 @@ def _run_tool(bq_tool: BigQueryTool, name: str, args: dict) -> dict:
 
 
 def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: str):
+    """Compile the agent's LangGraph tool-calling loop.
+
+    Args:
+        provider: The LLM provider (or `ProviderCircuitBreaker` wrapping
+            two of them) used by the `call_model` node.
+        bq_tool: The BigQuery wrapper used by the `tools` node.
+        system_instruction: The system prompt sent on every `call_model`
+            invocation.
+
+    Returns:
+        A compiled `StateGraph` with in-memory checkpointing, ready for
+        `.invoke(...)`.
+    """
+
     def call_model(state: AgentState) -> dict:
+        """Send the message history to the provider and append its reply."""
         response = provider.generate(
             contents=state["messages"],
             system_instruction=system_instruction,
@@ -53,6 +102,14 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
         return {"messages": [response.candidates[0].content]}
 
     def call_tools(state: AgentState) -> dict:
+        """Execute every function call in the latest model message.
+
+        Dispatches each to `_run_tool`, turns the result (or a caught
+        `AgentError`) into a `FunctionResponse`, injects a one-time
+        sanity-check note on the first zero-row `run_query` result, and
+        tracks `self_correct_attempts`/`last_tool_errors` for
+        `route_after_tools` to act on.
+        """
         last = state["messages"][-1]
         response_parts = []
         self_correct_attempts = state.get("self_correct_attempts", 0)
@@ -106,6 +163,12 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
         }
 
     def give_up(state: AgentState) -> dict:
+        """Terminal node: emit a graceful message for the turn's failure.
+
+        Picks the first non-self-correctable error if any (it's the one
+        that actually explains why the turn is ending), otherwise the
+        first error recorded.
+        """
         errors = state["last_tool_errors"]
         chosen = next((e for e in errors if not e["self_correctable"]), errors[0])
         message = graceful_message_for(chosen["error_class"])
@@ -113,12 +176,17 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
         return {"messages": [types.Content(role="model", parts=[types.Part(text=message)])]}
 
     def route_after_model(state: AgentState) -> str:
+        """Route to `tools` if the model's last message made a function
+        call, else end the turn."""
         last = state["messages"][-1]
         if any(part.function_call is not None for part in last.parts):
             return "tools"
         return END
 
     def route_after_tools(state: AgentState) -> str:
+        """Route back to `call_model` to retry, or to `give_up` if this
+        turn's errors aren't self-correctable or the retry budget
+        (`MAX_SELF_CORRECT_ATTEMPTS`) is exhausted."""
         errors = state["last_tool_errors"]
         if not errors:
             return "call_model"

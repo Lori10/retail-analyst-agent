@@ -13,6 +13,23 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 def _to_openai_messages(system_instruction: str, contents: list[types.Content]) -> list[dict]:
+    """Translate google-genai message history into OpenAI chat-completions
+    `messages`.
+
+    A tool-result `Content` in this codebase's graph always carries only
+    `function_response` parts (never mixed with text), so it becomes one or
+    more standalone `role: "tool"` messages rather than a single user/
+    assistant message — OpenAI's format has no equivalent of "one turn,
+    several tool results."
+
+    Args:
+        system_instruction: The system prompt, sent as the first message.
+        contents: The running message history in `types.Content` shape.
+
+    Returns:
+        A list of OpenAI-shaped message dicts, ready for
+        `chat.completions.create(messages=...)`.
+    """
     messages = [{"role": "system", "content": system_instruction}]
     for content in contents:
         text = "".join(part.text for part in content.parts if part.text)
@@ -50,6 +67,16 @@ def _to_openai_messages(system_instruction: str, contents: list[types.Content]) 
 
 
 def _to_openai_tools(tools: list[types.Tool]) -> list[dict]:
+    """Translate google-genai `Tool`/`FunctionDeclaration` schemas into
+    OpenAI's `tools` shape.
+
+    Args:
+        tools: The `types.Tool` list passed to `generate(...)`.
+
+    Returns:
+        A list of `{"type": "function", "function": {...}}` dicts, ready
+        for `chat.completions.create(tools=...)`.
+    """
     return [
         {
             "type": "function",
@@ -65,6 +92,16 @@ def _to_openai_tools(tools: list[types.Tool]) -> list[dict]:
 
 
 def _classify_openai_error(exc: openai.OpenAIError) -> ProviderError:
+    """Map an `openai` SDK exception into a typed AgentError.
+
+    Args:
+        exc: The exception raised by the `openai` client.
+
+    Returns:
+        `ProviderAuthError` for an authentication failure,
+        `ProviderTransientError` for a rate limit, timeout, connection
+        error, or 5xx/429 status, otherwise the generic `ProviderError`.
+    """
     if isinstance(exc, openai.AuthenticationError):
         return ProviderAuthError(str(exc))
     if isinstance(exc, (openai.RateLimitError, openai.APITimeoutError, openai.APIConnectionError, openai.InternalServerError)):
@@ -75,6 +112,17 @@ def _classify_openai_error(exc: openai.OpenAIError) -> ProviderError:
 
 
 def _to_genai_response(response) -> types.GenerateContentResponse:
+    """Translate an OpenAI `ChatCompletion` into google-genai's response
+    shape.
+
+    Args:
+        response: The `ChatCompletion` returned by
+            `chat.completions.create(...)`.
+
+    Returns:
+        A `types.GenerateContentResponse` with a single candidate whose
+        content mirrors the completion's text and/or tool calls.
+    """
     message = response.choices[0].message
     parts = []
     if message.content:
@@ -102,6 +150,12 @@ class OpenRouterProvider:
     """
 
     def __init__(self, api_key: str, model: str) -> None:
+        """Initialize the OpenAI SDK client pointed at OpenRouter.
+
+        Args:
+            api_key: OpenRouter API key.
+            model: OpenRouter model slug, e.g. `"openai/gpt-4o-mini"`.
+        """
         # max_retries=0: bounded_backoff below is the sole retry policy, so
         # the SDK's own internal retries don't stack multiplicatively on top.
         self._client = openai.OpenAI(base_url=OPENROUTER_BASE_URL, api_key=api_key, max_retries=0)
@@ -114,6 +168,27 @@ class OpenRouterProvider:
         system_instruction: str,
         tools: list[types.Tool],
     ) -> types.GenerateContentResponse:
+        """Send the conversation so far to OpenRouter and return its reply.
+
+        Translates the request to and response from OpenAI's
+        chat-completions shape, classifies failures via
+        `_classify_openai_error`, and retries a transient one once (via the
+        `bounded_backoff` decorator) before letting it propagate.
+
+        Args:
+            contents: The running message history.
+            system_instruction: The system prompt for this call.
+            tools: Function-calling tool schemas available to the model.
+
+        Returns:
+            The reply translated back into `types.GenerateContentResponse`.
+
+        Raises:
+            ProviderAuthError: The API key is invalid.
+            ProviderTransientError: The call failed transiently on every
+                retry attempt.
+            ProviderError: Any other provider-side failure.
+        """
         messages = _to_openai_messages(system_instruction, contents)
         openai_tools = _to_openai_tools(tools)
         try:

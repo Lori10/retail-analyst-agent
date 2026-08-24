@@ -16,6 +16,14 @@ class ProviderCircuitBreaker:
     then routes to `fallback` for `cooldown_seconds` before trying the
     primary again. A single-process, in-memory breaker — no external state
     store needed for a synchronous CLI prototype.
+
+    Attributes:
+        primary: The provider used while the breaker is closed (Gemini).
+        fallback: The provider used while the breaker is open (OpenRouter).
+        failure_threshold: Consecutive `primary` failures before the breaker
+            opens.
+        cooldown_seconds: How long the breaker stays open before `primary`
+            is tried again.
     """
 
     primary: Provider
@@ -31,6 +39,26 @@ class ProviderCircuitBreaker:
         system_instruction: str,
         tools: list[types.Tool],
     ) -> types.GenerateContentResponse:
+        """Generate via `primary` if the breaker is closed, else `fallback`.
+
+        On a `primary` failure, bumps the consecutive-failure count and
+        opens the breaker once `failure_threshold` is reached; any success
+        on `primary` resets the count to 0. Failures on `fallback` are not
+        tracked — there's no further fallback to route to.
+
+        Args:
+            contents: The running message history.
+            system_instruction: The system prompt for this call.
+            tools: Function-calling tool schemas available to the model.
+
+        Returns:
+            The chosen provider's response.
+
+        Raises:
+            ProviderError: The chosen provider's `generate(...)` raised one
+                of its subclasses; re-raised unchanged after any breaker
+                bookkeeping.
+        """
         use_fallback = time.monotonic() < self._open_until
         provider, name = (self.fallback, "openrouter") if use_fallback else (self.primary, "gemini")
 

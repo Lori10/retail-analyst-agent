@@ -32,10 +32,31 @@ THREAD_CONFIG = {"configurable": {"thread_id": "cli-session"}}
 
 
 def _response_text(content: types.Content) -> str:
+    """Concatenate the text parts of a model message.
+
+    Args:
+        content: A `types.Content` message, typically the final message in
+            a turn's result.
+
+    Returns:
+        The concatenated text of all text parts (empty string if none).
+    """
     return "".join(part.text for part in content.parts if part.text)
 
 
 def _build_graph(config):
+    """Construct the BigQuery client, LLM provider(s), and compiled graph.
+
+    Args:
+        config: A loaded `Config`.
+
+    Returns:
+        A compiled LangGraph graph ready for `.invoke(...)`.
+
+    Raises:
+        StartupError: BigQuery credentials are missing/invalid, or the
+            client otherwise fails to construct.
+    """
     try:
         client = bigquery.Client(project=config.project_id)
     except DefaultCredentialsError as exc:
@@ -66,6 +87,13 @@ def _build_graph(config):
 
 
 def main() -> None:
+    """Entry point for the `retail-agent` CLI: load config, build the
+    graph, then run the REPL loop until the user exits or input closes.
+
+    Prints a plain-language message and exits(1) on a config/startup
+    failure; catches `AgentError`/any other exception per turn inside the
+    loop so a single bad question never crashes the session.
+    """
     try:
         config = load_config()
     except ConfigError as exc:
