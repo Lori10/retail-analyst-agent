@@ -359,6 +359,14 @@ failure, at two different points in the pipeline.
   a repeatedly-reworded query can't nudge forever) would close this, but
   isn't implemented — a boolean is the simplest thing that catches the
   common case without risking runaway nudging on a genuinely-zero answer.
+  A second, more fundamental gap surfaced during live testing: the check
+  is `row_count == 0`, which only describes an *unaggregated* empty result
+  (a raw `SELECT` matching no rows). A `COUNT(*)` query — almost certainly
+  the single most natural way an LLM answers any "how many" question —
+  always returns exactly one row (the count itself, however small), so the
+  note never fires for the most common shape of the exact question class
+  it exists to catch. Not fixed; recorded because it means the mechanism's
+  real-world trigger rate is likely far lower than the design assumed.
 - **Transient/timeout** (backoff layer) → exponential backoff, 2 attempts
   total, via a shared `resilience.bounded_backoff(...)` (`tenacity`-based)
   policy used at all three retry sites (`bq_tool.py`, `llm_provider.py`,
