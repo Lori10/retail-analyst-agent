@@ -26,9 +26,11 @@ class FakeProvider:
 
 
 class FakeBigQueryTool:
-    def __init__(self, *, query_script=None):
+    def __init__(self, *, query_script=None, schema_script=None):
         self.queries = []
+        self.schema_calls = []
         self._query_script = list(query_script) if query_script is not None else None
+        self._schema_script = list(schema_script) if schema_script is not None else None
 
     def run_query(self, sql):
         self.queries.append(sql)
@@ -45,6 +47,12 @@ class FakeBigQueryTool:
         }
 
     def get_schema(self, table_name):
+        self.schema_calls.append(table_name)
+        if self._schema_script is not None:
+            item = self._schema_script.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
         return [{"name": "id", "type": "INTEGER"}]
 
 
@@ -54,6 +62,15 @@ def _model_response(*, text=None, function_call=None):
         parts.append(types.Part(function_call=function_call))
     if text is not None:
         parts.append(types.Part(text=text))
+    return types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(role="model", parts=parts))]
+    )
+
+
+def _multi_call_response(*function_calls):
+    """A single model turn firing several function calls at once — e.g. the
+    model checking two tables' schemas before writing SQL."""
+    parts = [types.Part(function_call=fc) for fc in function_calls]
     return types.GenerateContentResponse(
         candidates=[types.Candidate(content=types.Content(role="model", parts=parts))]
     )
@@ -72,6 +89,10 @@ def _final_text(result):
 
 def _sql_call(id_):
     return types.FunctionCall(id=id_, name="run_query", args={"sql": "SELECT 1"})
+
+
+def _schema_call(id_, table_name="orders"):
+    return types.FunctionCall(id=id_, name="get_schema", args={"table_name": table_name})
 
 
 def test_graph_runs_tool_call_then_final_answer():
@@ -163,6 +184,47 @@ def test_non_self_correctable_error_gives_up_immediately_without_retry():
 
     assert provider.calls == 1  # no self-correct attempt for a terminal error
     assert len(bq_tool.queries) == 1
+    assert "permission" in _final_text(result).lower()
+
+
+def test_mixed_round_non_self_correctable_error_wins_over_self_correctable_one():
+    # One round, two tool calls: get_schema fails permanently (permission),
+    # run_query fails in a way the model could fix (syntax). A permission
+    # error can't be resolved by any retry, and retrying would just re-run
+    # both calls (including the doomed one) again — so the turn gives up
+    # immediately rather than spending a self-correct attempt on the part
+    # that's fixable while the other part is fundamentally blocked.
+    bq_tool = FakeBigQueryTool(
+        query_script=[QuerySyntaxError("bad column")],
+        schema_script=[QueryPermissionError("no access")],
+    )
+    provider = FakeProvider(
+        [_multi_call_response(_schema_call("call-1"), _sql_call("call-2"))]
+    )
+    graph = build_graph(provider, bq_tool, system_instruction="test")
+
+    result = _invoke(graph, "t7", "What's total revenue, and what columns does orders have?")
+
+    assert provider.calls == 1  # no self-correct attempt at all
+    assert len(bq_tool.schema_calls) == 1
+    assert len(bq_tool.queries) == 1
+    assert "permission" in _final_text(result).lower()
+
+
+def test_mixed_round_non_self_correctable_error_wins_even_over_a_success():
+    # get_schema succeeds; run_query fails permanently (permission). The
+    # successful schema lookup doesn't rescue the turn — one unrecoverable
+    # failure in the round is enough to give up.
+    bq_tool = FakeBigQueryTool(query_script=[QueryPermissionError("no access")])
+    provider = FakeProvider(
+        [_multi_call_response(_schema_call("call-1"), _sql_call("call-2"))]
+    )
+    graph = build_graph(provider, bq_tool, system_instruction="test")
+
+    result = _invoke(graph, "t8", "What's total revenue, and what columns does orders have?")
+
+    assert provider.calls == 1
+    assert len(bq_tool.schema_calls) == 1  # the schema call did run, and succeeded
     assert "permission" in _final_text(result).lower()
 
 
