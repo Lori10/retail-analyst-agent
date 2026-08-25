@@ -64,6 +64,10 @@ def _run_tool(bq_tool: BigQueryTool, name: str, args: dict) -> dict:
 
     Returns:
         A JSON-safe payload suitable for a `FunctionResponse`.
+
+    Raises:
+        AgentError: Propagated unchanged from `bq_tool.run_query`/
+            `get_schema` — `call_tools` is what actually catches this.
     """
     if name == "run_query":
         result = bq_tool.run_query(args["sql"])
@@ -93,7 +97,20 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
     """
 
     def call_model(state: AgentState) -> dict:
-        """Send the message history to the provider and append its reply."""
+        """Send the message history to the provider and append its reply.
+
+        Args:
+            state: Current graph state; only `messages` is read.
+
+        Returns:
+            `{"messages": [...]}` — the model's reply, appended via the
+            state's `operator.add` reducer.
+
+        Raises:
+            ProviderError: Propagated unchanged from `provider.generate`;
+                not caught here — see `cli.py`'s `except AgentError` for
+                where it's ultimately handled.
+        """
         response = provider.generate(
             contents=state["messages"],
             system_instruction=system_instruction,
@@ -109,6 +126,17 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
         sanity-check note on the first zero-row `run_query` result, and
         tracks `self_correct_attempts`/`last_tool_errors` for
         `route_after_tools` to act on.
+
+        Args:
+            state: Current graph state; reads `messages` (for the model's
+                function calls) and the prior `self_correct_attempts`/
+                `empty_result_sanity_checked` to continue counting within
+                the same turn.
+
+        Returns:
+            A dict updating `messages` (the tool responses), plus the
+            (possibly incremented) `self_correct_attempts`,
+            `empty_result_sanity_checked`, and this pass's `last_tool_errors`.
         """
         last = state["messages"][-1]
         response_parts = []
@@ -168,6 +196,14 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
         Picks the first non-self-correctable error if any (it's the one
         that actually explains why the turn is ending), otherwise the
         first error recorded.
+
+        Args:
+            state: Current graph state; reads `last_tool_errors` (always
+                non-empty when this node runs, per `route_after_tools`).
+
+        Returns:
+            `{"messages": [...]}` — a single model-role text message
+            carrying the chosen error's graceful message.
         """
         errors = state["last_tool_errors"]
         chosen = next((e for e in errors if not e["self_correctable"]), errors[0])
@@ -177,7 +213,14 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
 
     def route_after_model(state: AgentState) -> str:
         """Route to `tools` if the model's last message made a function
-        call, else end the turn."""
+        call, else end the turn.
+
+        Args:
+            state: Current graph state; only `messages` is read.
+
+        Returns:
+            `"tools"` or `END`.
+        """
         last = state["messages"][-1]
         if any(part.function_call is not None for part in last.parts):
             return "tools"
@@ -186,7 +229,15 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
     def route_after_tools(state: AgentState) -> str:
         """Route back to `call_model` to retry, or to `give_up` if this
         turn's errors aren't self-correctable or the retry budget
-        (`MAX_SELF_CORRECT_ATTEMPTS`) is exhausted."""
+        (`MAX_SELF_CORRECT_ATTEMPTS`) is exhausted.
+
+        Args:
+            state: Current graph state; reads `last_tool_errors` and
+                `self_correct_attempts`.
+
+        Returns:
+            `"call_model"` or `"give_up"`.
+        """
         errors = state["last_tool_errors"]
         if not errors:
             return "call_model"

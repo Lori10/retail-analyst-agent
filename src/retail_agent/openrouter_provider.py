@@ -176,9 +176,18 @@ class OpenRouterProvider:
     def _generate_raw(self, messages: list[dict], openai_tools: list[dict]):
         """Call OpenRouter directly, retrying a transient failure (any of
         `_TRANSIENT_OPENAI_EXCEPTIONS`) via the `bounded_backoff` decorator.
-        Raises whatever the client itself raises, unclassified —
-        classification happens once, in `generate`, after retries are
-        resolved one way or the other.
+
+        Args:
+            messages: OpenAI-shaped message list, from `_to_openai_messages`.
+            openai_tools: OpenAI-shaped tool list, from `_to_openai_tools`.
+
+        Returns:
+            The raw `ChatCompletion` from the `openai` client.
+
+        Raises:
+            openai.OpenAIError: Whatever the client itself raises,
+                unclassified — classification happens once, in `generate`,
+                after retries are resolved one way or the other.
         """
         return self._client.chat.completions.create(
             model=self._model,

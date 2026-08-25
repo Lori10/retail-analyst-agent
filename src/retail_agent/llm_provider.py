@@ -118,9 +118,19 @@ class GeminiProvider:
     ) -> types.GenerateContentResponse:
         """Call Gemini directly, retrying a transient failure (see
         `_is_transient_genai_error`) via the `bounded_backoff` decorator.
-        Raises whatever the client itself raises, unclassified —
-        classification happens once, in `generate`, after retries are
-        resolved one way or the other.
+
+        Args:
+            contents: The running message history.
+            system_instruction: The system prompt for this call.
+            tools: Function-calling tool schemas available to the model.
+
+        Returns:
+            The raw `GenerateContentResponse` from `google-genai`.
+
+        Raises:
+            Exception: Whatever the client itself raises, unclassified —
+                classification happens once, in `generate`, after retries
+                are resolved one way or the other.
         """
         config = types.GenerateContentConfig(
             system_instruction=system_instruction,

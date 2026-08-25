@@ -63,6 +63,11 @@ def _call_bq_raw(fn):
 
     Returns:
         Whatever `fn()` returns, unchanged, on success.
+
+    Raises:
+        Exception: Whatever `fn()` itself raises, unclassified, once
+            retries (if the exception matched `_TRANSIENT_EXCEPTIONS`) are
+            exhausted or didn't apply in the first place.
     """
     return fn()
 
@@ -213,6 +218,7 @@ class BigQueryTool:
         )
 
         def _execute():
+            """Run the billable query and return its full result as a DataFrame."""
             query_job = self._client.query(sql, job_config=run_config)
             result = query_job.result(timeout=self.timeout_seconds, max_results=self.row_limit)
             return result.to_dataframe()
