@@ -325,6 +325,24 @@ failure, at two different points in the pipeline.
   instead. Net effect: exactly 2 self-correct retries, 3 total SQL attempts,
   then a graceful "couldn't produce a valid query" message — never a raw
   stack trace, never an unbounded retry loop that inflates cost.
+- **Self-correct operates on the whole round, not per tool call.** A single
+  model turn can fire multiple function calls at once (e.g. `get_schema` on
+  two tables before writing SQL). If that round has a mix of outcomes —
+  say one call succeeds or fails self-correctably, but another fails with
+  a non-self-correctable error — `route_after_tools` gives up immediately
+  for the *entire* turn, discarding the other calls' results even though
+  they were independently fine. This is a deliberate limitation, not an
+  oversight: each `call_model` regenerates the *entire* set of function
+  calls fresh from the full history, so there's no mechanism to retry only
+  the fixable call while preserving a prior success from the same round —
+  and retrying anyway would be wasted cost, since the blocked call would
+  just fail identically again. A more granular per-call retry design
+  (tracking retry state per tool call, accepting the blocked one as a
+  permanent gap, returning a partial answer) is a valid alternative this
+  architecture doesn't support today. Covered by
+  `test_mixed_round_non_self_correctable_error_wins_over_self_correctable_one`
+  and `test_mixed_round_non_self_correctable_error_wins_even_over_a_success`
+  in `test_graph.py`.
 - **Permission error** (`QueryPermissionError`) → not self-correctable
   (no query rewrite fixes an IAM grant) — routes straight to `give_up` on
   the first occurrence, no retry.
