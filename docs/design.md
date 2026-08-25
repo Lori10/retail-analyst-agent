@@ -396,7 +396,20 @@ failure, at two different points in the pipeline.
   set) counts consecutive Gemini failures; at `PROVIDER_FAILURE_THRESHOLD`
   (default 2) it opens and routes to `OpenRouterProvider` for
   `PROVIDER_COOLDOWN_SECONDS` (default 60), logged as a `provider_failover`
-  event, then tries Gemini again. `call_model` itself does not catch
+  event, then tries Gemini again. Live testing surfaced a real
+  classification gap: an invalid Gemini API key returns HTTP 400
+  (`INVALID_ARGUMENT`), not 401/403 — `_classify_genai_error`'s
+  `exc.code in (401, 403)` check doesn't match it, so it falls through to
+  the generic `ProviderError` instead of the more specific
+  `ProviderAuthError`. The actual reason (`API_KEY_INVALID`) is present,
+  but nested three levels into the error response
+  (`exc.details["error"]["details"][0]["reason"]`) — matching it reliably
+  would mean depending on that exact nested shape, which is fragile
+  against a Google-side response format change. Not fixed: both classes
+  are non-self-correctable and both produce a graceful message, so there's
+  no functional or safety difference — only the graceful message's wording
+  and the log's `error_class` are affected, an observability gap rather
+  than a behavioral one. `call_model` itself does not catch
   provider errors — a `ProviderError` that survives the breaker/backoff
   propagates out of `graph.invoke()` and is caught by `cli.py`'s existing
   top-level `except AgentError` handler, which prints the graceful message
