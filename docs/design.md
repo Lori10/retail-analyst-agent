@@ -351,7 +351,14 @@ failure, at two different points in the pipeline.
   reset per turn) — a note is injected into the first zero-row
   `FunctionResponse` asking the model to sanity-check its own filters/joins
   before accepting "zero rows" as the real answer, but a second zero-row
-  result in the same turn is accepted rather than looping.
+  result in the same turn is accepted rather than looping. The flag is
+  turn-scoped, not query-scoped: if a turn asks a compound question that
+  needs two unrelated `run_query` calls and *both* unexpectedly return zero
+  rows, only the first gets nudged — the second is silently accepted. A
+  per-query-identity fix (e.g. keyed by SQL text, plus a small total cap so
+  a repeatedly-reworded query can't nudge forever) would close this, but
+  isn't implemented — a boolean is the simplest thing that catches the
+  common case without risking runaway nudging on a genuinely-zero answer.
 - **Transient/timeout** (backoff layer) → exponential backoff, 2 attempts
   total, via a shared `resilience.bounded_backoff(...)` (`tenacity`-based)
   policy used at all three retry sites (`bq_tool.py`, `llm_provider.py`,
