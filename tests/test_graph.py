@@ -1,7 +1,12 @@
 import pandas as pd
 from google.genai import types
 
-from retail_agent.errors import QueryPermissionError, QuerySyntaxError
+from retail_agent.errors import (
+    QueryPermissionError,
+    QuerySyntaxError,
+    QueryTooExpensiveError,
+    SQLSafetyError,
+)
 from retail_agent.graph import build_graph
 
 INITIAL_STATE_EXTRAS = {
@@ -87,8 +92,20 @@ def _final_text(result):
     return "".join(p.text for p in result["messages"][-1].parts if p.text)
 
 
-def _sql_call(id_):
-    return types.FunctionCall(id=id_, name="run_query", args={"sql": "SELECT 1"})
+def _function_response_payload(result, call_id):
+    """Find the FunctionResponse payload matching a given call id, anywhere
+    in the resulting message history — lets a test inspect exactly what one
+    specific tool call got back, when a round has more than one."""
+    for content in result["messages"]:
+        for part in content.parts:
+            fr = part.function_response
+            if fr is not None and fr.id == call_id:
+                return fr.response
+    return None
+
+
+def _sql_call(id_, sql="SELECT 1"):
+    return types.FunctionCall(id=id_, name="run_query", args={"sql": sql})
 
 
 def _schema_call(id_, table_name="orders"):
@@ -253,3 +270,102 @@ def test_empty_result_gets_one_extra_sanity_check_pass():
 
     assert provider.calls == 3
     assert _final_text(result) == "Total revenue is 42."
+
+
+def test_second_empty_result_in_same_turn_has_no_second_note():
+    # A second zero-row result in the same turn is accepted rather than
+    # nudging the model again — otherwise a genuinely-empty answer (there
+    # really are no matching rows) could loop forever chasing a note that
+    # will never stop firing.
+    bq_tool = FakeBigQueryTool(
+        query_script=[
+            {"dataframe": pd.DataFrame(), "row_count": 0, "bytes_processed": 10, "redacted_columns": []},
+            {"dataframe": pd.DataFrame(), "row_count": 0, "bytes_processed": 10, "redacted_columns": []},
+        ]
+    )
+    provider = FakeProvider(
+        [
+            _model_response(function_call=_sql_call("call-1")),
+            _model_response(function_call=_sql_call("call-2")),  # still 0 rows after the nudge
+            _model_response(text="No matching rows found."),
+        ]
+    )
+    graph = build_graph(provider, bq_tool, system_instruction="test")
+
+    result = _invoke(graph, "t9", "How many orders shipped from Mars?")
+
+    assert provider.calls == 3
+    assert len(bq_tool.queries) == 2
+    assert _final_text(result) == "No matching rows found."
+    assert "note" in _function_response_payload(result, "call-1")
+    assert "note" not in _function_response_payload(result, "call-2")
+
+
+def test_self_correct_counts_across_different_error_types_and_reports_the_last_one():
+    # self_correct_attempts must count *any* self-correctable failure toward
+    # the shared budget, not just repeats of the same error class.
+    bq_tool = FakeBigQueryTool(
+        query_script=[
+            SQLSafetyError("SELECT * on users"),
+            QueryTooExpensiveError("too many bytes"),
+            QuerySyntaxError("bad column"),
+        ]
+    )
+    provider = FakeProvider(
+        [
+            _model_response(function_call=_sql_call("call-1")),
+            _model_response(function_call=_sql_call("call-2")),
+            _model_response(function_call=_sql_call("call-3")),
+        ]
+    )
+    graph = build_graph(provider, bq_tool, system_instruction="test")
+
+    result = _invoke(graph, "t10", "What's total revenue?")
+
+    assert provider.calls == 3
+    assert len(bq_tool.queries) == 3
+    # last_tool_errors is replaced, not accumulated, each call_tools pass, so
+    # give_up reports the *last* attempt's error (QuerySyntaxError) even
+    # though a different type (SQLSafetyError) started the sequence.
+    assert "rephrase" in _final_text(result).lower()
+
+
+def test_mixed_round_empty_result_note_and_self_correctable_error_coexist():
+    # Two run_query calls in one round: one comes back with 0 rows (gets the
+    # sanity-check note), the other fails with a self-correctable error.
+    # call_tools handles each function-call part independently, so both
+    # branches (the "else" empty-check and the "except AgentError" handler)
+    # need to fire correctly within the same pass.
+    bq_tool = FakeBigQueryTool(
+        query_script=[
+            {"dataframe": pd.DataFrame(), "row_count": 0, "bytes_processed": 10, "redacted_columns": []},
+            QuerySyntaxError("bad column"),
+            {
+                "dataframe": pd.DataFrame({"id": [1], "total_revenue": [42.0]}),
+                "row_count": 1,
+                "bytes_processed": 123,
+                "redacted_columns": [],
+            },
+        ]
+    )
+    provider = FakeProvider(
+        [
+            _multi_call_response(_sql_call("call-1", sql="SELECT a"), _sql_call("call-2", sql="SELECT b")),
+            _model_response(function_call=_sql_call("call-3", sql="SELECT b_fixed")),  # self-correct retry
+            _model_response(text="Total revenue is 42."),
+        ]
+    )
+    graph = build_graph(provider, bq_tool, system_instruction="test")
+
+    result = _invoke(graph, "t11", "What's total revenue, and how many orders shipped to Mars?")
+
+    # a self-correctable error alongside an empty (non-error) result still
+    # routes back to call_model for a retry, not to give_up
+    assert provider.calls == 3
+    assert len(bq_tool.queries) == 3
+    assert _final_text(result) == "Total revenue is 42."
+
+    empty_payload = _function_response_payload(result, "call-1")
+    error_payload = _function_response_payload(result, "call-2")
+    assert "note" in empty_payload
+    assert error_payload["error_class"] == "QuerySyntaxError"

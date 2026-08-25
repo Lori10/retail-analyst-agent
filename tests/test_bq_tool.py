@@ -122,6 +122,36 @@ def test_dry_run_forbidden_raises_query_permission_error():
     assert client.calls == 1
 
 
+def test_execute_forbidden_raises_query_permission_error_without_retry():
+    # Distinct from test_dry_run_forbidden_raises_query_permission_error:
+    # here the dry run passes and the permission failure only shows up once
+    # the real (billable) query actually runs.
+    tool, client = _tool_with_script(
+        [
+            FakeJob(total_bytes_processed=100),  # dry run succeeds
+            gax.Forbidden("no access to execute"),  # execute fails
+        ]
+    )
+    with pytest.raises(QueryPermissionError):
+        tool.run_query("SELECT 1")
+    assert client.calls == 2  # dry run + one execute attempt, no retry
+
+
+def test_execute_bad_request_raises_query_syntax_error_without_retry():
+    # Distinct from test_dry_run_bad_request_raises_query_syntax_error_without_retry:
+    # a query can pass the dry run's static check yet still fail at execute
+    # time (e.g. a runtime type mismatch BigQuery only catches once it runs).
+    tool, client = _tool_with_script(
+        [
+            FakeJob(total_bytes_processed=100),  # dry run succeeds
+            gax.BadRequest("bad sql at execute time"),  # execute fails
+        ]
+    )
+    with pytest.raises(QuerySyntaxError):
+        tool.run_query("SELECT 1")
+    assert client.calls == 2
+
+
 def test_transient_execute_error_is_retried_and_succeeds():
     rows = pd.DataFrame({"id": [1]})
     tool, client = _tool_with_script(
