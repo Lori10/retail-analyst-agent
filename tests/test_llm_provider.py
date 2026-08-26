@@ -68,3 +68,28 @@ def test_timeout_error_is_treated_as_transient():
     result = provider.generate(contents=[], system_instruction="x", tools=[])
     assert result == "ok"
     assert counter.calls == 2
+
+
+def test_connection_error_is_treated_as_transient():
+    provider, counter = _provider_with_script([ConnectionError("connection reset"), "ok"])
+    result = provider.generate(contents=[], system_instruction="x", tools=[])
+    assert result == "ok"
+    assert counter.calls == 2
+
+
+def test_timeout_error_exhausts_retries_and_raises_provider_transient_error():
+    provider, counter = _provider_with_script(
+        [TimeoutError("client timed out"), TimeoutError("client timed out again")]
+    )
+    with pytest.raises(ProviderTransientError):
+        provider.generate(contents=[], system_instruction="x", tools=[])
+    assert counter.calls == 2
+
+
+def test_connection_error_exhausts_retries_and_raises_provider_transient_error():
+    provider, counter = _provider_with_script(
+        [ConnectionError("connection reset"), ConnectionError("connection reset again")]
+    )
+    with pytest.raises(ProviderTransientError):
+        provider.generate(contents=[], system_instruction="x", tools=[])
+    assert counter.calls == 2
