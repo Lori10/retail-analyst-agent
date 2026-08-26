@@ -1,7 +1,19 @@
 import pandas as pd
 from google.genai import types
 
+from retail_agent.errors import (
+    QueryPermissionError,
+    QuerySyntaxError,
+    QueryTooExpensiveError,
+    SQLSafetyError,
+)
 from retail_agent.graph import build_graph
+
+INITIAL_STATE_EXTRAS = {
+    "self_correct_attempts": 0,
+    "empty_result_sanity_checked": False,
+    "last_tool_errors": [],
+}
 
 
 class FakeProvider:
@@ -19,11 +31,19 @@ class FakeProvider:
 
 
 class FakeBigQueryTool:
-    def __init__(self):
+    def __init__(self, *, query_script=None, schema_script=None):
         self.queries = []
+        self.schema_calls = []
+        self._query_script = list(query_script) if query_script is not None else None
+        self._schema_script = list(schema_script) if schema_script is not None else None
 
     def run_query(self, sql):
         self.queries.append(sql)
+        if self._query_script is not None:
+            item = self._query_script.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
         return {
             "dataframe": pd.DataFrame({"id": [1], "total_revenue": [42.0]}),
             "row_count": 1,
@@ -32,6 +52,12 @@ class FakeBigQueryTool:
         }
 
     def get_schema(self, table_name):
+        self.schema_calls.append(table_name)
+        if self._schema_script is not None:
+            item = self._schema_script.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
         return [{"name": "id", "type": "INTEGER"}]
 
 
@@ -46,8 +72,48 @@ def _model_response(*, text=None, function_call=None):
     )
 
 
+def _multi_call_response(*function_calls):
+    """A single model turn firing several function calls at once — e.g. the
+    model checking two tables' schemas before writing SQL."""
+    parts = [types.Part(function_call=fc) for fc in function_calls]
+    return types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(role="model", parts=parts))]
+    )
+
+
+def _invoke(graph, thread_id, text):
+    return graph.invoke(
+        {"messages": [types.Content(role="user", parts=[types.Part(text=text)])], **INITIAL_STATE_EXTRAS},
+        config={"configurable": {"thread_id": thread_id}},
+    )
+
+
+def _final_text(result):
+    return "".join(p.text for p in result["messages"][-1].parts if p.text)
+
+
+def _function_response_payload(result, call_id):
+    """Find the FunctionResponse payload matching a given call id, anywhere
+    in the resulting message history — lets a test inspect exactly what one
+    specific tool call got back, when a round has more than one."""
+    for content in result["messages"]:
+        for part in content.parts:
+            fr = part.function_response
+            if fr is not None and fr.id == call_id:
+                return fr.response
+    return None
+
+
+def _sql_call(id_, sql="SELECT 1"):
+    return types.FunctionCall(id=id_, name="run_query", args={"sql": sql})
+
+
+def _schema_call(id_, table_name="orders"):
+    return types.FunctionCall(id=id_, name="get_schema", args={"table_name": table_name})
+
+
 def test_graph_runs_tool_call_then_final_answer():
-    tool_call = types.FunctionCall(id="call-1", name="run_query", args={"sql": "SELECT 1"})
+    tool_call = _sql_call("call-1")
     provider = FakeProvider(
         [
             _model_response(function_call=tool_call),
@@ -57,26 +123,249 @@ def test_graph_runs_tool_call_then_final_answer():
     bq_tool = FakeBigQueryTool()
     graph = build_graph(provider, bq_tool, system_instruction="test")
 
-    result = graph.invoke(
-        {"messages": [types.Content(role="user", parts=[types.Part(text="What's total revenue?")])]},
-        config={"configurable": {"thread_id": "t1"}},
-    )
+    result = _invoke(graph, "t1", "What's total revenue?")
 
     assert provider.calls == 2
     assert bq_tool.queries == ["SELECT 1"]
-    final_text = "".join(p.text for p in result["messages"][-1].parts if p.text)
-    assert final_text == "Total revenue is 42."
+    assert _final_text(result) == "Total revenue is 42."
 
 
 def test_graph_answers_directly_without_tool_call():
     provider = FakeProvider([_model_response(text="I can help with sales, orders, and product data.")])
     graph = build_graph(provider, FakeBigQueryTool(), system_instruction="test")
 
-    result = graph.invoke(
-        {"messages": [types.Content(role="user", parts=[types.Part(text="What can you do?")])]},
-        config={"configurable": {"thread_id": "t2"}},
-    )
+    result = _invoke(graph, "t2", "What can you do?")
 
     assert provider.calls == 1
-    final_text = "".join(p.text for p in result["messages"][-1].parts if p.text)
-    assert "sales" in final_text
+    assert "sales" in _final_text(result)
+
+
+def test_self_correctable_error_retries_and_then_succeeds():
+    bq_tool = FakeBigQueryTool(
+        query_script=[
+            QuerySyntaxError("bad column"),
+            {
+                "dataframe": pd.DataFrame({"id": [1], "total_revenue": [42.0]}),
+                "row_count": 1,
+                "bytes_processed": 123,
+                "redacted_columns": [],
+            },
+        ]
+    )
+    provider = FakeProvider(
+        [
+            _model_response(function_call=_sql_call("call-1")),
+            _model_response(function_call=_sql_call("call-2")),  # model self-corrects
+            _model_response(text="Total revenue is 42."),
+        ]
+    )
+    graph = build_graph(provider, bq_tool, system_instruction="test")
+
+    result = _invoke(graph, "t3", "What's total revenue?")
+
+    assert provider.calls == 3
+    assert _final_text(result) == "Total revenue is 42."
+
+
+def test_self_correctable_error_exhausts_budget_and_gives_up_gracefully():
+    bq_tool = FakeBigQueryTool(
+        query_script=[
+            QuerySyntaxError("bad column"),
+            QuerySyntaxError("still bad"),
+            QuerySyntaxError("still bad again"),
+        ]
+    )
+    provider = FakeProvider(
+        [
+            _model_response(function_call=_sql_call("call-1")),
+            _model_response(function_call=_sql_call("call-2")),
+            _model_response(function_call=_sql_call("call-3")),
+        ]
+    )
+    graph = build_graph(provider, bq_tool, system_instruction="test")
+
+    result = _invoke(graph, "t4", "What's total revenue?")
+
+    # exactly 2 self-correct retries -> 3 total SQL attempts, then give up
+    assert provider.calls == 3
+    assert len(bq_tool.queries) == 3
+    assert "rephrase" in _final_text(result).lower()
+
+
+def test_non_self_correctable_error_gives_up_immediately_without_retry():
+    bq_tool = FakeBigQueryTool(query_script=[QueryPermissionError("no access")])
+    provider = FakeProvider([_model_response(function_call=_sql_call("call-1"))])
+    graph = build_graph(provider, bq_tool, system_instruction="test")
+
+    result = _invoke(graph, "t5", "What's total revenue?")
+
+    assert provider.calls == 1  # no self-correct attempt for a terminal error
+    assert len(bq_tool.queries) == 1
+    assert "permission" in _final_text(result).lower()
+
+
+def test_mixed_round_non_self_correctable_error_wins_over_self_correctable_one():
+    # One round, two tool calls: get_schema fails permanently (permission),
+    # run_query fails in a way the model could fix (syntax). A permission
+    # error can't be resolved by any retry, and retrying would just re-run
+    # both calls (including the doomed one) again — so the turn gives up
+    # immediately rather than spending a self-correct attempt on the part
+    # that's fixable while the other part is fundamentally blocked.
+    bq_tool = FakeBigQueryTool(
+        query_script=[QuerySyntaxError("bad column")],
+        schema_script=[QueryPermissionError("no access")],
+    )
+    provider = FakeProvider(
+        [_multi_call_response(_schema_call("call-1"), _sql_call("call-2"))]
+    )
+    graph = build_graph(provider, bq_tool, system_instruction="test")
+
+    result = _invoke(graph, "t7", "What's total revenue, and what columns does orders have?")
+
+    assert provider.calls == 1  # no self-correct attempt at all
+    assert len(bq_tool.schema_calls) == 1
+    assert len(bq_tool.queries) == 1
+    assert "permission" in _final_text(result).lower()
+
+
+def test_mixed_round_non_self_correctable_error_wins_even_over_a_success():
+    # get_schema succeeds; run_query fails permanently (permission). The
+    # successful schema lookup doesn't rescue the turn — one unrecoverable
+    # failure in the round is enough to give up.
+    bq_tool = FakeBigQueryTool(query_script=[QueryPermissionError("no access")])
+    provider = FakeProvider(
+        [_multi_call_response(_schema_call("call-1"), _sql_call("call-2"))]
+    )
+    graph = build_graph(provider, bq_tool, system_instruction="test")
+
+    result = _invoke(graph, "t8", "What's total revenue, and what columns does orders have?")
+
+    assert provider.calls == 1
+    assert len(bq_tool.schema_calls) == 1  # the schema call did run, and succeeded
+    assert "permission" in _final_text(result).lower()
+
+
+def test_empty_result_gets_one_extra_sanity_check_pass():
+    bq_tool = FakeBigQueryTool(
+        query_script=[
+            {"dataframe": pd.DataFrame(), "row_count": 0, "bytes_processed": 10, "redacted_columns": []},
+            {
+                "dataframe": pd.DataFrame({"id": [1], "total_revenue": [42.0]}),
+                "row_count": 1,
+                "bytes_processed": 123,
+                "redacted_columns": [],
+            },
+        ]
+    )
+    provider = FakeProvider(
+        [
+            _model_response(function_call=_sql_call("call-1")),
+            _model_response(function_call=_sql_call("call-2")),  # model revises after seeing 0 rows
+            _model_response(text="Total revenue is 42."),
+        ]
+    )
+    graph = build_graph(provider, bq_tool, system_instruction="test")
+
+    result = _invoke(graph, "t6", "What's total revenue?")
+
+    assert provider.calls == 3
+    assert _final_text(result) == "Total revenue is 42."
+
+
+def test_second_empty_result_in_same_turn_has_no_second_note():
+    # A second zero-row result in the same turn is accepted rather than
+    # nudging the model again — otherwise a genuinely-empty answer (there
+    # really are no matching rows) could loop forever chasing a note that
+    # will never stop firing.
+    bq_tool = FakeBigQueryTool(
+        query_script=[
+            {"dataframe": pd.DataFrame(), "row_count": 0, "bytes_processed": 10, "redacted_columns": []},
+            {"dataframe": pd.DataFrame(), "row_count": 0, "bytes_processed": 10, "redacted_columns": []},
+        ]
+    )
+    provider = FakeProvider(
+        [
+            _model_response(function_call=_sql_call("call-1")),
+            _model_response(function_call=_sql_call("call-2")),  # still 0 rows after the nudge
+            _model_response(text="No matching rows found."),
+        ]
+    )
+    graph = build_graph(provider, bq_tool, system_instruction="test")
+
+    result = _invoke(graph, "t9", "How many orders shipped from Mars?")
+
+    assert provider.calls == 3
+    assert len(bq_tool.queries) == 2
+    assert _final_text(result) == "No matching rows found."
+    assert "note" in _function_response_payload(result, "call-1")
+    assert "note" not in _function_response_payload(result, "call-2")
+
+
+def test_self_correct_counts_across_different_error_types_and_reports_the_last_one():
+    # self_correct_attempts must count *any* self-correctable failure toward
+    # the shared budget, not just repeats of the same error class.
+    bq_tool = FakeBigQueryTool(
+        query_script=[
+            SQLSafetyError("SELECT * on users"),
+            QueryTooExpensiveError("too many bytes"),
+            QuerySyntaxError("bad column"),
+        ]
+    )
+    provider = FakeProvider(
+        [
+            _model_response(function_call=_sql_call("call-1")),
+            _model_response(function_call=_sql_call("call-2")),
+            _model_response(function_call=_sql_call("call-3")),
+        ]
+    )
+    graph = build_graph(provider, bq_tool, system_instruction="test")
+
+    result = _invoke(graph, "t10", "What's total revenue?")
+
+    assert provider.calls == 3
+    assert len(bq_tool.queries) == 3
+    # last_tool_errors is replaced, not accumulated, each call_tools pass, so
+    # give_up reports the *last* attempt's error (QuerySyntaxError) even
+    # though a different type (SQLSafetyError) started the sequence.
+    assert "rephrase" in _final_text(result).lower()
+
+
+def test_mixed_round_empty_result_note_and_self_correctable_error_coexist():
+    # Two run_query calls in one round: one comes back with 0 rows (gets the
+    # sanity-check note), the other fails with a self-correctable error.
+    # call_tools handles each function-call part independently, so both
+    # branches (the "else" empty-check and the "except AgentError" handler)
+    # need to fire correctly within the same pass.
+    bq_tool = FakeBigQueryTool(
+        query_script=[
+            {"dataframe": pd.DataFrame(), "row_count": 0, "bytes_processed": 10, "redacted_columns": []},
+            QuerySyntaxError("bad column"),
+            {
+                "dataframe": pd.DataFrame({"id": [1], "total_revenue": [42.0]}),
+                "row_count": 1,
+                "bytes_processed": 123,
+                "redacted_columns": [],
+            },
+        ]
+    )
+    provider = FakeProvider(
+        [
+            _multi_call_response(_sql_call("call-1", sql="SELECT a"), _sql_call("call-2", sql="SELECT b")),
+            _model_response(function_call=_sql_call("call-3", sql="SELECT b_fixed")),  # self-correct retry
+            _model_response(text="Total revenue is 42."),
+        ]
+    )
+    graph = build_graph(provider, bq_tool, system_instruction="test")
+
+    result = _invoke(graph, "t11", "What's total revenue, and how many orders shipped to Mars?")
+
+    # a self-correctable error alongside an empty (non-error) result still
+    # routes back to call_model for a retry, not to give_up
+    assert provider.calls == 3
+    assert len(bq_tool.queries) == 3
+    assert _final_text(result) == "Total revenue is 42."
+
+    empty_payload = _function_response_payload(result, "call-1")
+    error_payload = _function_response_payload(result, "call-2")
+    assert "note" in empty_payload
+    assert error_payload["error_class"] == "QuerySyntaxError"
