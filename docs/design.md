@@ -65,12 +65,15 @@ flowchart TB
 ## 2a. Current Graph Structure (generated, not hand-drawn)
 
 The diagram above is the production system architecture — most of it
-(Golden Bucket, Reports store, Persona config) isn't coded yet. This one is
-different in kind: it's Mermaid syntax read directly off the real compiled
-`StateGraph` in `graph.py` via `graph.get_graph().draw_mermaid()`, so it
-shows exactly what's running today, not an aspiration. Regenerate it with
-`uv run python scripts/render_graph.py` any time the graph changes — step 3
-(the delete-confirmation `interrupt()`) will add nodes here.
+(Golden Bucket, Reports store, Persona config) isn't coded, and per §9
+never will be in this prototype. This one is different in kind: it's
+Mermaid syntax read directly off the real compiled `StateGraph` in
+`graph.py` via `graph.get_graph().draw_mermaid()`, so it shows exactly
+what's running today, not an aspiration. Regenerate it with
+`uv run python scripts/render_graph.py` any time the graph changes. The
+delete-confirmation `interrupt()` node described in §4/§6 (requirement 3)
+is design only — the prototype's build order stops after resilience depth
+(§9), so this graph will not grow that node.
 
 ```mermaid
 ---
@@ -244,11 +247,16 @@ down-weight/archive trios past a freshness horizon (e.g. 12 months, since
 "why did revenue rise" from a year ago may not reflect current dynamics),
 and version trios rather than overwrite them in place.
 
-**Saved Reports Store.** SQLite in the prototype, Cloud SQL/Postgres in
-production, identical schema: `id, owner, title, content, conversation_id,
-created_at, tags`. This gives real queryable delete-scoping (`WHERE owner =
-? AND content LIKE ?`), which is what the confirm-then-delete flow in
-requirement 3 actually needs rather than asserts in prose.
+**Saved Reports Store (docs only — not built in the prototype).** Cloud
+SQL/Postgres in production, schema: `id, owner, title, content,
+conversation_id, created_at, tags`. This gives real queryable
+delete-scoping (`WHERE owner = ? AND content LIKE ?`), which is what the
+confirm-then-delete flow in requirement 3 actually needs rather than
+asserts in prose. The prototype's build order (§9) stops before High-Stakes
+Oversight, so this store — and the delete flow it exists to support — is
+design only; "create a report with action items" (deliverable 3's base
+ask, distinct from requirement 3) is satisfied by the agent formatting its
+chat answer as a report, with no persistence layer required.
 
 **User Preference Store.** Firestore doc per manager (preferred format,
 analysis depth, updated_at), read into the system prompt each turn, written
@@ -262,12 +270,17 @@ internal admin surface with no engineering ticket, read fresh each session.
 This is the concrete mechanism for "CEO changes tone weekly, no redeploy"
 (requirement 8).
 
-**Observability.** One structured JSON log line per LLM call / tool call /
-turn (conversation_id, user, intent, sql, rows_returned, tokens,
-latency_ms, error_class, self_correct_attempt). Prototype writes this shape
-to stdout/a local file — this is the coded, zero-setup mechanism a reviewer
-can see just by running the CLI, and it's what satisfies requirement 7 in
-the prototype. Production ships the identical log shape to Cloud Logging
+**Observability (docs only — not built as a coded requirement in the
+prototype).** One structured JSON log line per LLM call / tool call / turn
+(conversation_id, user, intent, sql, rows_returned, tokens, latency_ms,
+error_class, self_correct_attempt) is the target shape. What the prototype
+actually has is narrower: stdlib `logging` calls with `extra=` fields at
+each error/retry site (§5), added incidentally as part of building
+resilience depth, not as a deliberate implementation of requirement 7 —
+there's no per-turn structured JSON line, and no log covers the successful
+(non-error) path. §9's build order stops before the dedicated observability
+step, so this gap is by design, not yet-unfinished. Production ships the
+full log shape to Cloud Logging
 (metrics/alerting substrate) *and* adds real cross-call conversation
 tracing via **Langfuse**, chosen specifically because it plugs into
 LangGraph as a native callback handler — no hand-rolled OpenTelemetry spans
@@ -288,23 +301,29 @@ raw metrics can't.
 
 ## 4. Data Flow
 
-Two paths through the same orchestrator:
+Two paths through the same orchestrator, described here at production
+scope. The prototype implements only the coded steps of the Q&A path (see
+§9); Golden Bucket retrieval, persona config, and the entire Delete path
+are design only.
 
 **Q&A / analysis path**: user message → lightweight guardrail check
 (analysis vs. off-topic/malicious vs. delete-intent) → embed question,
-retrieve top-k Golden Bucket trios → LLM generates SQL using trios + schema
-as context → BQ wrapper validates (read-only check) → dry-run (reject over
-cap) → execute with timeout + row limit → PII-strip the DataFrame → LLM
-synthesizes the report/answer using persona config + (prod: user
-preferences) → response returned to the client and logged.
+retrieve top-k Golden Bucket trios (docs only) → LLM generates SQL using
+trios + schema as context → BQ wrapper validates (read-only check) →
+dry-run (reject over cap) → execute with timeout + row limit → PII-strip
+the DataFrame → LLM synthesizes the report/answer using persona config
+(docs only) + (prod: user preferences, docs only) → response returned to
+the client and logged.
 
-**Delete path**: user message → LLM resolves the request into candidate
-report(s) via a store query scoped to the requesting user (never
-cross-user) → orchestrator lists the exact candidates and pauses via
-`interrupt()` → next user turn: "yes" resumes the graph and executes the
-delete against the store; anything else aborts. Both outcomes are logged.
-Non-mutating actions (e.g. "show me my reports") never trigger this pause —
-only the delete itself does, keeping the added friction to one turn.
+**Delete path (docs only — not built in the prototype)**: user message →
+LLM resolves the request into candidate report(s) via a store query scoped
+to the requesting user (never cross-user) → orchestrator lists the exact
+candidates and pauses via `interrupt()` → next user turn: "yes" resumes the
+graph and executes the delete against the store; anything else aborts.
+Both outcomes are logged. Non-mutating actions (e.g. "show me my reports")
+never trigger this pause — only the delete itself does, keeping the added
+friction to one turn. This entire path depends on the Saved Reports Store
+(§3), which the prototype's build order (§9) stops short of.
 
 ## 5. Error Handling & Fallback Strategies
 
@@ -442,8 +461,9 @@ failure, at two different points in the pipeline.
   Gemini-only and a Gemini failure surfaces the same way once
   backoff is exhausted.
 - Every failure path is logged (Python stdlib `logging`, structured
-  `extra=` fields — an interim shape ahead of step 4's structured JSON
-  logging, not a second logging system) with its error class:
+  `extra=` fields — a by-product of building resilience depth, not a
+  deliberate implementation of requirement 7; see the Observability note
+  in §3) with its error class:
   `bq_call_failed`/`bq_unclassified_exception` (BQ wrapper),
   `tool_call_error`/`agent_terminal_error` (graph), `provider_call_failed`
   (either provider), `provider_failure`/`provider_failover` (circuit
@@ -458,7 +478,7 @@ human-in-the-loop update gate: the bucket only grows from
 analyst-approved reports, trading update speed for protection against
 the agent reinforcing its own errors.
 
-**2. Safety & PII Masking (primary, coded).** Two independent layers: an
+**2. Safety & PII Masking (coded).** Two independent layers: an
 input-side guardrail rejects off-topic/malicious requests before any tool
 call happens, and an output-side hard control — name-based PII column
 stripping in the BQ wrapper (§3) — guarantees known-PII columns never leave
@@ -473,11 +493,13 @@ depth: the read-only SQL check and the service account's IAM read-only role
 are independent backstops against a malicious or buggy query in the first
 place.
 
-**3. High-Stakes Oversight (secondary, coded).** See delete path in §4.
-The resolve-then-list-then-confirm shape is the actual safeguard;
-the confirmation mechanism itself (a plain yes/no next turn) is
-deliberately boring so it doesn't become UX friction for a routine action
-users are allowed to take on their own reports.
+**3. High-Stakes Oversight (docs only).** See delete path in §4. The
+resolve-then-list-then-confirm shape is the intended safeguard; the
+confirmation mechanism itself (a plain yes/no next turn) is deliberately
+boring so it wouldn't become UX friction for a routine action users are
+allowed to take on their own reports. Eligible for the prototype per the
+assignment's deliverable-3 list, but not coded — the prototype's scope is
+fixed at exactly two requirements (§9), and this wasn't one of them.
 
 **4. Continuous Improvement (docs-only).** User-level: preference profile
 described in §3, injected into the system prompt. System-level: explicitly
@@ -489,40 +511,47 @@ abandoned, explicit negative feedback) feeds a prompt/instruction
 changelog reviewed by an engineer. Improvement happens at the prompt and
 bucket layer with a human gate, not via silent model retraining.
 
-**5. Resilience & Graceful Error Handling (primary, coded).** See §5 in
-full.
+**5. Resilience & Graceful Error Handling (coded).** See §5 in full.
 
-**6. Quality Assurance (secondary, coded).** Offline golden eval set —
+**6. Quality Assurance (docs only).** Offline golden eval set —
 representative questions with expected SQL shape and expected report
 themes/facts, curated by a human analyst, ideally later sourced from real
 analyst-approved Golden Bucket entries. Correctness is scored by an
 LLM-as-judge rubric (right numbers, answers the actual question, no PII),
 periodically cross-checked against human grading to catch judge drift, and
 re-run as a regression gate before any prompt/persona/bucket change ships.
-UX is evaluated from the same structured logs Observability already
-captures — turns-to-answer, clarification-request rate, self-correct
-rate, delete-confirmation abandonment rate — rather than a separate survey
-mechanism.
+UX would be evaluated from the same structured logs Observability would
+capture — turns-to-answer, clarification-request rate, self-correct rate,
+delete-confirmation abandonment rate — rather than a separate survey
+mechanism. Eligible for the prototype, but no eval script or golden set
+exists in this repo; the prototype's scope is fixed at exactly two
+requirements (§9), and this wasn't one of them.
 
-**7. Observability (secondary, coded).** See §3. In the prototype: because
-every log line carries `conversation_id`, a full exchange (every LLM call,
-tool call, and outcome) can be reconstructed by filtering the JSON log —
-the concrete mechanism for "understand what went wrong in this exact
-exchange," and it requires nothing beyond running the CLI to inspect. In
-production, the same reconstruction is a Langfuse trace view rather than a
-log grep, since Langfuse attaches to LangGraph's own execution graph and
-needs no extra instrumentation code per call site.
+**7. Observability (docs only).** See §3. In production, because every log
+line would carry `conversation_id`, a full exchange (every LLM call, tool
+call, and outcome) could be reconstructed by filtering the JSON log — the
+concrete mechanism for "understand what went wrong in this exact
+exchange." A Langfuse trace view would give the same reconstruction
+without a log grep, since Langfuse attaches to LangGraph's own execution
+graph and needs no extra instrumentation code per call site. The prototype
+has only the incidental `logging` calls described in §5 — no per-turn
+structured JSON line, no `conversation_id`, no coverage of the successful
+path — added as a by-product of resilience work, not as a coded
+implementation of this requirement; the prototype's scope is fixed at
+exactly two requirements (§9), and this wasn't one of them.
 
-**8. Agility / Persona Management (docs-only, small prototype add if time
-allows).** See Persona Config in §3. A CEO-requested tone change ships by
-editing an external document, not by a code deploy.
+**8. Agility / Persona Management (docs only).** See Persona Config in §3.
+A CEO-requested tone change ships by editing an external document, not by
+a code deploy.
 
-## 7. Quality Assurance / Evaluation
+## 7. Quality Assurance / Evaluation (docs only)
 
 See requirement 6 above for the full approach. In short: a curated golden
 set + LLM-as-judge scoring (spot-checked by humans) as a pre-ship
 regression gate, and UX measured passively from production observability
-data rather than a separate instrumentation surface.
+data rather than a separate instrumentation surface. No eval script,
+golden set, or judge rubric exists in this repo — this section describes
+the intended production approach only.
 
 ## 8. Setup Instructions & Example Run
 
@@ -563,17 +592,17 @@ Example session:
 
 ```
 > Why did our churn rate spike last month?
-[agent retrieves relevant Golden Bucket trios, generates SQL, queries
- BigQuery read-only, strips PII, returns an analysis]
+[agent generates SQL, queries BigQuery read-only, strips PII, returns an
+ analysis]
 
-> Save that as a report
-[report persisted to the local Saved Reports store]
-
-> Delete all the reports we made in this conversation
-Agent: This will delete 1 report: "Churn spike analysis — <date>". Confirm? (y/n)
-> y
-Agent: Deleted.
+> Turn that into a report with action items for next quarter
+[agent formats the analysis as a report — summary, key findings, action
+ items — returned in the chat; not persisted, since the Saved Reports
+ store (§3) isn't built in the prototype]
 ```
+
+Golden Bucket retrieval and the delete-confirmation flow shown in earlier
+drafts of this example aren't in the prototype — see §9.
 
 ## 9. Prototype vs. Production Scope Matrix
 
@@ -581,13 +610,18 @@ Agent: Deleted.
 |---|---|---|
 | 1. Hybrid Intelligence | Docs only | Vertex AI Vector Search, human-curated updates |
 | 2. Safety & PII Masking | **Coded** — guardrail + name-based PII stripping (schema-verified) | Same, at scale |
-| 3. High-Stakes Oversight | **Coded** — SQLite store + interrupt-based confirm | Cloud SQL, same flow |
+| 3. High-Stakes Oversight | Docs only — eligible for the prototype, deliberately not coded | Cloud SQL reports store + interrupt-based confirm |
 | 4. Continuous Improvement | Docs only | Firestore preference store; human-gated system learning |
 | 5. Resilience & Error Handling | **Coded** — typed errors, self-correct, backoff, circuit breaker | Same, at scale |
-| 6. Quality Assurance | **Coded** — golden eval set + scoring script | Same + judge-drift audits |
-| 7. Observability | **Coded** — structured JSON logs (stdout/file); optional Langfuse callback as a stretch add | Cloud Logging + Monitoring dashboards/alerts + Langfuse (self-hosted) for conversation-level tracing |
-| 8. Agility (Persona) | Docs only (or `persona.yaml` if time allows) | Firestore/Cloud Storage config, admin surface |
+| 6. Quality Assurance | Docs only — eligible for the prototype, deliberately not coded | Golden eval set + scoring script, judge-drift audits |
+| 7. Observability | Docs only — eligible for the prototype, deliberately not coded (only incidental `logging` calls from resilience work exist, see §3/§6) | Structured JSON logs → Cloud Logging + Monitoring dashboards/alerts + Langfuse (self-hosted) for conversation-level tracing |
+| 8. Agility (Persona) | Docs only | Firestore/Cloud Storage config, admin surface |
 
-5 of 8 requirements are coded (all 5 eligible for the prototype per the
-assignment's deliverable-3 list); the remaining 3 aren't in that list, so
-they're designed here in full but not implemented in code.
+Exactly 2 of 8 requirements are coded (both eligible for the prototype per
+the assignment's deliverable-3 list, which allows any 2 of 5). The other 3
+eligible requirements (High-Stakes Oversight, Quality Assurance,
+Observability) are a deliberate scope decision, not a time cutoff — the
+build order (see `CLAUDE.md`) stops after resilience depth by design. The
+remaining 3 requirements (Hybrid Intelligence, Continuous Improvement,
+Agility) were never in the assignment's prototype-eligible list, so they're
+designed here in full but were never candidates for coding either way.
