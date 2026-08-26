@@ -1,8 +1,11 @@
 # Retail Data Analysis Agent — High-Level Design
 
 Source of truth for architecture and design decisions. Update this file
-whenever a decision changes; see `src/provided/CLAUDE.md` for build
-constraints and current prototype scope, `docs/assignment.md` for the brief.
+whenever a decision changes. See `CLAUDE.md` for build constraints and
+current prototype scope, `docs/assignment.md` for the brief, and
+`docs/implementation-notes.md` for implementation-level detail, rejected
+alternatives, and gaps found during testing — kept separate so this
+document stays a fast read on a first pass.
 
 ## 1. Overview
 
@@ -70,10 +73,7 @@ never will be in this prototype. This one is different in kind: it's
 Mermaid syntax read directly off the real compiled `StateGraph` in
 `graph.py` via `graph.get_graph().draw_mermaid()`, so it shows exactly
 what's running today, not an aspiration. Regenerate it with
-`uv run python scripts/render_graph.py` any time the graph changes. The
-delete-confirmation `interrupt()` node described in §4/§6 (requirement 3)
-is design only — the prototype's build order stops after resilience depth
-(§9), so this graph will not grow that node.
+`uv run python scripts/render_graph.py` any time the graph changes.
 
 ```mermaid
 ---
@@ -99,452 +99,269 @@ graph TD;
 ```
 
 - **`call_model`** — sends the running message history plus the tool
-  schemas to the current LLM provider (Gemini, or OpenRouter if the circuit
-  breaker has failed over) and appends whatever comes back (text, a tool
-  call, or both).
+  schemas to the current LLM provider (Gemini, or OpenRouter if the
+  circuit breaker has failed over) and appends whatever comes back (text,
+  a tool call, or both).
 - **`tools`** — executes every tool call in the latest model message
-  against `BigQueryTool`, appends the results as `FunctionResponse`s, and
-  tracks per-turn `self_correct_attempts`/`empty_result_sanity_checked`/
-  `last_tool_errors` state (the resilience-depth mechanisms in §5).
+  against `BigQueryTool`, appends the results, and tracks per-turn
+  self-correct/empty-result state (the resilience mechanisms in §5).
 - **`give_up`** — terminal node reached when a tool error isn't
   self-correctable or the self-correct budget (2 retries) is exhausted;
   emits the error class's graceful user-facing message and ends the turn.
 - **Solid edges** (`__start__ → call_model`, `give_up → __end__`) always
-  fire. **Dashed edges** are conditional routing: out of `call_model`,
-  `route_after_model` sends the turn to `tools` if the model's reply
-  contains a function call, else `__end__`; out of `tools`,
-  `route_after_tools` sends it back to `call_model` if there were no
-  errors (or the self-correct budget isn't exhausted yet), else to
-  `give_up` — this is the bounded self-correct loop described in §5.
-  Backoff on transient BigQuery/provider errors happens beneath this graph
-  entirely, inside `bq_tool.py`/the provider classes — a `QueryTransientError`
-  or `ProviderTransientError` reaching `tools`/`call_model` means the
-  backoff attempts already ran out, so it's treated as non-self-correctable
+  fire. **Dashed edges** are conditional routing: out of `call_model` to
+  `tools` only if the model's reply contains a function call, else
+  `__end__`; out of `tools` back to `call_model` unless the self-correct
+  budget is exhausted, in which case to `give_up` — the bounded
+  self-correct loop described in §5. Backoff on transient BigQuery/provider
+  errors happens beneath this graph entirely, inside `bq_tool.py`/the
+  provider classes — a typed transient error reaching `tools`/`call_model`
+  means backoff already ran out, so it's treated as non-self-correctable
   here.
 
 ## 3. Component Reasoning
 
 **Orchestrator — LangGraph.** Chosen over a hand-rolled loop because two
-requirements map directly onto its primitives rather than needing bespoke
-state machines: `interrupt()`/resume implements the confirm-before-delete
-flow (requirement 3) as a pause-and-resume in the graph, and checkpointing
-gives real conversation-state persistence (relevant to requirement 4's
-memory story). It's used for these mechanisms specifically, not adopted
-decoratively — the architecture diagram maps ~1:1 onto actual graph nodes.
+requirements map directly onto its primitives: `interrupt()`/resume for
+the confirm-before-delete flow (requirement 3, docs only), and
+checkpointing for conversation-state persistence (requirement 4, docs
+only). Used for these mechanisms specifically, not adopted decoratively —
+the architecture diagram maps ~1:1 onto actual graph nodes.
 
 **LLM provider — Gemini primary, OpenRouter fallback, behind a common
-interface.** Gemini via Vertex AI in production (shares IAM/audit/quota
-plumbing with the BigQuery access already required); AI Studio key in the
-prototype for simplicity. Both providers implement the same `Provider`
-protocol (`generate(contents, system_instruction, tools) ->
-GenerateContentResponse`) so `graph.py` and the circuit breaker never
-branch on which one is active. `OpenRouterProvider` (coded, in
-`openrouter_provider.py`) calls OpenRouter's OpenAI-compatible endpoint via
-the `openai` SDK pointed at OpenRouter's `base_url` — OpenRouter's own
-documented integration path, chosen over hand-rolled HTTP calls specifically
-to avoid ~60-80 lines of bespoke request/response JSON translation (role
-mapping, tool-call IDs, argument parsing) that the SDK already implements
-and tests; the SDK's own internal retry is disabled (`max_retries=0`) so
-the bounded-backoff wrapper below is the single source of retry behavior,
-not two retry policies stacking. `ProviderCircuitBreaker`
-(`circuit_breaker.py`) is a small hand-rolled, in-memory, single-process
-class — no external dependency, appropriate for a synchronous CLI
-prototype — that routes to OpenRouter after `PROVIDER_FAILURE_THRESHOLD`
-(default 2) consecutive Gemini failures, for `PROVIDER_COOLDOWN_SECONDS`
-(default 60) before Gemini is tried again; this is the concrete mechanism
-for "resilient to 3rd-party service downtime" (requirement 5). The breaker
-is only constructed when `OPENROUTER_API_KEY` is set — with no fallback
-configured, the CLI runs Gemini-only and provider failures surface directly
-as a graceful error message (see §5).
+`Provider` interface.** Gemini via Vertex AI in production (shares
+IAM/audit/quota plumbing with the BigQuery access already required); AI
+Studio key in the prototype for simplicity. `OpenRouterProvider` (coded)
+calls OpenRouter's OpenAI-compatible endpoint via the `openai` SDK —
+OpenRouter's own documented integration path, chosen to avoid hand-rolled
+request/response JSON translation the SDK already implements and tests;
+its internal retry is disabled so the bounded-backoff wrapper (§5) is the
+single source of retry behavior. `ProviderCircuitBreaker` (hand-rolled,
+in-memory, single-process — no external dependency needed for a
+synchronous CLI) opens after `PROVIDER_FAILURE_THRESHOLD` (default 2)
+consecutive Gemini failures, routes to OpenRouter for
+`PROVIDER_COOLDOWN_SECONDS` (default 60), then retries Gemini — the
+concrete mechanism for "resilient to 3rd-party downtime" (requirement 5).
+Only constructed when `OPENROUTER_API_KEY` is set; with no fallback
+configured, Gemini failures surface directly as a graceful error message.
 
-Each provider talks to its SDK directly (`google-genai`, `openai`) rather
-than through LangChain's chat model wrappers (`ChatGoogleGenerativeAI`,
-`ChatOpenAI`), a deliberate choice weighed against what requirements 5 and
-7 actually need: precise, per-SDK exception classification
-(`genai_errors.APIError.code`; `openai`'s distinct per-category exception
-types) feeding a single classification point after retries resolve (§5),
-and an `error_class` on every log line precise enough to reconstruct a
-failure from logs alone (§7). A LangChain wrapper sits between this code
-and those raw exceptions with its own retry/wrapping behavior, which would
-have to be pinned and re-verified (the same live-testing work the current
-classification already went through) for uncertain benefit — the two
-providers already share one interface (`Provider`) with no branching
-elsewhere in the codebase, so LangChain's unification wouldn't simplify
-anything requirements 5/7 depend on today, only the OpenRouter-side
-message/tool-schema translation, which is real but secondary.
-
-This is a two-provider decision, not a permanent one. If requirement 1
-(Hybrid Intelligence/Golden Bucket) moves from docs-only into coded scope,
-or a third LLM provider is added, LangChain's chat model wrappers become
-worth revisiting: `init_chat_model()`-style provider swapping and
-LangChain's retriever/vector-store integrations reduce real per-provider
-code at that point, in a way they don't for the current two-provider,
-resilience-first scope.
+Both providers talk to their SDK directly rather than through LangChain's
+chat model wrappers — see
+[implementation-notes.md](implementation-notes.md#llm-provider-raw-sdks-vs-langchain-chat-model-wrappers)
+for the full reasoning. Short version: precise per-SDK exception
+classification is what the resilience/observability requirements depend
+on, and a LangChain layer between this code and those exceptions would
+need the same live-testing verification for uncertain benefit at the
+current two-provider scope — worth revisiting if a third provider or the
+Golden Bucket's retriever integration enters coded scope.
 
 **BigQuery tool wrapper.** `src/provided/bq_runner.py` was supplied by the
-company as an example of how to query BigQuery, not a required dependency —
-it's left in the repo unused. `BigQueryTool` owns a `bigquery.Client`
-directly instead of wrapping it. The raw client (and `bq_runner.py` alike,
-since it's a thin pass-through over the same client) has no cost, safety,
-PII, or resilience behavior:
+company as an example of how to query BigQuery, not a required
+dependency — it's left in the repo unused. A raw `bigquery.Client` call
+(what it thinly wraps) has no cost cap, no statement-type check, no PII
+masking, and collapses every failure into one exception shape. The
+wrapper (`BigQueryTool`, which owns its own client) adds: a SQL read-only
+keyword/regex allowlist (SELECT/WITH only, reject DML/DDL and
+multi-statement input) with the service account's IAM read-only role as
+the real backstop; `dry_run=True` plus a ~1GB max-bytes cap (well under
+the 1TB/month free tier); a query timeout; a row limit; PII column
+stripping applied post-execution by matching each returned column's bare
+name against a maintained PII field registry; and typed error
+classification (syntax, permission, transient, empty-result) so the
+orchestrator can decide retry vs. self-correct vs. give-up instead of
+re-parsing a bare exception.
 
-- *Cost*: no dry-run/bytes estimate, no max-bytes cap, no row limit
-  (an unbounded `.to_dataframe()` pulls the full result set), no timeout on
-  `query_job.result()` — a runaway query has no ceiling and can hang.
-- *Safety*: SQL is passed straight to `client.query()` with no
-  statement-type check — nothing stops DML/DDL or multi-statement input at
-  the application layer.
-- *PII*: query results return whatever columns are selected, verbatim,
-  with no masking; schema lookups expose PII column names/types with
-  no sensitivity flag.
-- *Resilience*: a bare client call raises whatever the underlying library
-  raises, collapsing syntax errors, permission errors, quota errors, and
-  transient network failures into one shape — a caller can't tell "retry"
-  from "fix the SQL" from "give up" without re-parsing the raw exception.
+The PII match is name-based, not a true schema-driven allow-list — it can
+miss a column renamed in the query, or one added to the live schema after
+the registry was written. See
+[implementation-notes.md](implementation-notes.md#bigquery-pii-stripping-name-based-matching-not-a-true-allow-list)
+for why that trade-off was accepted (a true allow-list would also drop
+legitimate aggregate columns like `SUM(sale_price) AS total_revenue`) and
+what covers the gap. The registry was verified against the live `users`
+schema during development, not just typed from the brief — that check
+caught two columns (`postal_code`, `user_geom`) absent from the
+assignment's original PII list before they could leak.
 
-The wrapper therefore adds: a SQL read-only keyword/regex allowlist
-(SELECT/WITH only, reject DML/DDL keywords and multi-statement input) with
-an IAM read-only role on the service account as the real backstop — an AST
-parser was considered and rejected as over-building against a threat model
-IAM already covers; `dry_run=True` plus a ~1GB max-bytes cap (generous
-against thelook_ecommerce's actual table sizes, well under the 1TB/month
-free tier); a query timeout; a row limit; PII column stripping applied
-post-execution, matching each returned column's bare name (case-insensitive,
-table-qualifier stripped) against a maintained PII field registry — and typed
-error classification (syntax/bad-request, permission, transient/timeout,
-empty-result) so the orchestrator can decide retry vs. self-correct vs.
-give-up instead of re-parsing a bare exception.
+**Golden Bucket (docs only).** Question embedded at query time
+(`text-embedding-004`), top-k (e.g. k=3) cosine/ANN retrieval against
+Vertex AI Vector Search (pgvector on Cloud SQL is an acceptable cheaper
+alternative) — retrieved (question, sql, report) trios are injected as
+few-shot context before SQL generation and again as style/structure cues
+before report writing. Update path is human-curated, not automatic: a
+trio is appended only after a human analyst approves or edits the
+generated report, specifically to avoid feedback-loop drift where an
+unreviewed mistake compounds into future retrievals. Periodic
+maintenance: dedup near-identical trios, down-weight/archive trios past a
+freshness horizon (e.g. 12 months), and version trios rather than
+overwrite them in place.
 
-This is name-based matching, not a true schema-driven allow-list: it can't
-tell that `first_name AS x` is PII once renamed, and it doesn't
-automatically catch a column added to the live schema tomorrow that isn't
-in the registry yet. Both gaps are accepted trade-offs, not oversights — a
-real allow-list (only pass through columns from a pre-approved safe list)
-would also silently drop legitimate computed/aggregated columns
-(`SUM(sale_price) AS total_revenue`), which an analysis agent needs to
-return constantly, so it isn't viable here without full SQL parsing (which
-§3 already rejects as over-building). The renaming gap is covered by
-defense-in-depth (the input-side guardrail and the IAM read-only role), not
-by this function. The registry itself was verified against the live
-`users` schema during prototype development, not just typed from the brief
-— that check caught two columns absent from the assignment's original PII
-list (`postal_code`, `user_geom`, a GEOGRAPHY point encoding the same
-location `latitude`/`longitude` carry) before they could leak, which is
-exactly the schema-drift scenario this control needs to survive; in
-production this check should be a scheduled job diffing the live schema
-against the registry, not a one-time manual pass.
+**Saved Reports Store (docs only).** Cloud SQL/Postgres, schema: `id,
+owner, title, content, conversation_id, created_at, tags` — gives real
+queryable delete-scoping (`WHERE owner = ? AND content LIKE ?`), which is
+what the confirm-then-delete flow in requirement 3 actually needs rather
+than asserts in prose. Not built in the prototype (§9); "create a report
+with action items" — the base deliverable-3 ask, distinct from
+requirement 3 — is satisfied by the agent formatting its chat answer as a
+report, with no persistence layer required.
 
-**Golden Bucket.** Question embedded at query time (`text-embedding-004`),
-top-k (e.g. k=3) cosine/ANN retrieval against Vertex AI Vector Search
-(pgvector on Cloud SQL is an acceptable cheaper alternative) — retrieved
-(question, sql, report) trios are injected as few-shot context before SQL
-generation and again as style/structure cues before report writing. Update
-path is human-curated, not automatic: a trio is appended only after a
-human analyst approves or edits the generated report, specifically to
-avoid feedback-loop drift where an unreviewed mistake compounds into
-future retrievals. Periodic maintenance: dedup near-identical trios,
-down-weight/archive trios past a freshness horizon (e.g. 12 months, since
-"why did revenue rise" from a year ago may not reflect current dynamics),
-and version trios rather than overwrite them in place.
+**User Preference Store (docs only).** Firestore doc per manager
+(preferred format, analysis depth, updated_at), read into the system
+prompt each turn, written after an explicit ("just give me the numbers")
+or recurring implicit preference signal.
 
-**Saved Reports Store (docs only — not built in the prototype).** Cloud
-SQL/Postgres in production, schema: `id, owner, title, content,
-conversation_id, created_at, tags`. This gives real queryable
-delete-scoping (`WHERE owner = ? AND content LIKE ?`), which is what the
-confirm-then-delete flow in requirement 3 actually needs rather than
-asserts in prose. The prototype's build order (§9) stops before High-Stakes
-Oversight, so this store — and the delete flow it exists to support — is
-design only; "create a report with action items" (deliverable 3's base
-ask, distinct from requirement 3) is satisfied by the agent formatting its
-chat answer as a report, with no persistence layer required.
+**Persona Config (docs only).** A single versioned instruction document
+external to code — a Firestore row or Cloud Storage file, editable
+through a small internal admin surface with no engineering ticket, read
+fresh each session. This is the concrete mechanism for "CEO changes tone
+weekly, no redeploy" (requirement 8).
 
-**User Preference Store.** Firestore doc per manager (preferred format,
-analysis depth, updated_at), read into the system prompt each turn, written
-after an explicit ("just give me the numbers") or recurring implicit
-preference signal. Docs-only in the prototype — not in the assignment's
-prototype-eligible requirement list.
-
-**Persona Config.** A single versioned instruction document external to
-code — a Firestore row or Cloud Storage file, editable through a small
-internal admin surface with no engineering ticket, read fresh each session.
-This is the concrete mechanism for "CEO changes tone weekly, no redeploy"
-(requirement 8).
-
-**Observability (docs only — not built as a coded requirement in the
-prototype).** One structured JSON log line per LLM call / tool call / turn
-(conversation_id, user, intent, sql, rows_returned, tokens, latency_ms,
-error_class, self_correct_attempt) is the target shape. What the prototype
-actually has is narrower: stdlib `logging` calls with `extra=` fields at
-each error/retry site (§5), added incidentally as part of building
-resilience depth, not as a deliberate implementation of requirement 7 —
-there's no per-turn structured JSON line, and no log covers the successful
-(non-error) path. §9's build order stops before the dedicated observability
-step, so this gap is by design, not yet-unfinished. Production ships the
-full log shape to Cloud Logging
-(metrics/alerting substrate) *and* adds real cross-call conversation
-tracing via **Langfuse**, chosen specifically because it plugs into
-LangGraph as a native callback handler — no hand-rolled OpenTelemetry spans
-needed, since the orchestration framework already emits everything a
-tracer needs. Self-hosted Langfuse over LangSmith: this system already
-treats PII as something that must never leave its boundary, and a trace of
-prompts/SQL/tool output is exactly the kind of payload you don't want
-handed to a third-party SaaS by default; self-hosting keeps trace data in
-the same infra boundary as everything else. (LangSmith remains a valid
-alternative if the org already has LangChain-ecosystem buy-in.) Whatever
-tracer is used, it must trace **post-PII-strip** data only — tracing raw
-BigQuery output would reopen the exact leak the wrapper's PII stripping
-closes. Cloud Monitoring dashboards/alerts sit on top of the Cloud Logging
-stream for error rate, self-correct rate, latency, PII-block rate,
-delete-confirmation rate, and daily cost; Langfuse covers the
-conversation-level "what exactly happened in this exchange" deep-dive that
-raw metrics can't.
+**Observability (docs only as a coded requirement — see §9).** Target
+shape: one structured JSON log line per LLM call / tool call / turn
+(conversation_id, intent, sql, rows_returned, tokens, latency_ms,
+error_class, self_correct_attempt). The prototype has only incidental
+`logging` calls with `extra=` fields at error/retry sites, added as a
+by-product of building resilience depth (§5), not a deliberate
+implementation of this requirement — there's no per-turn structured JSON
+line and no log covers the successful path. Production ships the full
+log shape to Cloud Logging (metrics/alerting substrate) *and* adds
+cross-call conversation tracing via self-hosted **Langfuse**, chosen
+because it plugs into LangGraph as a native callback handler — no
+hand-rolled OpenTelemetry spans needed. Self-hosted over LangSmith:
+tracing must cover the same PII boundary the rest of this system respects,
+and self-hosting keeps trace data in the same infra boundary rather than
+handing prompts/SQL/tool output to a third-party SaaS by default —
+whatever tracer is used, it must trace **post-PII-strip** data only.
+Cloud Monitoring dashboards/alerts sit on top of the Cloud Logging stream
+for error rate, self-correct rate, latency, PII-block rate, and daily
+cost; Langfuse covers the conversation-level "what exactly happened in
+this exchange" deep-dive that raw metrics can't.
 
 ## 4. Data Flow
 
-Two paths through the same orchestrator, described here at production
-scope. The prototype implements only the coded steps of the Q&A path (see
-§9); Golden Bucket retrieval, persona config, and the entire Delete path
-are design only.
+Described here at production scope; the prototype implements only the
+coded steps of the Q&A path below (§9) — Golden Bucket retrieval, persona
+config, user preferences, and the entire Delete path are docs only.
 
 **Q&A / analysis path**: user message → lightweight guardrail check
 (analysis vs. off-topic/malicious vs. delete-intent) → embed question,
-retrieve top-k Golden Bucket trios (docs only) → LLM generates SQL using
-trios + schema as context → BQ wrapper validates (read-only check) →
-dry-run (reject over cap) → execute with timeout + row limit → PII-strip
-the DataFrame → LLM synthesizes the report/answer using persona config
-(docs only) + (prod: user preferences, docs only) → response returned to
-the client and logged.
+retrieve top-k Golden Bucket trios → LLM generates SQL using trios +
+schema as context → BQ wrapper validates (read-only check) → dry-run
+(reject over cap) → execute with timeout + row limit → PII-strip the
+DataFrame → LLM synthesizes the report/answer using persona config + user
+preferences → response returned to the client and logged.
 
-**Delete path (docs only — not built in the prototype)**: user message →
-LLM resolves the request into candidate report(s) via a store query scoped
-to the requesting user (never cross-user) → orchestrator lists the exact
-candidates and pauses via `interrupt()` → next user turn: "yes" resumes the
-graph and executes the delete against the store; anything else aborts.
-Both outcomes are logged. Non-mutating actions (e.g. "show me my reports")
-never trigger this pause — only the delete itself does, keeping the added
-friction to one turn. This entire path depends on the Saved Reports Store
-(§3), which the prototype's build order (§9) stops short of.
+**Delete path**: user message → LLM resolves the request into candidate
+report(s) via a store query scoped to the requesting user (never
+cross-user) → orchestrator lists the exact candidates and pauses via
+`interrupt()` → next user turn: "yes" resumes the graph and executes the
+delete against the store; anything else aborts. Both outcomes are logged.
+Non-mutating actions (e.g. "show me my reports") never trigger this
+pause — only the delete itself does, keeping the added friction to one
+turn. This entire path depends on the Saved Reports Store (§3).
 
 ## 5. Error Handling & Fallback Strategies
 
 Coded (`errors.py`, `bq_tool.py`, `graph.py`, `llm_provider.py`,
 `openrouter_provider.py`, `circuit_breaker.py`, `resilience.py`). Every
 `AgentError` subclass carries a `self_correctable: bool` flag and a
-`graceful_message` — the graph routes on the flag, never on ad hoc
+`graceful_message` — the graph routes on the flag, never ad hoc
 isinstance checks, and `errors.graceful_message_for(...)` is the single
 place user-facing copy for a failure class lives.
 
-Two independent retry mechanisms exist below, and they share vocabulary
-("transient," "retry") on purpose, since both describe the same real-world
-condition — worth naming up front so they never read as contradicting each
-other: **backoff** (inside `bq_tool.py`/the providers, via
-`resilience.bounded_backoff`) retries the *same* call automatically when
+Two independent retry mechanisms: **backoff** (inside
+`bq_tool.py`/the providers) retries the *same* call automatically when
 the client's raw exception looks transient. **Self-correct** (in
 `graph.py`, gated by `self_correctable`) lets the *model* retry with a
-*different* query, only after a typed error reaches the graph. A
-`QueryTransientError`/`ProviderTransientError` is a case where the first
-already ran, twice, and failed both times — which is exactly why the
-second is `self_correctable = False` for it: not a contradiction, two
-different questions ("is retrying this call worth attempting at all" vs.
-"would a *different* query fix it") answered differently for the same
-failure, at two different points in the pipeline.
+*different* query, only after a typed error reaches the graph. See
+[implementation-notes.md](implementation-notes.md#two-retry-mechanisms-backoff-vs-self-correct)
+for why these are deliberately separate mechanisms rather than a
+contradiction.
 
-- The BQ wrapper raises typed errors instead of bare exceptions, fixing the
-  raw-client gap described in §3: `QuerySyntaxError` (BigQuery
-  `BadRequest`/`NotFound`/`Conflict`), `QueryPermissionError`
-  (`Forbidden`/`Unauthorized`), `QueryTransientError`
-  (`ServerError`/`TooManyRequests`/`RetryError`/timeouts), and
-  `QueryExecutionError` itself as a defensive fallback for any exception
-  type not yet classified — logged as `bq_unclassified_exception` so a
-  recurring one gets a new typed subclass added, and treated as terminal
-  (not retried) until it does.
-- **Syntax/bad-request** (`QuerySyntaxError`, also `SQLSafetyError` and
-  `QueryTooExpensiveError`) → self-correctable. The error is fed back to
-  the model as the tool's `FunctionResponse`; `graph.py`'s
-  `self_correct_attempts` counter (reset once per turn, i.e. once per
-  `graph.invoke()` call) is bumped on each self-correctable failure and
-  compared against `MAX_SELF_CORRECT_ATTEMPTS = 2` — attempt 1 and 2 route
-  back to `call_model` for a retry, attempt 3 routes to the `give_up` node
-  instead. Net effect: exactly 2 self-correct retries, 3 total SQL attempts,
-  then a graceful "couldn't produce a valid query" message — never a raw
-  stack trace, never an unbounded retry loop that inflates cost.
-- **Self-correct operates on the whole round, not per tool call.** A single
-  model turn can fire multiple function calls at once (e.g. `get_schema` on
-  two tables before writing SQL). If that round has a mix of outcomes —
-  say one call succeeds or fails self-correctably, but another fails with
-  a non-self-correctable error — `route_after_tools` gives up immediately
-  for the *entire* turn, discarding the other calls' results even though
-  they were independently fine. This is a deliberate limitation, not an
-  oversight: each `call_model` regenerates the *entire* set of function
-  calls fresh from the full history, so there's no mechanism to retry only
-  the fixable call while preserving a prior success from the same round —
-  and retrying anyway would be wasted cost, since the blocked call would
-  just fail identically again. A more granular per-call retry design
-  (tracking retry state per tool call, accepting the blocked one as a
-  permanent gap, returning a partial answer) is a valid alternative this
-  architecture doesn't support today. Covered by
-  `test_mixed_round_non_self_correctable_error_wins_over_self_correctable_one`
-  and `test_mixed_round_non_self_correctable_error_wins_even_over_a_success`
-  in `test_graph.py`.
-- **Permission error** (`QueryPermissionError`) → not self-correctable
-  (no query rewrite fixes an IAM grant) — routes straight to `give_up` on
-  the first occurrence, no retry.
-- **Empty result** → not an exception (0 rows is a valid tool result); one
-  extra pass only, tracked by a `empty_result_sanity_checked` flag (also
-  reset per turn) — a note is injected into the first zero-row
-  `FunctionResponse` asking the model to sanity-check its own filters/joins
-  before accepting "zero rows" as the real answer, but a second zero-row
-  result in the same turn is accepted rather than looping. The flag is
-  turn-scoped, not query-scoped: if a turn asks a compound question that
-  needs two unrelated `run_query` calls and *both* unexpectedly return zero
-  rows, only the first gets nudged — the second is silently accepted. A
-  per-query-identity fix (e.g. keyed by SQL text, plus a small total cap so
-  a repeatedly-reworded query can't nudge forever) would close this, but
-  isn't implemented — a boolean is the simplest thing that catches the
-  common case without risking runaway nudging on a genuinely-zero answer.
-  A second, more fundamental gap surfaced during live testing: the check
-  is `row_count == 0`, which only describes an *unaggregated* empty result
-  (a raw `SELECT` matching no rows). A `COUNT(*)` query — almost certainly
-  the single most natural way an LLM answers any "how many" question —
-  always returns exactly one row (the count itself, however small), so the
-  note never fires for the most common shape of the exact question class
-  it exists to catch. Not fixed; recorded because it means the mechanism's
-  real-world trigger rate is likely far lower than the design assumed.
-- **Transient/timeout** (backoff layer) → exponential backoff, 2 attempts
-  total, via a shared `resilience.bounded_backoff(...)` (`tenacity`-based)
-  policy used at all three retry sites (`bq_tool.py`, `llm_provider.py`,
-  `openrouter_provider.py`), entirely internal to the failing component —
-  the graph never sees a retry happen. The retry condition and the
-  classification step are deliberately separate: each site wraps a private
-  `_call_bq_raw`/`_generate_raw` helper that retries on the client's own
-  raw exception signal — a type tuple for `bq_tool.py` and
-  `openrouter_provider.py`, since `google.api_core.exceptions` and the
-  `openai` SDK both raise a distinct type per failure category, or a
-  `tenacity.retry_if_exception` predicate for `llm_provider.py`, since
-  `google.genai.errors` lumps every 4xx into one `ClientError` type and
-  every 5xx into one `ServerError` type, distinguishable only by a `.code`
-  attribute. Classification into the typed `AgentError` vocabulary happens
-  exactly once, in the public `_call_bq`/`generate` method, only after
-  retries are resolved one way or the other — not inside the retried call
-  itself, which would either log a failure that later succeeds on retry, or
-  make the retry condition match a synthetic type this codebase invented
-  rather than the client's real one.
-- **Transient/timeout** (self-correct layer) → once backoff is exhausted,
-  the typed `QueryTransientError`/`ProviderTransientError` reaches the
-  graph already `self_correctable = False` — `QueryTransientError` routes
-  straight to `give_up`; `ProviderTransientError` propagates out of
-  `graph.invoke()` entirely (see next bullet).
-- **LLM provider failure** → `ProviderCircuitBreaker` (in front of
-  `call_model`, constructed in `cli.py` only when `OPENROUTER_API_KEY` is
-  set) counts consecutive Gemini failures; at `PROVIDER_FAILURE_THRESHOLD`
-  (default 2) it opens and routes to `OpenRouterProvider` for
-  `PROVIDER_COOLDOWN_SECONDS` (default 60), logged as a `provider_failover`
-  event, then tries Gemini again. Live testing surfaced a real
-  classification gap: an invalid Gemini API key returns HTTP 400
-  (`INVALID_ARGUMENT`), not 401/403 — `_classify_genai_error`'s
-  `exc.code in (401, 403)` check doesn't match it, so it falls through to
-  the generic `ProviderError` instead of the more specific
-  `ProviderAuthError`. The actual reason (`API_KEY_INVALID`) is present,
-  but nested three levels into the error response
-  (`exc.details["error"]["details"][0]["reason"]`) — matching it reliably
-  would mean depending on that exact nested shape, which is fragile
-  against a Google-side response format change. Not fixed: both classes
-  are non-self-correctable and both produce a graceful message, so there's
-  no functional or safety difference — only the graceful message's wording
-  and the log's `error_class` are affected, an observability gap rather
-  than a behavioral one. `call_model` itself does not catch
-  provider errors — a `ProviderError` that survives the breaker/backoff
-  propagates out of `graph.invoke()` and is caught by `cli.py`'s existing
-  top-level `except AgentError` handler, which prints the graceful message
-  and keeps the REPL loop alive; no separate graph node duplicates that
-  handling. With no `OPENROUTER_API_KEY` configured, the CLI runs
-  Gemini-only and a Gemini failure surfaces the same way once
-  backoff is exhausted.
-- Every failure path is logged (Python stdlib `logging`, structured
-  `extra=` fields — a by-product of building resilience depth, not a
-  deliberate implementation of requirement 7; see the Observability note
-  in §3) with its error class:
-  `bq_call_failed`/`bq_unclassified_exception` (BQ wrapper),
-  `tool_call_error`/`agent_terminal_error` (graph), `provider_call_failed`
-  (either provider), `provider_failure`/`provider_failover` (circuit
-  breaker). No path crashes the CLI loop; every path terminates in either
-  a valid answer or a bounded, legible error message.
+| Error class | Mechanism | Outcome |
+|---|---|---|
+| Syntax/bad-request (`QuerySyntaxError`, `SQLSafetyError`, `QueryTooExpensiveError`) | Self-correct | Fed back to the model as the tool result; up to 2 retries (`MAX_SELF_CORRECT_ATTEMPTS`), 3rd attempt routes to `give_up` with a graceful message — never an unbounded loop |
+| Permission (`QueryPermissionError`) | None | Straight to `give_up` on first occurrence — no query rewrite fixes an IAM grant |
+| Empty result (0 rows) | One sanity-check pass | Model is nudged once per turn to check its own filters/joins before accepting "zero rows"; a second zero-row result in the same turn is accepted rather than looping |
+| Transient/timeout — BQ or provider (`QueryTransientError`/`ProviderTransientError`) | Backoff (2 attempts, exponential, `tenacity`-based, shared across all 3 retry sites) | If backoff exhausts, the typed error reaches the graph already non-self-correctable → `give_up` (BQ), or propagates to `cli.py`'s top-level `except AgentError` handler (provider), which prints the graceful message and keeps the REPL loop alive |
+| LLM provider failure | Circuit breaker (§3) | Opens after `PROVIDER_FAILURE_THRESHOLD` consecutive Gemini failures, routes to OpenRouter for `PROVIDER_COOLDOWN_SECONDS`, then retries Gemini |
+
+Self-correct operates on the whole model turn, not per tool call — if a
+turn fires multiple tool calls and one fails non-self-correctably while
+another succeeds, the entire turn gives up rather than keeping the
+successful result. Deliberate, not an oversight (each `call_model`
+regenerates the whole call set fresh, so there's no partial-retry path) —
+see
+[implementation-notes.md](implementation-notes.md#known-gaps-found-during-testing)
+for the full reasoning and test coverage.
+
+Every failure path is logged (Python stdlib `logging`, `extra=` fields —
+see the Observability note in §3) with its error class
+(`bq_call_failed`/`bq_unclassified_exception`, `tool_call_error`,
+`provider_call_failed`, `provider_failover`, etc.). No path crashes the
+CLI loop; every path terminates in either a valid answer or a bounded,
+legible error message. Two gaps found during live testing — an
+empty-result check that doesn't fire for `COUNT(*)` queries, and an
+invalid-API-key error classified as a generic `ProviderError` instead of
+`ProviderAuthError` — are recorded in
+[implementation-notes.md](implementation-notes.md#known-gaps-found-during-testing);
+neither has a functional or safety impact, both affect only log/message
+wording.
 
 ## 6. Requirement-by-Requirement Handling
 
-**1. Hybrid Intelligence (docs-only in prototype).** See Golden Bucket in
-§3 for retrieval and update mechanics. The key design choice is the
-human-in-the-loop update gate: the bucket only grows from
-analyst-approved reports, trading update speed for protection against
-the agent reinforcing its own errors.
+**1. Hybrid Intelligence — docs only.** See Golden Bucket in §3. Key
+design choice: a human-in-the-loop update gate — the bucket only grows
+from analyst-approved reports, trading update speed for protection
+against the agent reinforcing its own errors.
 
-**2. Safety & PII Masking (coded).** Two independent layers: an
-input-side guardrail rejects off-topic/malicious requests before any tool
-call happens, and an output-side hard control — name-based PII column
-stripping in the BQ wrapper (§3) — guarantees known-PII columns never leave
-the wrapper even if the guardrail is bypassed and the LLM generates a query
-touching them. This caught a real gap during prototype development: the
-live `users` schema has two sensitive columns (`postal_code`, `user_geom`)
-absent from the assignment's original PII list, found by inspecting the
-schema directly rather than trusting the brief's list as complete — see §3
-for the full reasoning on why this is name-based matching, not a true
-allow-list, and what that trade-off does and doesn't cover. Defense in
-depth: the read-only SQL check and the service account's IAM read-only role
-are independent backstops against a malicious or buggy query in the first
-place.
+**2. Safety & PII Masking — coded.** Two independent layers: an
+input-side guardrail rejects off-topic/malicious requests before any
+tool call happens, and an output-side hard control — name-based PII
+column stripping in the BQ wrapper (§3) — guarantees known-PII columns
+never leave the wrapper even if the guardrail is bypassed. Defense in
+depth: the read-only SQL check and the service account's IAM read-only
+role are independent backstops against a malicious or buggy query in the
+first place.
 
-**3. High-Stakes Oversight (docs only).** See delete path in §4. The
+**3. High-Stakes Oversight — docs only** (eligible for the prototype,
+deliberately not coded — see §9). See delete path in §4. The
 resolve-then-list-then-confirm shape is the intended safeguard; the
 confirmation mechanism itself (a plain yes/no next turn) is deliberately
 boring so it wouldn't become UX friction for a routine action users are
-allowed to take on their own reports. Eligible for the prototype per the
-assignment's deliverable-3 list, but not coded — the prototype's scope is
-fixed at exactly two requirements (§9), and this wasn't one of them.
+allowed to take on their own reports.
 
-**4. Continuous Improvement (docs-only).** User-level: preference profile
-described in §3, injected into the system prompt. System-level: explicitly
+**4. Continuous Improvement — docs only.** User-level: preference
+profile (§3), injected into the system prompt. System-level: explicitly
 *not* automatic fine-tuning — high risk for a decision-support tool.
 Instead, positively-signaled interactions (saved/approved reports) become
 Golden Bucket candidates (requirement 1), and a periodic (e.g. weekly)
 human review of low-signal interactions (self-correct exhausted, user
 abandoned, explicit negative feedback) feeds a prompt/instruction
-changelog reviewed by an engineer. Improvement happens at the prompt and
-bucket layer with a human gate, not via silent model retraining.
+changelog reviewed by an engineer.
 
-**5. Resilience & Graceful Error Handling (coded).** See §5 in full.
+**5. Resilience & Graceful Error Handling — coded.** See §5.
 
-**6. Quality Assurance (docs only).** Offline golden eval set —
-representative questions with expected SQL shape and expected report
-themes/facts, curated by a human analyst, ideally later sourced from real
-analyst-approved Golden Bucket entries. Correctness is scored by an
-LLM-as-judge rubric (right numbers, answers the actual question, no PII),
-periodically cross-checked against human grading to catch judge drift, and
-re-run as a regression gate before any prompt/persona/bucket change ships.
-UX would be evaluated from the same structured logs Observability would
-capture — turns-to-answer, clarification-request rate, self-correct rate,
-delete-confirmation abandonment rate — rather than a separate survey
-mechanism. Eligible for the prototype, but no eval script or golden set
-exists in this repo; the prototype's scope is fixed at exactly two
-requirements (§9), and this wasn't one of them.
+**6. Quality Assurance — docs only** (eligible for the prototype,
+deliberately not coded — see §9). Offline golden eval set — representative
+questions with expected SQL shape and report themes, curated by a human
+analyst — scored by an LLM-as-judge rubric (right numbers, answers the
+actual question, no PII), periodically cross-checked against human
+grading, re-run as a regression gate before any prompt/persona/bucket
+change ships. UX would be evaluated from the same structured logs
+Observability would capture, rather than a separate survey mechanism.
 
-**7. Observability (docs only).** See §3. In production, because every log
-line would carry `conversation_id`, a full exchange (every LLM call, tool
-call, and outcome) could be reconstructed by filtering the JSON log — the
-concrete mechanism for "understand what went wrong in this exact
-exchange." A Langfuse trace view would give the same reconstruction
-without a log grep, since Langfuse attaches to LangGraph's own execution
-graph and needs no extra instrumentation code per call site. The prototype
-has only the incidental `logging` calls described in §5 — no per-turn
-structured JSON line, no `conversation_id`, no coverage of the successful
-path — added as a by-product of resilience work, not as a coded
-implementation of this requirement; the prototype's scope is fixed at
-exactly two requirements (§9), and this wasn't one of them.
+**7. Observability — docs only** (eligible for the prototype,
+deliberately not coded — see §9; only the incidental `logging` calls from
+resilience work exist today). See §3. In production, every log line
+would carry `conversation_id`, so a full exchange could be reconstructed
+by filtering the JSON log; a Langfuse trace view gives the same
+reconstruction without a log grep.
 
-**8. Agility / Persona Management (docs only).** See Persona Config in §3.
-A CEO-requested tone change ships by editing an external document, not by
-a code deploy.
+**8. Agility / Persona Management — docs only.** See Persona Config in
+§3. A CEO-requested tone change ships by editing an external document,
+not by a code deploy.
 
-## 7. Quality Assurance / Evaluation (docs only)
+## 7. Quality Assurance / Evaluation
 
 See requirement 6 above for the full approach. In short: a curated golden
 set + LLM-as-judge scoring (spot-checked by humans) as a pre-ship
@@ -570,13 +387,13 @@ Optional env vars (defaults shown): `GEMINI_MODEL=gemini-3.6-flash`,
 `BQ_MAX_BYTES_BILLED=1000000000` (~1GB), `BQ_ROW_LIMIT=500`,
 `BQ_QUERY_TIMEOUT_SECONDS=30`, `LOG_LEVEL=INFO`.
 
-Provider fallback / circuit breaker (resilience-depth slice, build order
-step 2 — coded): `OPENROUTER_API_KEY` (unset by default — the CLI runs
-Gemini-only with no circuit breaker when it's absent, since there's nowhere
-to fail over to), `OPENROUTER_MODEL=openai/gpt-4o-mini`,
-`PROVIDER_FAILURE_THRESHOLD=2` (consecutive Gemini failures before the
-breaker opens), `PROVIDER_COOLDOWN_SECONDS=60` (how long OpenRouter is used
-before Gemini is tried again).
+Provider fallback / circuit breaker (resilience-depth slice — coded):
+`OPENROUTER_API_KEY` (unset by default — the CLI runs Gemini-only with no
+circuit breaker when it's absent, since there's nowhere to fail over to),
+`OPENROUTER_MODEL=openai/gpt-4o-mini`, `PROVIDER_FAILURE_THRESHOLD=2`
+(consecutive Gemini failures before the breaker opens),
+`PROVIDER_COOLDOWN_SECONDS=60` (how long OpenRouter is used before Gemini
+is tried again).
 
 Run the test suite: `uv run pytest`. This runs only the unit tests by
 default. `tests/integration/` — live regression checks against real
@@ -614,7 +431,7 @@ drafts of this example aren't in the prototype — see §9.
 | 4. Continuous Improvement | Docs only | Firestore preference store; human-gated system learning |
 | 5. Resilience & Error Handling | **Coded** — typed errors, self-correct, backoff, circuit breaker | Same, at scale |
 | 6. Quality Assurance | Docs only — eligible for the prototype, deliberately not coded | Golden eval set + scoring script, judge-drift audits |
-| 7. Observability | Docs only — eligible for the prototype, deliberately not coded (only incidental `logging` calls from resilience work exist, see §3/§6) | Structured JSON logs → Cloud Logging + Monitoring dashboards/alerts + Langfuse (self-hosted) for conversation-level tracing |
+| 7. Observability | Docs only — eligible for the prototype, deliberately not coded | Structured JSON logs → Cloud Logging + Monitoring dashboards/alerts + Langfuse (self-hosted) for conversation-level tracing |
 | 8. Agility (Persona) | Docs only | Firestore/Cloud Storage config, admin surface |
 
 Exactly 2 of 8 requirements are coded (both eligible for the prototype per
@@ -623,5 +440,6 @@ eligible requirements (High-Stakes Oversight, Quality Assurance,
 Observability) are a deliberate scope decision, not a time cutoff — the
 build order (see `CLAUDE.md`) stops after resilience depth by design. The
 remaining 3 requirements (Hybrid Intelligence, Continuous Improvement,
-Agility) were never in the assignment's prototype-eligible list, so they're
-designed here in full but were never candidates for coding either way.
+Agility) were never in the assignment's prototype-eligible list, so
+they're designed here in full but were never candidates for coding
+either way.

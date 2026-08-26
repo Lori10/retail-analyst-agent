@@ -1,7 +1,7 @@
 # Retail Data Analysis Agent
 
 Take-home assignment. Full brief: @docs/assignment.md — read it before doing anything.
-Design decisions and HLD live in @docs/design.md (source of truth; update it when a decision changes).
+Design decisions and HLD live in @docs/design.md (source of truth; update it when a decision changes). Implementation-level detail, rejected alternatives, and gaps found during testing live in @docs/implementation-notes.md — kept separate so design.md stays a fast read.
 
 ## Constraints
 - Python 3.11, uv for deps
