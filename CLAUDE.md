@@ -1,7 +1,7 @@
 # Retail Data Analysis Agent
 
 Take-home assignment. Full brief: @docs/assignment.md — read it before doing anything.
-Design decisions and HLD live in @docs/design.md (source of truth; update it when a decision changes).
+Design decisions and HLD live in @docs/design.md (source of truth; update it when a decision changes). Implementation-level detail, rejected alternatives, and gaps found during testing live in @docs/implementation-notes.md — kept separate so design.md stays a fast read.
 
 ## Constraints
 - Python 3.11, uv for deps
@@ -23,12 +23,16 @@ Design decisions and HLD live in @docs/design.md (source of truth; update it whe
   cleverness.
 
 ## Prototype scope (requirements implemented in code)
-Primary: Safety & PII Masking, Resilience & Graceful Error Handling.
-Secondary: High-Stakes Oversight (delete confirmation), basic Observability
-(structured tracing), Quality Assurance (golden-set eval harness).
-Everything else (Hybrid Intelligence/Golden Bucket, Continuous Improvement,
-Agility/Persona Management) is covered in docs only — not in the assignment's
-eligible-for-prototype list, so no grading credit for coding them.
+Coded: Safety & PII Masking, Resilience & Graceful Error Handling — exactly
+these two, satisfying the assignment's "at least 2 of 5" minimum for
+deliverable 3. Nothing else gets coded, including the other three
+prototype-eligible requirements.
+Docs only: High-Stakes Oversight (delete confirmation), Observability
+(structured tracing), Quality Assurance (golden-set eval harness) — all
+eligible for the prototype but deliberately left as design only, to keep
+the coded surface to exactly two slices. Also docs only, and never eligible
+for the prototype in the first place: Hybrid Intelligence/Golden Bucket,
+Continuous Improvement, Agility/Persona Management.
 
 ## Workflow
 - Design before code. Don't write source until docs/design.md is agreed.
@@ -36,11 +40,12 @@ eligible-for-prototype list, so no grading credit for coding them.
 - Build order: (1) thin end-to-end skeleton — CLI → LangGraph tool-calling
   loop → Gemini → BQ wrapper with PII stripping and cost/timeout/row caps;
   (2) resilience depth — typed errors, bounded self-correct, backoff,
-  provider circuit breaker; (3) High-Stakes Oversight — reports store +
-  interrupt-based confirm-then-delete; (4) observability — instrument
-  incrementally as each piece above is built, not as a late bolt-on;
-  (5) QA/eval harness against the working agent; (6) polish — docs, clean-
-  machine setup test.
+  provider circuit breaker; (3) polish — docs, clean-machine setup test.
+  The prototype stops at (2). High-Stakes Oversight (reports store +
+  interrupt-based confirm-then-delete), observability (structured JSON
+  tracing), and a QA/eval harness are all designed in docs/design.md but
+  deliberately not coded — scope is fixed at exactly the two requirements
+  above.
 - Write tests for PII filtering and delete confirmation first.
 - Ask before adding a dependency.
 
