@@ -372,8 +372,34 @@ the intended production approach only.
 
 ## 8. Setup Instructions & Example Run
 
+Two independent things need to be configured, and they have different
+prerequisites — Gemini is a single API key with nothing else to install;
+BigQuery needs the `gcloud` CLI and a real GCP project, even though the
+dataset being queried (`thelook_ecommerce`) is public.
+
+**1. Python environment**
+
+- Python 3.11
+- [`uv`](https://docs.astral.sh/uv/getting-started/installation/) installed
+
+**2. Gemini (LLM provider)**
+
+- Get a free API key from [Google AI Studio](https://aistudio.google.com/apikey)
+- No other setup — this is just `GEMINI_API_KEY` in `.env`
+
+**3. BigQuery (data source)**
+
+- Install the [`gcloud` CLI](https://cloud.google.com/sdk/docs/install) if
+  you don't already have it
+- Have (or create) a GCP project with the BigQuery API enabled and billing
+  active — required even though `thelook_ecommerce` is a public dataset,
+  because dry-run cost estimation and query execution both run as *your*
+  project, not the dataset owner's
+- Run `gcloud auth application-default login` once (opens a browser) to
+  create local Application Default Credentials
+- Set `GOOGLE_CLOUD_PROJECT` in `.env` to that project's ID
+
 ```bash
-# Prerequisites: Python 3.11, uv, a GCP project with BigQuery API enabled
 gcloud auth application-default login
 cp .env.example .env   # fill in GOOGLE_CLOUD_PROJECT and GEMINI_API_KEY
 # or export them directly — .env is picked up automatically (python-dotenv),
@@ -382,6 +408,15 @@ cp .env.example .env   # fill in GOOGLE_CLOUD_PROJECT and GEMINI_API_KEY
 uv sync
 uv run retail-agent
 ```
+
+**Troubleshooting:** a `PermissionDenied`/403 on startup or on the first
+query almost always means one of the BigQuery-specific steps above was
+skipped — either the BigQuery API isn't enabled on the project named by
+`GOOGLE_CLOUD_PROJECT`, billing isn't active on it, or
+`gcloud auth application-default login` was never run (or was run for a
+different account/project than the one in `.env`). Gemini-side failures
+(invalid/missing `GEMINI_API_KEY`) surface as a graceful provider error
+message rather than a crash — see §5.
 
 Optional env vars (defaults shown): `GEMINI_MODEL=gemini-3.6-flash`,
 `BQ_MAX_BYTES_BILLED=1000000000` (~1GB), `BQ_ROW_LIMIT=500`,
