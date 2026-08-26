@@ -18,9 +18,9 @@ Design decisions and HLD live in @docs/design.md (source of truth; update it whe
   (GEOGRAPHY) is a direct point encoding of the same location `latitude`/
   `longitude` carry, and `postal_code` is a standard quasi-identifier.
 - CLI chat interface. No web UI.
-- Budget: up to ~1 week (per recruiter; original ~10h estimate was wrong).
-  Prefer simple and working over clever — the longer budget buys more coded
-  scope and polish, not more architectural cleverness.
+- Budget: up to ~1 week. Prefer simple and working over clever — the longer
+  budget buys more coded scope and polish, not more architectural
+  cleverness.
 
 ## Prototype scope (requirements implemented in code)
 Primary: Safety & PII Masking, Resilience & Graceful Error Handling.
