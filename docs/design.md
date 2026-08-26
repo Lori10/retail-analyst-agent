@@ -128,56 +128,32 @@ checkpointing for conversation-state persistence (requirement 4, docs
 only). Used for these mechanisms specifically, not adopted decoratively —
 the architecture diagram maps ~1:1 onto actual graph nodes.
 
-Weighed against other agent frameworks, not only a hand-rolled loop:
-role-based multi-agent frameworks (CrewAI, AutoGen) model a crew of
-cooperating agents handing off work to each other — this system is one
-agent with a tool-calling loop and one deliberately-inserted pause, so
-their coordination machinery (role definitions, inter-agent messaging,
-delegation) would be pure overhead here, not a capability gap being
-filled. Provider-bundled agent runtimes (OpenAI's Agents SDK, Vertex AI
-Agent Builder) were ruled out for the opposite reason: they couple
-orchestration to one LLM vendor's SDK, which conflicts with the
-provider-agnostic `Provider` interface (below) needed for the
-Gemini/OpenRouter circuit breaker — LangGraph has no opinion on which SDK
-`call_model` uses, so the orchestration layer and the provider-fallback
-layer stay independently swappable. LangGraph was the only candidate
-whose primitives are a direct match for both requirements above *and*
-whose scope stops at graph/state management rather than reaching into
-provider choice.
+Also weighed against role-based multi-agent frameworks (CrewAI,
+AutoGen) — unneeded coordination machinery for one agent with a
+tool-calling loop, not a multi-agent crew — and provider-bundled agent
+runtimes (OpenAI's Agents SDK, Vertex AI Agent Builder), ruled out
+because they couple orchestration to one LLM vendor's SDK, conflicting
+with the provider-agnostic `Provider` interface (below) the
+Gemini/OpenRouter circuit breaker depends on.
 
-**Agent Service compute — Cloud Run.** The workload is a synchronous
-request/response chat turn (a few seconds of LLM + BigQuery round trips),
-used intermittently by a small internal user base (Store/Regional
-Managers, not a public-scale audience) — that profile argues against
-GKE, whose per-cluster operational overhead (node pools, upgrades,
-autoscaling config) buys nothing a single-container service needs; and
-against Cloud Functions, whose default request-timeout ceiling is tight
-against a turn that can include a self-correct retry round-trip plus a
-BigQuery dry-run and execute. Cloud Run fits the middle: scales to zero
-between conversations (no idle cost for a tool executives use a few times
-a day), takes an arbitrary container image (so the LangGraph process's
-actual dependency set — `langgraph`, `google-genai`, `google-cloud-bigquery`
-— doesn't have to fit a FaaS runtime's constraints), and its per-request
-timeout ceiling comfortably covers the slowest realistic turn (self-correct
-retries + BQ dry-run/execute).
+**Agent Service compute — Cloud Run.** Fits a synchronous,
+intermittently-used chat workload better than GKE (cluster overhead
+buying nothing a single container needs) or Cloud Functions (default
+timeout too tight for a self-correct retry plus a BQ dry-run/execute):
+scales to zero between conversations and takes an arbitrary container
+image for the LangGraph process's actual dependencies.
 
 **LLM provider — Gemini primary, OpenRouter fallback, behind a common
 `Provider` interface.** Gemini via Vertex AI in production (shares
 IAM/audit/quota plumbing with the BigQuery access already required); AI
 Studio key in the prototype for simplicity. Default model is Gemini
-Flash (`gemini-3.6-flash`, see §8), not Pro: the two coded turn shapes —
-SQL generation over a fixed four-table schema, and report synthesis over
-an already-small, already-PII-stripped result set — are closer to
-templated generation than open-ended reasoning, so Flash's latency/cost
-profile matches a synchronous chat UX better than Pro's, and the BQ
-wrapper's own cost/row caps (below) already bound how much a wrong
-query can cost regardless of which model wrote it. Pro is the
-production escalation path, not a current gap: a query classifier or a
-self-correct-attempt counter could route only the hardest turns (e.g. a
-turn that has already failed self-correct once) to Pro, trading latency
-for accuracy exactly where Flash is most likely to be wrong — not
-implemented in the prototype since it adds a second model to test and
-bill for one demo-scale corpus. `OpenRouterProvider` (coded)
+Flash (`gemini-3.6-flash`, see §8), not Pro: both coded turn shapes
+(schema-bound SQL generation, report synthesis over an already-small
+PII-stripped result set) are closer to templated generation than
+open-ended reasoning, so Flash's latency/cost fits a synchronous chat UX
+better — Pro remains a viable production escalation for turns that fail
+self-correct once, not implemented here to avoid a second model to
+test/bill for at prototype scale. `OpenRouterProvider` (coded)
 calls OpenRouter's OpenAI-compatible endpoint via the `openai` SDK —
 OpenRouter's own documented integration path, chosen to avoid hand-rolled
 request/response JSON translation the SDK already implements and tests;
@@ -232,24 +208,18 @@ assignment's original PII list before they could leak.
 (`text-embedding-004`), top-k (e.g. k=3) cosine/ANN retrieval against
 **pgvector on Cloud SQL** — retrieved (question, sql, report) trios are
 injected as few-shot context before SQL generation and again as
-style/structure cues before report writing. pgvector is the primary
-choice, not Vertex AI Vector Search, because the update path is
-human-curated by design (below): only analyst-approved reports are ever
-appended, so the corpus grows by at most a handful of trios a day and
-realistically stays in the thousands, not millions, of vectors — well
-inside where pgvector's IVFFlat/HNSW indexes perform fine, and it lets
-the Golden Bucket live in the same Cloud SQL instance as the Saved
-Reports Store (one engine, one backup/DR/connection-pooling story,
-instead of standing up and paying for a second managed vector service).
-Vertex AI Vector Search is the scale-out path if that assumption breaks
-— e.g. the bucket is later seeded with a large historical archive of
-analyst reports rather than growing incrementally — since it's built for
-ANN search at a scale pgvector's indexes stop handling well.
+style/structure cues before report writing. pgvector over Vertex AI
+Vector Search because the human-curated update path (below) keeps the
+corpus in the thousands of vectors, not millions — comfortably inside
+pgvector's range, and it co-locates with the Saved Reports Store's Cloud
+SQL instance instead of paying for a second managed vector service;
+Vertex AI Vector Search would be worth revisiting if the bucket is ever
+seeded from a large historical archive instead of growing incrementally.
 
 Update path is human-curated, not automatic: a trio is appended only
 after a human analyst approves or edits the generated report,
-specifically to avoid feedback-loop drift where an
-unreviewed mistake compounds into future retrievals. Periodic
+specifically to avoid feedback-loop drift where an unreviewed mistake
+compounds into future retrievals. Periodic
 maintenance: dedup near-identical trios, down-weight/archive trios past a
 freshness horizon (e.g. 12 months), and version trios rather than
 overwrite them in place.
@@ -263,32 +233,22 @@ with action items" — the base deliverable-3 ask, distinct from
 requirement 3 — is satisfied by the agent formatting its chat answer as a
 report, with no persistence layer required.
 
-The split between Cloud SQL and Firestore below follows one rule, not a
-per-service preference: relational/queryable access patterns (arbitrary
-`WHERE` clauses over report content and ownership, joined against the
-Golden Bucket per above) go in Cloud SQL; single-key document
-reads/writes with no cross-record querying go in Firestore. Reports and
-the Golden Bucket need the former; preferences and persona don't.
+Cloud SQL vs. Firestore below follows one rule: relational/queryable
+access (arbitrary `WHERE` clauses, joins) goes in Cloud SQL; single-key
+document reads/writes go in Firestore. Reports and the Golden Bucket need
+the former; preferences and persona don't.
 
 **User Preference Store (docs only).** Firestore doc per manager
 (preferred format, analysis depth, updated_at), read into the system
 prompt each turn, written after an explicit ("just give me the numbers")
-or recurring implicit preference signal. Firestore over a Cloud SQL
-table because every access is a single lookup by manager id with no
-cross-manager query ever needed — a serverless per-document store avoids
-provisioning a second relational instance (or a second schema in the
-Reports one) just to hold key-value rows, and it's the same reasoning
-that puts Persona Config there too.
+or recurring implicit preference signal — Firestore, not Cloud SQL,
+since every access is a single lookup by manager id.
 
 **Persona Config (docs only).** A single versioned instruction document
-external to code — a Firestore row or Cloud Storage file, editable
-through a small internal admin surface with no engineering ticket, read
-fresh each session. Firestore for the same reason as User Preferences
-(one document, read whole, no querying) — Cloud Storage is the fallback
-if the admin surface ends up being "edit a file and re-upload it" rather
-than a small CRUD form, since a flat file needs no schema at all. This is
-the concrete mechanism for "CEO changes tone weekly, no redeploy"
-(requirement 8).
+external to code — a Firestore row or Cloud Storage file (whichever fits
+the eventual admin surface — a CRUD form or a re-uploaded file), editable
+with no engineering ticket, read fresh each session. This is the concrete
+mechanism for "CEO changes tone weekly, no redeploy" (requirement 8).
 
 **Observability (docs only as a coded requirement — see §9).** Target
 shape: one structured JSON log line per LLM call / tool call / turn
