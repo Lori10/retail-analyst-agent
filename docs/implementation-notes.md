@@ -194,7 +194,34 @@ present, but nested three levels into the error response
 (`exc.details["error"]["details"][0]["reason"]`) — matching it reliably
 would mean depending on that exact nested shape, which is fragile against a
 Google-side response format change. Not fixed: both classes are
-non-self-correctable and both produce a graceful message, so there's no
-functional or safety difference — only the graceful message's wording and
-the log's `error_class` are affected, an observability gap rather than a
-behavioral one.
+non-self-correctable, so there's no functional or safety difference from
+misclassification alone — only the log's `error_class` is affected (the
+curated `graceful_message` text isn't reachable from this path regardless
+of which class is raised — see the gap below), an observability gap rather
+than a behavioral one.
+
+**Provider error classification isn't wired into behavior the way it's
+typed.** Three typed provider error classes exist (`ProviderError`,
+`ProviderTransientError`, `ProviderAuthError`), all `self_correctable =
+False` — correctly, no query-style self-correct move exists for a model API
+failure — but the distinction isn't threaded any further than that. Two
+concrete effects: (1) `call_model` in `graph.py` has no try/except around
+`provider.generate(...)`, so a raised `ProviderError` propagates straight
+out of `graph.invoke()` and is caught only by `cli.py`'s top-level `except
+AgentError as exc: print(f"...{exc}")`, which prints `str(exc)` — the three
+curated `graceful_message` strings on the provider error classes are
+consequently never invoked by any live path, since `graceful_message_for`
+is only ever called from the graph's `give_up` node, which a provider error
+never reaches. (2) `ProviderCircuitBreaker.generate()` catches the generic
+`except ProviderError`, treating `ProviderAuthError` and
+`ProviderTransientError` identically when counting toward opening the
+breaker. A `ProviderTransientError` (rate limit, 5xx) plausibly clears
+after `PROVIDER_COOLDOWN_SECONDS`; a `ProviderAuthError` (bad/revoked key)
+never will, so today the breaker cycles open indefinitely against a Gemini
+key that will never recover, quietly routing every subsequent call through
+OpenRouter instead of surfacing a distinct "your Gemini credentials are
+broken" message. Not fixed: no crash risk (the CLI loop still never dies,
+per §5's guarantee) and OpenRouter still answers the question — but it
+silently masks a configuration problem behind the fallback provider and
+leaves the auth-specific curated message unused for exactly the case it was
+written for.

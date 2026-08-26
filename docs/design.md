@@ -339,13 +339,18 @@ see the Observability note in §3) with its error class
 (`bq_call_failed`/`bq_unclassified_exception`, `tool_call_error`,
 `provider_call_failed`, `provider_failover`, etc.). No path crashes the
 CLI loop; every path terminates in either a valid answer or a bounded,
-legible error message. Two gaps found during live testing — an
-empty-result check that doesn't fire for `COUNT(*)` queries, and an
+legible error message. Three gaps found during live testing are recorded in
+[implementation-notes.md](implementation-notes.md#known-gaps-found-during-testing):
+an empty-result check that doesn't fire for `COUNT(*)` queries; an
 invalid-API-key error classified as a generic `ProviderError` instead of
-`ProviderAuthError` — are recorded in
-[implementation-notes.md](implementation-notes.md#known-gaps-found-during-testing);
-neither has a functional or safety impact, both affect only log/message
-wording.
+`ProviderAuthError`; and the resulting auth/transient distinction not
+actually being used anywhere — `call_model` lets a `ProviderError`
+propagate past the graph's curated-message pipeline entirely, and the
+circuit breaker treats an unrecoverable bad key the same as a recoverable
+rate limit, cycling open forever instead of surfacing a distinct message.
+None has a functional or safety impact (the CLI loop never dies and
+OpenRouter still answers), but the last one silently masks a config problem
+behind the fallback provider rather than surfacing it.
 
 ## 6. Requirement-by-Requirement Handling
 
