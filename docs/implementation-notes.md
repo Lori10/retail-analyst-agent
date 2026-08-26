@@ -11,28 +11,48 @@ summarized there in one or two sentences.
 
 Each provider (`llm_provider.py`, `openrouter_provider.py`) talks to its SDK
 directly (`google-genai`, `openai`) rather than through LangChain's chat
-model wrappers (`ChatGoogleGenerativeAI`, `ChatOpenAI`). This was weighed
-against what design.md §5/§7 actually need: precise, per-SDK exception
-classification (`genai_errors.APIError.code`; `openai`'s distinct
-per-category exception types) feeding a single classification point after
-retries resolve, and an `error_class` on every log line precise enough to
-reconstruct a failure from logs alone. A LangChain wrapper sits between this
-code and those raw exceptions with its own retry/wrapping behavior, which
-would have to be pinned and re-verified (the same live-testing work the
-current classification already went through) for uncertain benefit — the two
-providers already share one interface (`Provider`) with no branching
-elsewhere in the codebase, so LangChain's unification wouldn't simplify
-anything the resilience/observability requirements depend on today, only the
-OpenRouter-side message/tool-schema translation, which is real but
-secondary.
+model wrappers (`ChatGoogleGenerativeAI`, `ChatOpenAI`). The trade-off splits
+into two independent axes, not one:
 
-This is a two-provider decision, not a permanent one. If Hybrid Intelligence
-(the Golden Bucket) moves from docs-only into coded scope, or a third LLM
-provider is added, LangChain's chat model wrappers become worth revisiting:
-`init_chat_model()`-style provider swapping and LangChain's
-retriever/vector-store integrations reduce real per-provider code at that
-point, in a way they don't for the current two-provider, resilience-first
-scope.
+**Exception classification (favors raw SDKs, flat regardless of provider
+count).** design.md §5/§7 need precise, per-SDK exception classification
+(`genai_errors.APIError.code`; `openai`'s distinct per-category exception
+types) feeding a single classification point after retries resolve, and an
+`error_class` on every log line precise enough to reconstruct a failure from
+logs alone. LangChain has no unified exception taxonomy across chat models —
+a wrapper would still leak or re-wrap each SDK's native exceptions
+inconsistently, so the same per-provider classification work (and the same
+live-testing verification it already went through) would still be needed
+underneath a LangChain layer, for no reduction in that work. This argument
+doesn't weaken as more providers are added.
+
+**Message/tool-schema translation (favors LangChain, and scales with
+provider count).** LangChain's chat models normalize message history
+(`BaseMessage`) and function-calling (`.bind_tools`, `AIMessage.tool_calls`,
+`ToolMessage`) into one shape across providers. This codebase doesn't have
+that: the canonical shape is `google-genai`'s `types.Content`/`types.Tool`,
+so any provider that isn't Gemini needs a hand-rolled translation module —
+`openrouter_provider.py`'s `_to_openai_messages`, `_to_openai_tools`, and
+`_to_genai_response` are exactly that, written by hand because OpenRouter
+speaks OpenAI's format, not Gemini's. Under LangChain, that translation is
+already solved per-provider by the integration package. Real cost, but
+accepted at two providers since one of the two (Gemini) needs no translation
+in the first place — it would not stay small at three or more.
+
+Net today: the two providers already share one interface (`Provider`) with
+no branching elsewhere in the codebase, so LangChain would only remove the
+OpenRouter-side translation module — real, but the smaller of the two costs
+at this scale — while adding nothing on the classification axis that
+resilience/observability actually depend on.
+
+This is a two-provider decision, not a permanent one, and the trigger to
+revisit is specifically provider *count* — the classification argument never
+goes away, translation-layer savings do compound. If a third LLM provider is
+added, or Hybrid Intelligence (the Golden Bucket) moves from docs-only into
+coded scope and pulls in LangChain's retriever/vector-store integrations
+anyway, `init_chat_model()`-style provider swapping and the translation
+savings start paying for themselves independent of the exception-
+classification question.
 
 ## BigQuery PII Stripping: Name-Based Matching, Not a True Allow-List
 
