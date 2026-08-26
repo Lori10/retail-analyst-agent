@@ -11,48 +11,66 @@ summarized there in one or two sentences.
 
 Each provider (`llm_provider.py`, `openrouter_provider.py`) talks to its SDK
 directly (`google-genai`, `openai`) rather than through LangChain's chat
-model wrappers (`ChatGoogleGenerativeAI`, `ChatOpenAI`). The trade-off splits
-into two independent axes, not one:
+model wrappers (`ChatGoogleGenerativeAI`, `ChatOpenAI`).
 
-**Exception classification (favors raw SDKs, flat regardless of provider
-count).** design.md §5/§7 need precise, per-SDK exception classification
+**Exception classification is a wash, not an argument for raw SDKs.**
+design.md §5/§7 need precise, per-SDK exception classification
 (`genai_errors.APIError.code`; `openai`'s distinct per-category exception
 types) feeding a single classification point after retries resolve, and an
 `error_class` on every log line precise enough to reconstruct a failure from
-logs alone. LangChain has no unified exception taxonomy across chat models —
-a wrapper would still leak or re-wrap each SDK's native exceptions
-inconsistently, so the same per-provider classification work (and the same
-live-testing verification it already went through) would still be needed
-underneath a LangChain layer, for no reduction in that work. This argument
-doesn't weaken as more providers are added.
+logs alone. LangChain has no unified exception taxonomy across chat
+models — a wrapper still lets each SDK's native exceptions propagate (or
+re-wraps them per-integration), so a `_classify_*_error` function of the
+same shape as today's would still need writing underneath a LangChain layer.
+The work doesn't disappear either way; it just moves one call frame up, to
+sit around `.invoke()` instead of around `generate_content()`/
+`chat.completions.create()`.
 
-**Message/tool-schema translation (favors LangChain, and scales with
-provider count).** LangChain's chat models normalize message history
-(`BaseMessage`) and function-calling (`.bind_tools`, `AIMessage.tool_calls`,
-`ToolMessage`) into one shape across providers. This codebase doesn't have
-that: the canonical shape is `google-genai`'s `types.Content`/`types.Tool`,
-so any provider that isn't Gemini needs a hand-rolled translation module —
-`openrouter_provider.py`'s `_to_openai_messages`, `_to_openai_tools`, and
-`_to_genai_response` are exactly that, written by hand because OpenRouter
-speaks OpenAI's format, not Gemini's. Under LangChain, that translation is
-already solved per-provider by the integration package. Real cost, but
-accepted at two providers since one of the two (Gemini) needs no translation
-in the first place — it would not stay small at three or more.
+**What raw SDKs actually buy, once that's stripped out:**
 
-Net today: the two providers already share one interface (`Provider`) with
-no branching elsewhere in the codebase, so LangChain would only remove the
-OpenRouter-side translation module — real, but the smaller of the two costs
-at this scale — while adding nothing on the classification axis that
-resilience/observability actually depend on.
+- **A first-party, self-pinned exception surface.** Catching
+  `genai_errors.APIError` from the `google-genai` package this code already
+  imports directly is one hop. Catching whatever
+  `ChatGoogleGenerativeAI.invoke()` raises is a second-hand surface —
+  contingent on which client library `langchain-google-genai` wraps
+  internally, a choice this codebase doesn't control and that could change
+  on a routine dependency bump, silently breaking the classifier without a
+  corresponding change on this side.
+- **Direct control over exact request shape.** `llm_provider.py`'s
+  `_generate_raw` explicitly sets
+  `automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)`
+  — a deliberate choice that the graph, not the SDK, drives the tool-calling
+  loop. `.bind_tools()` and LangChain's message/tool-call shaping carry their
+  own opinions here that would need verifying against this design rather
+  than being set directly.
+- **Matches the project's own scope discipline.** CLAUDE.md's build
+  philosophy is "prefer simple and working over clever." At two providers,
+  one of which needs no translation, the `Provider` protocol already does
+  the one job needed (`generate(...)`) in a few dozen lines with nothing
+  extra to pin or debug through; LangChain's `Runnable`/LCEL layer solves an
+  N-provider problem this prototype doesn't have yet.
 
-This is a two-provider decision, not a permanent one, and the trigger to
-revisit is specifically provider *count* — the classification argument never
-goes away, translation-layer savings do compound. If a third LLM provider is
+**What genuinely does favor LangChain, and scales with provider count:**
+message/tool-schema translation. LangChain's chat models normalize message
+history (`BaseMessage`) and function-calling (`.bind_tools`,
+`AIMessage.tool_calls`, `ToolMessage`) into one shape across providers. This
+codebase doesn't have that — the canonical shape is `google-genai`'s
+`types.Content`/`types.Tool`, so any provider that isn't Gemini needs a
+hand-rolled translation module. `openrouter_provider.py`'s
+`_to_openai_messages`, `_to_openai_tools`, and `_to_genai_response` are
+exactly that, written by hand because OpenRouter speaks OpenAI's format, not
+Gemini's. Real cost, accepted at two providers since one of the two (Gemini)
+needs no translation in the first place — it would not stay small at three
+or more.
+
+This is a two-provider decision, not a permanent one. The trigger to
+revisit is specifically provider *count*: the exception-surface-stability
+and request-control arguments don't weaken as providers are added, but the
+translation savings compound, and past some point they outweigh the value of
+keeping direct control over the request shape. If a third LLM provider is
 added, or Hybrid Intelligence (the Golden Bucket) moves from docs-only into
 coded scope and pulls in LangChain's retriever/vector-store integrations
-anyway, `init_chat_model()`-style provider swapping and the translation
-savings start paying for themselves independent of the exception-
-classification question.
+anyway, that's the point to re-run this trade-off.
 
 ## BigQuery PII Stripping: Name-Based Matching, Not a True Allow-List
 

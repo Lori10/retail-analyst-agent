@@ -170,15 +170,17 @@ configured, Gemini failures surface directly as a graceful error message.
 Both providers talk to their SDK directly rather than through LangChain's
 chat model wrappers — see
 [implementation-notes.md](implementation-notes.md#llm-provider-raw-sdks-vs-langchain-chat-model-wrappers)
-for the full reasoning. Short version: two separate trade-offs, not one.
-LangChain doesn't clean up the per-SDK exception classification
-resilience/observability depend on (a wrapper still leaks each SDK's own
-exceptions), but it would remove the hand-rolled message/tool-schema
-translation `openrouter_provider.py` needs today. That translation cost is
-small at two providers (Gemini itself needs none) but doesn't stay small —
-worth revisiting if a third LLM provider is added, or if Hybrid
-Intelligence's Golden Bucket pulls in LangChain's retriever integrations
-anyway.
+for the full reasoning. Short version: exception classification is a wash
+either way (LangChain doesn't unify exceptions, so a classifier of the same
+shape is still needed under it), so that's not the real reason. The real
+reasons are a self-pinned exception surface and direct control over exact
+request shape (e.g. disabling the SDK's automatic function-calling so the
+graph drives the loop) — both matching CLAUDE.md's "simple over clever" for
+two providers. What LangChain would remove is the hand-rolled message/
+tool-schema translation `openrouter_provider.py` needs today; small at two
+providers (Gemini itself needs none) but doesn't stay small — worth
+revisiting if a third LLM provider is added, or if Hybrid Intelligence's
+Golden Bucket pulls in LangChain's retriever integrations anyway.
 
 **BigQuery tool wrapper.** `src/provided/bq_runner.py` was supplied by the
 company as an example of how to query BigQuery, not a required
