@@ -154,6 +154,30 @@ is only constructed when `OPENROUTER_API_KEY` is set — with no fallback
 configured, the CLI runs Gemini-only and provider failures surface directly
 as a graceful error message (see §5).
 
+Each provider talks to its SDK directly (`google-genai`, `openai`) rather
+than through LangChain's chat model wrappers (`ChatGoogleGenerativeAI`,
+`ChatOpenAI`), a deliberate choice weighed against what requirements 5 and
+7 actually need: precise, per-SDK exception classification
+(`genai_errors.APIError.code`; `openai`'s distinct per-category exception
+types) feeding a single classification point after retries resolve (§5),
+and an `error_class` on every log line precise enough to reconstruct a
+failure from logs alone (§7). A LangChain wrapper sits between this code
+and those raw exceptions with its own retry/wrapping behavior, which would
+have to be pinned and re-verified (the same live-testing work the current
+classification already went through) for uncertain benefit — the two
+providers already share one interface (`Provider`) with no branching
+elsewhere in the codebase, so LangChain's unification wouldn't simplify
+anything requirements 5/7 depend on today, only the OpenRouter-side
+message/tool-schema translation, which is real but secondary.
+
+This is a two-provider decision, not a permanent one. If requirement 1
+(Hybrid Intelligence/Golden Bucket) moves from docs-only into coded scope,
+or a third LLM provider is added, LangChain's chat model wrappers become
+worth revisiting: `init_chat_model()`-style provider swapping and
+LangChain's retriever/vector-store integrations reduce real per-provider
+code at that point, in a way they don't for the current two-provider,
+resilience-first scope.
+
 **BigQuery tool wrapper.** `src/provided/bq_runner.py` was supplied by the
 company as an example of how to query BigQuery, not a required dependency —
 it's left in the repo unused. `BigQueryTool` owns a `bigquery.Client`
