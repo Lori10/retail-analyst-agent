@@ -39,9 +39,9 @@ flowchart TB
     subgraph Data["Data & Knowledge"]
         BQ[("BigQuery\nthelook_ecommerce\n(read-only)")]
         GoldenBucket[("Golden Bucket\npgvector on Cloud SQL (prod)\nlocal JSON + cosine (design reference)")]
-        Reports[("Saved Reports Store\nCloud SQL (prod) /\nSQLite (prototype)")]
+        Reports[("Saved Reports Store\nCloud SQL (prod)\nSQLite (design reference)")]
         Prefs[("User Preference Store\nFirestore (prod) —\ndocs-only in prototype")]
-        Persona[("Persona Config\nCloud Storage/Firestore (prod) /\nlocal persona.yaml (prototype)")]
+        Persona[("Persona Config\nCloud Storage/Firestore (prod)\nlocal persona.yaml (design reference)")]
     end
 
     subgraph Obs["Observability"]
@@ -121,12 +121,12 @@ graph TD;
 
 ## 3. Component Reasoning
 
-**Orchestrator — LangGraph.** Chosen over a hand-rolled loop because two
-requirements map directly onto its primitives: `interrupt()`/resume for
-the confirm-before-delete flow (requirement 3, docs only), and
-checkpointing for conversation-state persistence (requirement 4, docs
-only). Used for these mechanisms specifically, not adopted decoratively —
-the architecture diagram maps ~1:1 onto actual graph nodes.
+**Orchestrator — LangGraph.** Two requirements map directly onto its
+primitives: `interrupt()`/resume for the confirm-before-delete flow
+(requirement 3, docs only), and checkpointing for conversation-state
+persistence (requirement 4, docs only). Used for these mechanisms
+specifically, not adopted decoratively — the architecture diagram maps
+~1:1 onto actual graph nodes.
 
 Also weighed against role-based multi-agent frameworks (CrewAI,
 AutoGen) — unneeded coordination machinery for one agent with a
@@ -135,6 +135,17 @@ runtimes (OpenAI's Agents SDK, Vertex AI Agent Builder), ruled out
 because they couple orchestration to one LLM vendor's SDK, conflicting
 with the provider-agnostic `Provider` interface (below) the
 Gemini/OpenRouter circuit breaker depends on.
+
+**Extensibility — new tools and data sources.** New capabilities (chart
+generation, emailing reports, web search) fall out of the tool-calling
+shape already chosen rather than needing a separate mechanism: each is a
+new function registered as a LangGraph tool alongside
+`run_query`/`get_schema` (below), with the model deciding when to call
+it, same as the coded tools today. A new data source follows the same
+wrapper pattern as `BigQueryTool`: its own safety check appropriate to
+that source, its own cost/row/timeout caps, and its own PII-stripping
+pass before results reach the LLM, rather than a bespoke integration
+path per source.
 
 **Agent Service compute — Cloud Run.** Fits a synchronous,
 intermittently-used chat workload better than GKE (cluster overhead
@@ -174,11 +185,11 @@ for the full reasoning. Short version: exception classification is a wash
 either way (LangChain doesn't unify exceptions, so a classifier of the same
 shape is still needed under it), so that's not the real reason. The real
 reasons are a self-pinned exception surface and direct control over exact
-request shape (e.g. disabling the SDK's automatic function-calling so the
-graph drives the loop) — both matching CLAUDE.md's "simple over clever" for
-two providers. What LangChain would remove is the hand-rolled message/
-tool-schema translation `openrouter_provider.py` needs today; small at two
-providers (Gemini itself needs none) but doesn't stay small — worth
+request shape (e.g. disabling the SDK's automatic function-calling so
+the graph drives the loop). What LangChain would remove is the
+hand-rolled message/tool-schema translation `openrouter_provider.py`
+needs today; small at two providers (Gemini itself needs none) but
+doesn't stay small — worth
 revisiting if a third LLM provider is added, or if Hybrid Intelligence's
 Golden Bucket pulls in LangChain's retriever integrations anyway.
 
@@ -186,8 +197,11 @@ Golden Bucket pulls in LangChain's retriever integrations anyway.
 company as an example of how to query BigQuery, not a required
 dependency — it's left in the repo unused. A raw `bigquery.Client` call
 (what it thinly wraps) has no cost cap, no statement-type check, no PII
-masking, and collapses every failure into one exception shape. The
-wrapper (`BigQueryTool`, which owns its own client) adds: a SQL read-only
+masking, and collapses every failure into one exception shape. It backs
+two tools exposed to the model: `get_schema` (table/column
+introspection — how "what data is available" questions get answered)
+and `run_query`. The wrapper (`BigQueryTool`, which owns its own client)
+adds: a SQL read-only
 keyword/regex allowlist (SELECT/WITH only, reject DML/DDL and
 multi-statement input) with the service account's IAM read-only role as
 the real backstop; `dry_run=True` plus a ~1GB max-bytes cap (well under
