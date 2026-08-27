@@ -121,12 +121,12 @@ graph TD;
 
 ## 3. Component Reasoning
 
-**Orchestrator — LangGraph.** Chosen over a hand-rolled loop because two
-requirements map directly onto its primitives: `interrupt()`/resume for
-the confirm-before-delete flow (requirement 3, docs only), and
-checkpointing for conversation-state persistence (requirement 4, docs
-only). Used for these mechanisms specifically, not adopted decoratively —
-the architecture diagram maps ~1:1 onto actual graph nodes.
+**Orchestrator — LangGraph.** Two requirements map directly onto its
+primitives: `interrupt()`/resume for the confirm-before-delete flow
+(requirement 3, docs only), and checkpointing for conversation-state
+persistence (requirement 4, docs only). Used for these mechanisms
+specifically, not adopted decoratively — the architecture diagram maps
+~1:1 onto actual graph nodes.
 
 Also weighed against role-based multi-agent frameworks (CrewAI,
 AutoGen) — unneeded coordination machinery for one agent with a
