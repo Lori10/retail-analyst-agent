@@ -136,17 +136,16 @@ because they couple orchestration to one LLM vendor's SDK, conflicting
 with the provider-agnostic `Provider` interface (below) the
 Gemini/OpenRouter circuit breaker depends on.
 
-**Extensibility — new tools and data sources.** The assignment asks for
-a system that's easily extendable for new capabilities (chart
-generation, emailing reports, web search) and new data sources — this
-falls out of the tool-calling shape already chosen rather than needing a
-separate mechanism: a new capability is a new function registered as a
-LangGraph tool alongside `run_query`/`get_schema` (below), with the model
-deciding when to call it, same as the coded tools today. A new data
-source follows the same wrapper pattern as `BigQueryTool`: its own
-safety check appropriate to that source, its own cost/row/timeout caps,
-and its own PII-stripping pass before results reach the LLM, rather than
-a bespoke integration path per source.
+**Extensibility — new tools and data sources.** New capabilities (chart
+generation, emailing reports, web search) fall out of the tool-calling
+shape already chosen rather than needing a separate mechanism: each is a
+new function registered as a LangGraph tool alongside
+`run_query`/`get_schema` (below), with the model deciding when to call
+it, same as the coded tools today. A new data source follows the same
+wrapper pattern as `BigQueryTool`: its own safety check appropriate to
+that source, its own cost/row/timeout caps, and its own PII-stripping
+pass before results reach the LLM, rather than a bespoke integration
+path per source.
 
 **Agent Service compute — Cloud Run.** Fits a synchronous,
 intermittently-used chat workload better than GKE (cluster overhead
@@ -186,11 +185,11 @@ for the full reasoning. Short version: exception classification is a wash
 either way (LangChain doesn't unify exceptions, so a classifier of the same
 shape is still needed under it), so that's not the real reason. The real
 reasons are a self-pinned exception surface and direct control over exact
-request shape (e.g. disabling the SDK's automatic function-calling so the
-graph drives the loop) — both matching CLAUDE.md's "simple over clever" for
-two providers. What LangChain would remove is the hand-rolled message/
-tool-schema translation `openrouter_provider.py` needs today; small at two
-providers (Gemini itself needs none) but doesn't stay small — worth
+request shape (e.g. disabling the SDK's automatic function-calling so
+the graph drives the loop). What LangChain would remove is the
+hand-rolled message/tool-schema translation `openrouter_provider.py`
+needs today; small at two providers (Gemini itself needs none) but
+doesn't stay small — worth
 revisiting if a third LLM provider is added, or if Hybrid Intelligence's
 Golden Bucket pulls in LangChain's retriever integrations anyway.
 
