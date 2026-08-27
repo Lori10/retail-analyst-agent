@@ -39,9 +39,9 @@ flowchart TB
     subgraph Data["Data & Knowledge"]
         BQ[("BigQuery\nthelook_ecommerce\n(read-only)")]
         GoldenBucket[("Golden Bucket\npgvector on Cloud SQL (prod)\nlocal JSON + cosine (design reference)")]
-        Reports[("Saved Reports Store\nCloud SQL (prod) /\nSQLite (prototype)")]
+        Reports[("Saved Reports Store\nCloud SQL (prod)\nSQLite (design reference)")]
         Prefs[("User Preference Store\nFirestore (prod) —\ndocs-only in prototype")]
-        Persona[("Persona Config\nCloud Storage/Firestore (prod) /\nlocal persona.yaml (prototype)")]
+        Persona[("Persona Config\nCloud Storage/Firestore (prod)\nlocal persona.yaml (design reference)")]
     end
 
     subgraph Obs["Observability"]
@@ -136,6 +136,18 @@ because they couple orchestration to one LLM vendor's SDK, conflicting
 with the provider-agnostic `Provider` interface (below) the
 Gemini/OpenRouter circuit breaker depends on.
 
+**Extensibility — new tools and data sources.** The assignment asks for
+a system that's easily extendable for new capabilities (chart
+generation, emailing reports, web search) and new data sources — this
+falls out of the tool-calling shape already chosen rather than needing a
+separate mechanism: a new capability is a new function registered as a
+LangGraph tool alongside `run_query`/`get_schema` (below), with the model
+deciding when to call it, same as the coded tools today. A new data
+source follows the same wrapper pattern as `BigQueryTool`: its own
+safety check appropriate to that source, its own cost/row/timeout caps,
+and its own PII-stripping pass before results reach the LLM, rather than
+a bespoke integration path per source.
+
 **Agent Service compute — Cloud Run.** Fits a synchronous,
 intermittently-used chat workload better than GKE (cluster overhead
 buying nothing a single container needs) or Cloud Functions (default
@@ -186,8 +198,11 @@ Golden Bucket pulls in LangChain's retriever integrations anyway.
 company as an example of how to query BigQuery, not a required
 dependency — it's left in the repo unused. A raw `bigquery.Client` call
 (what it thinly wraps) has no cost cap, no statement-type check, no PII
-masking, and collapses every failure into one exception shape. The
-wrapper (`BigQueryTool`, which owns its own client) adds: a SQL read-only
+masking, and collapses every failure into one exception shape. It backs
+two tools exposed to the model: `get_schema` (table/column
+introspection — how "what data is available" questions get answered)
+and `run_query`. The wrapper (`BigQueryTool`, which owns its own client)
+adds: a SQL read-only
 keyword/regex allowlist (SELECT/WITH only, reject DML/DDL and
 multi-statement input) with the service account's IAM read-only role as
 the real backstop; `dry_run=True` plus a ~1GB max-bytes cap (well under
