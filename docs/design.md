@@ -38,7 +38,7 @@ flowchart TB
 
     subgraph Data["Data & Knowledge"]
         BQ[("BigQuery\nthelook_ecommerce\n(read-only)")]
-        GoldenBucket[("Golden Bucket\nVertex AI Vector Search / pgvector (prod)\nlocal JSON + cosine (design reference)")]
+        GoldenBucket[("Golden Bucket\npgvector on Cloud SQL (prod)\nlocal JSON + cosine (design reference)")]
         Reports[("Saved Reports Store\nCloud SQL (prod) /\nSQLite (prototype)")]
         Prefs[("User Preference Store\nFirestore (prod) —\ndocs-only in prototype")]
         Persona[("Persona Config\nCloud Storage/Firestore (prod) /\nlocal persona.yaml (prototype)")]
@@ -128,10 +128,32 @@ checkpointing for conversation-state persistence (requirement 4, docs
 only). Used for these mechanisms specifically, not adopted decoratively —
 the architecture diagram maps ~1:1 onto actual graph nodes.
 
+Also weighed against role-based multi-agent frameworks (CrewAI,
+AutoGen) — unneeded coordination machinery for one agent with a
+tool-calling loop, not a multi-agent crew — and provider-bundled agent
+runtimes (OpenAI's Agents SDK, Vertex AI Agent Builder), ruled out
+because they couple orchestration to one LLM vendor's SDK, conflicting
+with the provider-agnostic `Provider` interface (below) the
+Gemini/OpenRouter circuit breaker depends on.
+
+**Agent Service compute — Cloud Run.** Fits a synchronous,
+intermittently-used chat workload better than GKE (cluster overhead
+buying nothing a single container needs) or Cloud Functions (default
+timeout too tight for a self-correct retry plus a BQ dry-run/execute):
+scales to zero between conversations and takes an arbitrary container
+image for the LangGraph process's actual dependencies.
+
 **LLM provider — Gemini primary, OpenRouter fallback, behind a common
 `Provider` interface.** Gemini via Vertex AI in production (shares
 IAM/audit/quota plumbing with the BigQuery access already required); AI
-Studio key in the prototype for simplicity. `OpenRouterProvider` (coded)
+Studio key in the prototype for simplicity. Default model is Gemini
+Flash (`gemini-3.6-flash`, see §8), not Pro: both coded turn shapes
+(schema-bound SQL generation, report synthesis over an already-small
+PII-stripped result set) are closer to templated generation than
+open-ended reasoning, so Flash's latency/cost fits a synchronous chat UX
+better — Pro remains a viable production escalation for turns that fail
+self-correct once, not implemented here to avoid a second model to
+test/bill for at prototype scale. `OpenRouterProvider` (coded)
 calls OpenRouter's OpenAI-compatible endpoint via the `openai` SDK —
 OpenRouter's own documented integration path, chosen to avoid hand-rolled
 request/response JSON translation the SDK already implements and tests;
@@ -148,12 +170,17 @@ configured, Gemini failures surface directly as a graceful error message.
 Both providers talk to their SDK directly rather than through LangChain's
 chat model wrappers — see
 [implementation-notes.md](implementation-notes.md#llm-provider-raw-sdks-vs-langchain-chat-model-wrappers)
-for the full reasoning. Short version: precise per-SDK exception
-classification is what the resilience/observability requirements depend
-on, and a LangChain layer between this code and those exceptions would
-need the same live-testing verification for uncertain benefit at the
-current two-provider scope — worth revisiting if a third provider or the
-Golden Bucket's retriever integration enters coded scope.
+for the full reasoning. Short version: exception classification is a wash
+either way (LangChain doesn't unify exceptions, so a classifier of the same
+shape is still needed under it), so that's not the real reason. The real
+reasons are a self-pinned exception surface and direct control over exact
+request shape (e.g. disabling the SDK's automatic function-calling so the
+graph drives the loop) — both matching CLAUDE.md's "simple over clever" for
+two providers. What LangChain would remove is the hand-rolled message/
+tool-schema translation `openrouter_provider.py` needs today; small at two
+providers (Gemini itself needs none) but doesn't stay small — worth
+revisiting if a third LLM provider is added, or if Hybrid Intelligence's
+Golden Bucket pulls in LangChain's retriever integrations anyway.
 
 **BigQuery tool wrapper.** `src/provided/bq_runner.py` was supplied by the
 company as an example of how to query BigQuery, not a required
@@ -184,13 +211,20 @@ assignment's original PII list before they could leak.
 
 **Golden Bucket (docs only).** Question embedded at query time
 (`text-embedding-004`), top-k (e.g. k=3) cosine/ANN retrieval against
-Vertex AI Vector Search (pgvector on Cloud SQL is an acceptable cheaper
-alternative) — retrieved (question, sql, report) trios are injected as
-few-shot context before SQL generation and again as style/structure cues
-before report writing. Update path is human-curated, not automatic: a
-trio is appended only after a human analyst approves or edits the
-generated report, specifically to avoid feedback-loop drift where an
-unreviewed mistake compounds into future retrievals. Periodic
+**pgvector on Cloud SQL** — retrieved (question, sql, report) trios are
+injected as few-shot context before SQL generation and again as
+style/structure cues before report writing. pgvector over Vertex AI
+Vector Search because the human-curated update path (below) keeps the
+corpus in the thousands of vectors, not millions — comfortably inside
+pgvector's range, and it co-locates with the Saved Reports Store's Cloud
+SQL instance instead of paying for a second managed vector service;
+Vertex AI Vector Search would be worth revisiting if the bucket is ever
+seeded from a large historical archive instead of growing incrementally.
+
+Update path is human-curated, not automatic: a trio is appended only
+after a human analyst approves or edits the generated report,
+specifically to avoid feedback-loop drift where an unreviewed mistake
+compounds into future retrievals. Periodic
 maintenance: dedup near-identical trios, down-weight/archive trios past a
 freshness horizon (e.g. 12 months), and version trios rather than
 overwrite them in place.
@@ -204,16 +238,22 @@ with action items" — the base deliverable-3 ask, distinct from
 requirement 3 — is satisfied by the agent formatting its chat answer as a
 report, with no persistence layer required.
 
+Cloud SQL vs. Firestore below follows one rule: relational/queryable
+access (arbitrary `WHERE` clauses, joins) goes in Cloud SQL; single-key
+document reads/writes go in Firestore. Reports and the Golden Bucket need
+the former; preferences and persona don't.
+
 **User Preference Store (docs only).** Firestore doc per manager
 (preferred format, analysis depth, updated_at), read into the system
 prompt each turn, written after an explicit ("just give me the numbers")
-or recurring implicit preference signal.
+or recurring implicit preference signal — Firestore, not Cloud SQL,
+since every access is a single lookup by manager id.
 
 **Persona Config (docs only).** A single versioned instruction document
-external to code — a Firestore row or Cloud Storage file, editable
-through a small internal admin surface with no engineering ticket, read
-fresh each session. This is the concrete mechanism for "CEO changes tone
-weekly, no redeploy" (requirement 8).
+external to code — a Firestore row or Cloud Storage file (whichever fits
+the eventual admin surface — a CRUD form or a re-uploaded file), editable
+with no engineering ticket, read fresh each session. This is the concrete
+mechanism for "CEO changes tone weekly, no redeploy" (requirement 8).
 
 **Observability (docs only as a coded requirement — see §9).** Target
 shape: one structured JSON log line per LLM call / tool call / turn
@@ -299,13 +339,18 @@ see the Observability note in §3) with its error class
 (`bq_call_failed`/`bq_unclassified_exception`, `tool_call_error`,
 `provider_call_failed`, `provider_failover`, etc.). No path crashes the
 CLI loop; every path terminates in either a valid answer or a bounded,
-legible error message. Two gaps found during live testing — an
-empty-result check that doesn't fire for `COUNT(*)` queries, and an
+legible error message. Three gaps found during live testing are recorded in
+[implementation-notes.md](implementation-notes.md#known-gaps-found-during-testing):
+an empty-result check that doesn't fire for `COUNT(*)` queries; an
 invalid-API-key error classified as a generic `ProviderError` instead of
-`ProviderAuthError` — are recorded in
-[implementation-notes.md](implementation-notes.md#known-gaps-found-during-testing);
-neither has a functional or safety impact, both affect only log/message
-wording.
+`ProviderAuthError`; and the resulting auth/transient distinction not
+actually being used anywhere — `call_model` lets a `ProviderError`
+propagate past the graph's curated-message pipeline entirely, and the
+circuit breaker treats an unrecoverable bad key the same as a recoverable
+rate limit, cycling open forever instead of surfacing a distinct message.
+None has a functional or safety impact (the CLI loop never dies and
+OpenRouter still answers), but the last one silently masks a config problem
+behind the fallback provider rather than surfacing it.
 
 ## 6. Requirement-by-Requirement Handling
 

@@ -11,28 +11,66 @@ summarized there in one or two sentences.
 
 Each provider (`llm_provider.py`, `openrouter_provider.py`) talks to its SDK
 directly (`google-genai`, `openai`) rather than through LangChain's chat
-model wrappers (`ChatGoogleGenerativeAI`, `ChatOpenAI`). This was weighed
-against what design.md §5/§7 actually need: precise, per-SDK exception
-classification (`genai_errors.APIError.code`; `openai`'s distinct
-per-category exception types) feeding a single classification point after
-retries resolve, and an `error_class` on every log line precise enough to
-reconstruct a failure from logs alone. A LangChain wrapper sits between this
-code and those raw exceptions with its own retry/wrapping behavior, which
-would have to be pinned and re-verified (the same live-testing work the
-current classification already went through) for uncertain benefit — the two
-providers already share one interface (`Provider`) with no branching
-elsewhere in the codebase, so LangChain's unification wouldn't simplify
-anything the resilience/observability requirements depend on today, only the
-OpenRouter-side message/tool-schema translation, which is real but
-secondary.
+model wrappers (`ChatGoogleGenerativeAI`, `ChatOpenAI`).
 
-This is a two-provider decision, not a permanent one. If Hybrid Intelligence
-(the Golden Bucket) moves from docs-only into coded scope, or a third LLM
-provider is added, LangChain's chat model wrappers become worth revisiting:
-`init_chat_model()`-style provider swapping and LangChain's
-retriever/vector-store integrations reduce real per-provider code at that
-point, in a way they don't for the current two-provider, resilience-first
-scope.
+**Exception classification is a wash, not an argument for raw SDKs.**
+design.md §5/§7 need precise, per-SDK exception classification
+(`genai_errors.APIError.code`; `openai`'s distinct per-category exception
+types) feeding a single classification point after retries resolve, and an
+`error_class` on every log line precise enough to reconstruct a failure from
+logs alone. LangChain has no unified exception taxonomy across chat
+models — a wrapper still lets each SDK's native exceptions propagate (or
+re-wraps them per-integration), so a `_classify_*_error` function of the
+same shape as today's would still need writing underneath a LangChain layer.
+The work doesn't disappear either way; it just moves one call frame up, to
+sit around `.invoke()` instead of around `generate_content()`/
+`chat.completions.create()`.
+
+**What raw SDKs actually buy, once that's stripped out:**
+
+- **A first-party, self-pinned exception surface.** Catching
+  `genai_errors.APIError` from the `google-genai` package this code already
+  imports directly is one hop. Catching whatever
+  `ChatGoogleGenerativeAI.invoke()` raises is a second-hand surface —
+  contingent on which client library `langchain-google-genai` wraps
+  internally, a choice this codebase doesn't control and that could change
+  on a routine dependency bump, silently breaking the classifier without a
+  corresponding change on this side.
+- **Direct control over exact request shape.** `llm_provider.py`'s
+  `_generate_raw` explicitly sets
+  `automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)`
+  — a deliberate choice that the graph, not the SDK, drives the tool-calling
+  loop. `.bind_tools()` and LangChain's message/tool-call shaping carry their
+  own opinions here that would need verifying against this design rather
+  than being set directly.
+- **Matches the project's own scope discipline.** CLAUDE.md's build
+  philosophy is "prefer simple and working over clever." At two providers,
+  one of which needs no translation, the `Provider` protocol already does
+  the one job needed (`generate(...)`) in a few dozen lines with nothing
+  extra to pin or debug through; LangChain's `Runnable`/LCEL layer solves an
+  N-provider problem this prototype doesn't have yet.
+
+**What genuinely does favor LangChain, and scales with provider count:**
+message/tool-schema translation. LangChain's chat models normalize message
+history (`BaseMessage`) and function-calling (`.bind_tools`,
+`AIMessage.tool_calls`, `ToolMessage`) into one shape across providers. This
+codebase doesn't have that — the canonical shape is `google-genai`'s
+`types.Content`/`types.Tool`, so any provider that isn't Gemini needs a
+hand-rolled translation module. `openrouter_provider.py`'s
+`_to_openai_messages`, `_to_openai_tools`, and `_to_genai_response` are
+exactly that, written by hand because OpenRouter speaks OpenAI's format, not
+Gemini's. Real cost, accepted at two providers since one of the two (Gemini)
+needs no translation in the first place — it would not stay small at three
+or more.
+
+This is a two-provider decision, not a permanent one. The trigger to
+revisit is specifically provider *count*: the exception-surface-stability
+and request-control arguments don't weaken as providers are added, but the
+translation savings compound, and past some point they outweigh the value of
+keeping direct control over the request shape. If a third LLM provider is
+added, or Hybrid Intelligence (the Golden Bucket) moves from docs-only into
+coded scope and pulls in LangChain's retriever/vector-store integrations
+anyway, that's the point to re-run this trade-off.
 
 ## BigQuery PII Stripping: Name-Based Matching, Not a True Allow-List
 
@@ -156,7 +194,34 @@ present, but nested three levels into the error response
 (`exc.details["error"]["details"][0]["reason"]`) — matching it reliably
 would mean depending on that exact nested shape, which is fragile against a
 Google-side response format change. Not fixed: both classes are
-non-self-correctable and both produce a graceful message, so there's no
-functional or safety difference — only the graceful message's wording and
-the log's `error_class` are affected, an observability gap rather than a
-behavioral one.
+non-self-correctable, so there's no functional or safety difference from
+misclassification alone — only the log's `error_class` is affected (the
+curated `graceful_message` text isn't reachable from this path regardless
+of which class is raised — see the gap below), an observability gap rather
+than a behavioral one.
+
+**Provider error classification isn't wired into behavior the way it's
+typed.** Three typed provider error classes exist (`ProviderError`,
+`ProviderTransientError`, `ProviderAuthError`), all `self_correctable =
+False` — correctly, no query-style self-correct move exists for a model API
+failure — but the distinction isn't threaded any further than that. Two
+concrete effects: (1) `call_model` in `graph.py` has no try/except around
+`provider.generate(...)`, so a raised `ProviderError` propagates straight
+out of `graph.invoke()` and is caught only by `cli.py`'s top-level `except
+AgentError as exc: print(f"...{exc}")`, which prints `str(exc)` — the three
+curated `graceful_message` strings on the provider error classes are
+consequently never invoked by any live path, since `graceful_message_for`
+is only ever called from the graph's `give_up` node, which a provider error
+never reaches. (2) `ProviderCircuitBreaker.generate()` catches the generic
+`except ProviderError`, treating `ProviderAuthError` and
+`ProviderTransientError` identically when counting toward opening the
+breaker. A `ProviderTransientError` (rate limit, 5xx) plausibly clears
+after `PROVIDER_COOLDOWN_SECONDS`; a `ProviderAuthError` (bad/revoked key)
+never will, so today the breaker cycles open indefinitely against a Gemini
+key that will never recover, quietly routing every subsequent call through
+OpenRouter instead of surfacing a distinct "your Gemini credentials are
+broken" message. Not fixed: no crash risk (the CLI loop still never dies,
+per §5's guarantee) and OpenRouter still answers the question — but it
+silently masks a configuration problem behind the fallback provider and
+leaves the auth-specific curated message unused for exactly the case it was
+written for.
