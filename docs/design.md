@@ -38,6 +38,7 @@ flowchart TB
 
     subgraph Data["Data & Knowledge"]
         BQ[("BigQuery\nthelook_ecommerce\n(read-only)")]
+        Checkpoints[("Conversation Checkpoint Store\nMemorystore for Redis (prod)\nInMemorySaver (prototype)")]
         GoldenBucket[("Golden Bucket\npgvector on Cloud SQL (prod)\nlocal JSON + cosine (design reference)")]
         Reports[("Saved Reports Store\nCloud SQL (prod)\nSQLite (design reference)")]
         Prefs[("User Preference Store\nFirestore (prod) —\ndocs-only in prototype")]
@@ -56,6 +57,7 @@ flowchart TB
     Provider -. "circuit breaker on failure" .-> OpenRouter
     Orchestrator --> BQWrap
     BQWrap --> BQ
+    Orchestrator --> Checkpoints
     Orchestrator --> GoldenBucket
     Orchestrator --> Reports
     Orchestrator --> Prefs
@@ -126,15 +128,26 @@ primitives: `interrupt()`/resume for the confirm-before-delete flow
 (requirement 3, docs only), and checkpointing for conversation-state
 persistence (requirement 4, docs only). Used for these mechanisms
 specifically, not adopted decoratively — the architecture diagram maps
-~1:1 onto actual graph nodes.
+~1:1 onto actual graph nodes. Also weighed against multi-agent frameworks
+and provider-bundled agent runtimes; see
+[implementation-notes.md](implementation-notes.md#orchestrator-rejected-alternatives)
+for the full comparison — short version: neither fits a single
+tool-calling agent behind a provider-agnostic `Provider` interface.
 
-Also weighed against role-based multi-agent frameworks (CrewAI,
-AutoGen) — unneeded coordination machinery for one agent with a
-tool-calling loop, not a multi-agent crew — and provider-bundled agent
-runtimes (OpenAI's Agents SDK, Vertex AI Agent Builder), ruled out
-because they couple orchestration to one LLM vendor's SDK, conflicting
-with the provider-agnostic `Provider` interface (below) the
-Gemini/OpenRouter circuit breaker depends on.
+**Conversation Checkpoint Store — Memorystore for Redis (prod),
+`InMemorySaver` (prototype).** Cloud Run instances are stateless and
+scale to zero between turns, so the prototype's checkpointer
+(`InMemorySaver`, fine for one long-running local CLI process) can't
+carry conversation state across a cold start in production —
+checkpointing has to be externalized for `interrupt()`/resume and
+multi-turn context to survive that. Redis over Cloud SQL: checkpoints
+are written on every turn (far higher frequency than Reports or Golden
+Bucket writes) and are ephemeral working state, not a durable record
+worth keeping indefinitely, so under the same access-pattern rule used
+below for Cloud SQL vs. Firestore, they don't belong on the same
+relational instance — Memorystore is LangGraph's other officially
+supported checkpoint backend and keeps that write churn off the durable
+stores entirely.
 
 **Extensibility — new tools and data sources.** New capabilities (chart
 generation, emailing reports, web search) fall out of the tool-calling
@@ -154,6 +167,27 @@ timeout too tight for a self-correct retry plus a BQ dry-run/execute):
 scales to zero between conversations and takes an arbitrary container
 image for the LangGraph process's actual dependencies.
 
+**Client ↔ Agent Service communication.** The prototype CLI runs the
+orchestrator in-process — no network hop, no protocol involved. In
+production the same CLI talks to Cloud Run over a REST endpoint (a
+single `POST /chat` taking `{conversation_id, message}` and returning
+that turn's response), reached the same way any internal Cloud Run
+service is — an IAM-authenticated service-to-service call, not a public
+API key. `conversation_id` is the thread key both the LangGraph
+checkpointer above and the (stateless, scale-to-zero) Cloud Run instance
+need: every request carries it so the right checkpoint loads regardless
+of which instance handles the request.
+
+The response is returned whole, not token-streamed, matching the
+prototype's synchronous request/response CLI. Streaming would help
+perceived latency, but only partially: the orchestrator's tool-calling
+loop (schema lookups, SQL execution, self-correct retries) runs before
+the final synthesis call, so only that last call has anything to stream.
+Not assumed here. The Agent
+Service reaches Cloud SQL, Memorystore, and Firestore the same way it
+reaches BigQuery — its own IAM identity, no separate per-store credential
+to manage.
+
 **LLM provider — Gemini primary, OpenRouter fallback, behind a common
 `Provider` interface.** Gemini via Vertex AI in production (shares
 IAM/audit/quota plumbing with the BigQuery access already required); AI
@@ -162,9 +196,7 @@ Flash (`gemini-3.6-flash`, see §8), not Pro: both coded turn shapes
 (schema-bound SQL generation, report synthesis over an already-small
 PII-stripped result set) are closer to templated generation than
 open-ended reasoning, so Flash's latency/cost fits a synchronous chat UX
-better — Pro remains a viable production escalation for turns that fail
-self-correct once, not implemented here to avoid a second model to
-test/bill for at prototype scale. `OpenRouterProvider` (coded)
+better. `OpenRouterProvider` (coded)
 calls OpenRouter's OpenAI-compatible endpoint via the `openai` SDK —
 OpenRouter's own documented integration path, chosen to avoid hand-rolled
 request/response JSON translation the SDK already implements and tests;
@@ -353,18 +385,23 @@ see the Observability note in §3) with its error class
 (`bq_call_failed`/`bq_unclassified_exception`, `tool_call_error`,
 `provider_call_failed`, `provider_failover`, etc.). No path crashes the
 CLI loop; every path terminates in either a valid answer or a bounded,
-legible error message. Three gaps found during live testing are recorded in
+legible error message.
+
+Three gaps found during live testing are recorded in
 [implementation-notes.md](implementation-notes.md#known-gaps-found-during-testing):
-an empty-result check that doesn't fire for `COUNT(*)` queries; an
-invalid-API-key error classified as a generic `ProviderError` instead of
-`ProviderAuthError`; and the resulting auth/transient distinction not
-actually being used anywhere — `call_model` lets a `ProviderError`
-propagate past the graph's curated-message pipeline entirely, and the
-circuit breaker treats an unrecoverable bad key the same as a recoverable
-rate limit, cycling open forever instead of surfacing a distinct message.
+
+- The empty-result check doesn't fire for `COUNT(*)` queries.
+- An invalid API key is classified as a generic `ProviderError` instead of
+  `ProviderAuthError`.
+- That auth/transient distinction isn't used anywhere: `call_model` lets a
+  `ProviderError` propagate past the graph's curated-message pipeline
+  entirely, and the circuit breaker treats an unrecoverable bad key the
+  same as a recoverable rate limit, cycling open forever instead of
+  surfacing a distinct message.
+
 None has a functional or safety impact (the CLI loop never dies and
-OpenRouter still answers), but the last one silently masks a config problem
-behind the fallback provider rather than surfacing it.
+OpenRouter still answers), but the last one silently masks a config
+problem behind the fallback provider rather than surfacing it.
 
 ## 6. Requirement-by-Requirement Handling
 
