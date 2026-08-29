@@ -38,6 +38,7 @@ flowchart TB
 
     subgraph Data["Data & Knowledge"]
         BQ[("BigQuery\nthelook_ecommerce\n(read-only)")]
+        Checkpoints[("Conversation Checkpoint Store\nMemorystore for Redis (prod)\nInMemorySaver (prototype)")]
         GoldenBucket[("Golden Bucket\npgvector on Cloud SQL (prod)\nlocal JSON + cosine (design reference)")]
         Reports[("Saved Reports Store\nCloud SQL (prod)\nSQLite (design reference)")]
         Prefs[("User Preference Store\nFirestore (prod) —\ndocs-only in prototype")]
@@ -56,6 +57,7 @@ flowchart TB
     Provider -. "circuit breaker on failure" .-> OpenRouter
     Orchestrator --> BQWrap
     BQWrap --> BQ
+    Orchestrator --> Checkpoints
     Orchestrator --> GoldenBucket
     Orchestrator --> Reports
     Orchestrator --> Prefs
@@ -136,6 +138,21 @@ because they couple orchestration to one LLM vendor's SDK, conflicting
 with the provider-agnostic `Provider` interface (below) the
 Gemini/OpenRouter circuit breaker depends on.
 
+**Conversation Checkpoint Store — Memorystore for Redis (prod),
+`InMemorySaver` (prototype).** Cloud Run instances are stateless and
+scale to zero between turns, so the prototype's checkpointer
+(`InMemorySaver`, fine for one long-running local CLI process) can't
+carry conversation state across a cold start in production —
+checkpointing has to be externalized for `interrupt()`/resume and
+multi-turn context to survive that. Redis over Cloud SQL: checkpoints
+are written on every turn (far higher frequency than Reports or Golden
+Bucket writes) and are ephemeral working state, not a durable record
+worth keeping indefinitely, so under the same access-pattern rule used
+below for Cloud SQL vs. Firestore, they don't belong on the same
+relational instance — Memorystore is LangGraph's other officially
+supported checkpoint backend and keeps that write churn off the durable
+stores entirely.
+
 **Extensibility — new tools and data sources.** New capabilities (chart
 generation, emailing reports, web search) fall out of the tool-calling
 shape already chosen rather than needing a separate mechanism: each is a
@@ -153,6 +170,22 @@ buying nothing a single container needs) or Cloud Functions (default
 timeout too tight for a self-correct retry plus a BQ dry-run/execute):
 scales to zero between conversations and takes an arbitrary container
 image for the LangGraph process's actual dependencies.
+
+**Client ↔ Agent Service communication.** The prototype CLI runs the
+orchestrator in-process — no network hop, no protocol involved. In
+production the same CLI talks to Cloud Run over a REST endpoint (a
+single `POST /chat` taking `{conversation_id, message}` and returning
+that turn's response), reached the same way any internal Cloud Run
+service is — an IAM-authenticated service-to-service call, not a public
+API key. `conversation_id` is the thread key both the LangGraph
+checkpointer above and the (stateless, scale-to-zero) Cloud Run instance
+need: every request carries it so the right checkpoint loads regardless
+of which instance handles the request. The response is returned whole,
+not token-streamed, matching the prototype's synchronous request/response
+CLI; streaming is a reasonable production upgrade for perceived latency,
+not assumed here. The Agent Service reaches Cloud SQL, Memorystore, and
+Firestore the same way it reaches BigQuery — its own IAM identity, no
+separate per-store credential to manage.
 
 **LLM provider — Gemini primary, OpenRouter fallback, behind a common
 `Provider` interface.** Gemini via Vertex AI in production (shares
