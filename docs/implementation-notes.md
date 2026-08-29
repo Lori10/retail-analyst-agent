@@ -7,6 +7,29 @@ changes the architecture or the requirement-by-requirement scope described in
 design.md §9; it's the "why exactly" and "what we found" behind decisions
 summarized there in one or two sentences.
 
+## Orchestrator: Rejected Alternatives
+
+LangGraph (design.md §3) was weighed against two other categories, both
+ruled out on the same axis: coordination machinery this agent doesn't
+need, versus machinery it does.
+
+**Role-based multi-agent frameworks (CrewAI, AutoGen).** These solve
+coordination between multiple cooperating agents — role assignment, task
+handoff, shared memory across agents. This system is one agent running a
+tool-calling loop (`get_schema`, `run_query`, and future tools), not a
+crew of specialized agents dividing a task. Adopting either framework
+would mean carrying their multi-agent abstractions for a shape this agent
+never needs.
+
+**Provider-bundled agent runtimes (OpenAI's Agents SDK, Vertex AI Agent
+Builder).** Both couple orchestration to one LLM vendor's SDK — the
+Agents SDK is OpenAI-specific, Agent Builder is Vertex-specific. That
+conflicts directly with the provider-agnostic `Provider` interface
+(design.md §3) the Gemini/OpenRouter circuit breaker depends on: picking
+either runtime would mean rebuilding the fallback mechanism on top of a
+vendor-specific agent loop instead of the vendor-neutral one LangGraph
+provides.
+
 ## LLM Provider: Raw SDKs vs. LangChain Chat Model Wrappers
 
 Each provider (`llm_provider.py`, `openrouter_provider.py`) talks to its SDK
