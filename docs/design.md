@@ -195,9 +195,7 @@ Flash (`gemini-3.6-flash`, see §8), not Pro: both coded turn shapes
 (schema-bound SQL generation, report synthesis over an already-small
 PII-stripped result set) are closer to templated generation than
 open-ended reasoning, so Flash's latency/cost fits a synchronous chat UX
-better — Pro remains a viable production escalation for turns that fail
-self-correct once, not implemented here to avoid a second model to
-test/bill for at prototype scale. `OpenRouterProvider` (coded)
+better. `OpenRouterProvider` (coded)
 calls OpenRouter's OpenAI-compatible endpoint via the `openai` SDK —
 OpenRouter's own documented integration path, chosen to avoid hand-rolled
 request/response JSON translation the SDK already implements and tests;
