@@ -179,8 +179,11 @@ need: every request carries it so the right checkpoint loads regardless
 of which instance handles the request.
 
 The response is returned whole, not token-streamed, matching the
-prototype's synchronous request/response CLI; streaming is a reasonable
-production upgrade for perceived latency, not assumed here. The Agent
+prototype's synchronous request/response CLI. Streaming would help
+perceived latency, but only partially: the orchestrator's tool-calling
+loop (schema lookups, SQL execution, self-correct retries) runs before
+the final synthesis call, so only that last call has anything to stream.
+Not assumed here. The Agent
 Service reaches Cloud SQL, Memorystore, and Firestore the same way it
 reaches BigQuery — its own IAM identity, no separate per-store credential
 to manage.
