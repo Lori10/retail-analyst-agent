@@ -475,7 +475,9 @@ dataset being queried (`thelook_ecommerce`) is public.
 
 **1. Python environment**
 
-- Python 3.11
+- Python 3.11 — not required to be pre-installed: `uv sync` reads
+  `.python-version` and fetches a matching interpreter automatically if
+  none is found, via `uv`'s own Python management
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/) installed
 
 **2. Gemini (LLM provider)**
@@ -551,6 +553,8 @@ Example session:
 
 Golden Bucket retrieval and the delete-confirmation flow shown in earlier
 drafts of this example aren't in the prototype — see §9.
+
+Type `exit` or `quit` to leave the REPL (Ctrl-D/Ctrl-C also work).
 
 ## 9. Prototype vs. Production Scope Matrix
 
