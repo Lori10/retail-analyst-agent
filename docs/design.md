@@ -556,6 +556,21 @@ drafts of this example aren't in the prototype — see §9.
 
 Type `exit` or `quit` to leave the REPL (Ctrl-D/Ctrl-C also work).
 
+**Inspecting internals (PII stripping, self-correct).** `retail-agent`
+prints only the final `Agent: ...` answer per turn — enough to use the
+agent, not enough to see the two coded requirements actually fire.
+`scripts/trace.py` runs one question through the same graph and prints
+every message in the resulting state (every tool call, every tool
+response — post-PII-strip — every model turn) plus the resilience
+bookkeeping (`self_correct_attempts`, `last_tool_errors`) the REPL never
+surfaces. Same credentials as the CLI; no conversation continuity (each
+run is a fresh thread), so it's for inspecting one question at a time,
+not for discussing results:
+
+```bash
+uv run python scripts/trace.py "What are the top 5 product categories by revenue?"
+```
+
 ## 9. Prototype vs. Production Scope Matrix
 
 | Requirement | Prototype (coded) | Production (design only) |
