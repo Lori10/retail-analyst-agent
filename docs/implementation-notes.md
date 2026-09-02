@@ -302,3 +302,113 @@ moot now that the circuit breaker is gone entirely; see design.md §3.) Not
 fixed: no crash risk (the CLI loop still never dies, per §5's guarantee),
 but a misconfigured API key surfaces as a raw provider error string rather
 than the friendlier curated message written for exactly that case.
+
+## High-Stakes Oversight: Delete-Confirmation Implementation Notes
+
+Companion detail to design.md §3/§4/§6 for the Saved Reports Store and
+`interrupt()`-based confirm-then-delete flow, added when that requirement
+moved from docs-only to coded.
+
+**LangGraph replay semantics before `interrupt()` are a non-issue here by
+construction.** `graph.py`'s `resolve_delete` node calls `interrupt(...)`
+partway through its body; everything before that call (the
+`reports_store.find_candidates(...)` query) re-executes from scratch when
+the graph resumes via `Command(resume=...)`, a documented LangGraph
+behavior. This turns out not to matter here: the node's only `return`
+statement is reached exclusively on the pass that completes (zero
+candidates, a store error, or the resumed pass after confirmation) — the
+pausing pass unwinds internally before ever reaching a `return`, so no
+`ToolMessage`/`AIMessage` is ever double-appended. A side effect worth
+naming rather than treating as accidental: because `find_candidates` runs
+again on resume, the delete always operates against a *freshly re-queried*
+candidate list, not a snapshot frozen at the moment the confirmation
+prompt was shown. In the time between the prompt and the "yes," another
+process could in principle have added or removed a report matching the
+same criteria. This is judged acceptable for the prototype's single-user,
+mostly-single-session usage pattern; a production system serving
+concurrent managers might instead pass the exact candidate ids through the
+`interrupt()` payload and delete by id rather than by re-running the
+filter, trading a (very) small staleness risk for guaranteed
+re-derivation of "what exactly matches this filter right now."
+
+**Owner identity is `getpass.getuser()`, not real authentication.** There
+is no login system in the CLI prototype — one OS process, one user for its
+whole lifetime. `owner` is threaded into `build_graph(...)` once at
+startup and closed over by every node that touches `ReportsStore`. Every
+store method still enforces owner scoping (`find_candidates`,
+`delete_reports` both filter `WHERE owner = %s`, and `delete_reports`
+re-asserts it even though `find_candidates` already filtered — belt and
+suspenders against a bug ever passing an id from a different owner) — so
+the *scoping mechanism* requirement 3 asks for ("never cross-user") is
+real and tested (`test_delete_reports_scoped_to_wrong_owner_deletes_nothing`
+in both `test_reports_store.py` and, via `FakeReportsStore`,
+`test_graph.py`), even though the *identity source* feeding it is a
+placeholder for real per-manager auth.
+
+**Confirmation parsing is a deterministic keyword allowlist
+(`_is_affirmative` in `graph.py`), not an LLM call.** Matches this
+codebase's established pattern (`guardrail.py`'s injection denylist,
+`sql_safety.py`'s keyword allowlist): cheap, zero added latency/cost,
+adequate for the narrow "yes or anything else" shape of a reply to a
+plain confirmation prompt. A resumed turn bypasses the `guardrail` node
+entirely (resuming re-enters `resolve_delete` directly, not `START`), but
+this isn't a safety gap: the allowlist is narrow and everything unmatched
+aborts, so there's no way for adversarial phrasing on the confirmation
+turn to talk its way into a delete it wouldn't otherwise get. The real
+cost is UX, not safety: if the user types a brand-new, unrelated question
+instead of a yes/no while a delete is pending, `_is_affirmative` treats it
+as a "no" — the delete is correctly aborted, but the new question is
+silently discarded rather than answered, and the user has to re-ask it
+next turn. Solving this would mean classifying "is this a yes/no reply or
+a new topic," reintroducing the LLM-call cost this design deliberately
+avoids for a confirmation step described in design.md §6 as "deliberately
+boring." Not fixed; documented as an accepted trade-off, same spirit as
+the `COUNT(*)` empty-result gap above.
+
+**A round mixing `delete_reports` with another tool call drops the other
+call.** `route_after_model` routes the *entire* round to `resolve_delete`
+if any tool call in it is named `delete_reports`, discarding any other
+tool call the same model turn also requested. This mirrors the existing,
+already-documented precedent above ("Self-correct operates on the whole
+round, not per tool call") for exactly the same underlying reason: nothing
+in this architecture supports partially executing a round and retrying
+only the rest, and `call_model` will regenerate the full call set fresh
+next turn if the dropped call is still needed. Covered by
+`test_mixed_round_delete_reports_and_another_tool_call_takes_over_whole_round`
+in `test_graph.py`.
+
+**`ReportsStore` deliberately has no `resilience.bounded_backoff` retry,
+unlike `bq_tool.py`/`llm_provider.py`.** Both of those wrap calls to a
+genuinely remote, rate-limited third-party API where "the exact same
+request, retried a moment later, might succeed" is a real, common
+condition. A Postgres connection — whether the local `docker-compose`
+instance or Cloud SQL in production — doesn't have that failure mode in
+the same way for this workload; a `psycopg.Error` here is far more likely
+to mean a real, non-transient problem (bad connection string, database
+down, a schema/permissions issue) that a bare retry wouldn't fix. Adding
+backoff here would be unearned complexity copied from a different failure
+model. If `REPORTS_DATABASE_URL` is ever pointed at something with a
+meaningfully different failure profile (a connection-pooled proxy under
+heavy load, say), this is worth revisiting — but it's out of scope for
+the current deployment shape.
+
+**Postgres from the start, not SQLite-then-swap.** This requirement was
+initially implemented against a local SQLite file (zero new dependency,
+matching this codebase's general bias toward minimal dependencies for a
+take-home prototype) and then deliberately migrated to Postgres
+(`psycopg`, v3, no ORM) mid-implementation once real deployment plans
+came up — Postgres is what design.md's Saved Reports Store section always
+named as the production store technology (Cloud SQL for Postgres), so
+this removes a "swap it before shipping" step rather than adding
+architectural complexity the assignment didn't need. `docker-compose.yml`
+provides one-command local Postgres (two databases — one for interactive
+use, one for the test suite, so `uv run pytest` can never truncate
+manually-saved reports); `REPORTS_DATABASE_URL` repoints at any other
+reachable Postgres (a local install, Cloud SQL, etc.) with no code change.
+The practical cost of this choice: unlike every other unit test file in
+this repo, `test_reports_store.py` is not hermetic — it requires a real,
+reachable Postgres to pass at all, since `ReportsStore` (unlike
+`BigQueryTool`/`GeminiProvider`) has no fake/mock double standing in for
+it at that layer. `test_graph.py`/`test_cli.py`'s `FakeReportsStore`
+doubles keep the *graph-level* delete/save/list tests hermetic regardless
+— only the store's own CRUD/scoping tests need live Postgres.

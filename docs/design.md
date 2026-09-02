@@ -39,7 +39,7 @@ flowchart TB
         BQ[("BigQuery\nthelook_ecommerce\n(read-only)")]
         Checkpoints[("Conversation Checkpoint Store\nMemorystore for Redis (prod)\nInMemorySaver (prototype)")]
         GoldenBucket[("Golden Bucket\npgvector on Cloud SQL (prod)\nlocal JSON + cosine (design reference)")]
-        Reports[("Saved Reports Store\nCloud SQL (prod)\nSQLite (design reference)")]
+        Reports[("Saved Reports Store\nPostgres — Cloud SQL (prod) /\ndocker-compose (prototype) — coded")]
         Prefs[("User Preference Store\nFirestore (prod) —\ndocs-only in prototype")]
         Persona[("Persona Config\nCloud Storage/Firestore (prod)\nlocal persona.yaml (design reference)")]
     end
@@ -68,8 +68,9 @@ flowchart TB
 ## 2a. Current Graph Structure (generated, not hand-drawn)
 
 The diagram above is the production system architecture — most of it
-(Golden Bucket, Reports store, Persona config) isn't coded, and per §9
-never will be in this prototype. This one is different in kind: it's
+(Golden Bucket, Persona config) isn't coded, and per §9 never will be in
+this prototype; the Saved Reports Store is coded (§3/§4). This one is
+different in kind: it's
 Mermaid syntax read directly off the real compiled `StateGraph` in
 `graph.py` via `graph.get_graph().draw_mermaid()`, so it shows exactly
 what's running today, not an aspiration. Regenerate it with
@@ -88,9 +89,11 @@ graph TD;
 	call_model(call_model)
 	tools(tools)
 	give_up(give_up)
+	resolve_delete(resolve_delete)
 	__end__([<p>__end__</p>]):::last
 	__start__ --> guardrail;
 	call_model -.-> __end__;
+	call_model -.-> resolve_delete;
 	call_model -.-> tools;
 	guardrail -.-> blocked;
 	guardrail -.-> call_model;
@@ -98,6 +101,7 @@ graph TD;
 	tools -.-> give_up;
 	blocked --> __end__;
 	give_up --> __end__;
+	resolve_delete --> __end__;
 	classDef default fill:#f2f0ff,line-height:1.2
 	classDef first fill-opacity:0
 	classDef last fill:#bfb6fc
@@ -119,29 +123,42 @@ graph TD;
   `.bind_tools(...)`) and appends whatever comes back (text, a tool call,
   or both).
 - **`tools`** — executes every tool call in the latest model message
-  against `BigQueryTool`, appends the results, and tracks per-turn
+  against `BigQueryTool` or `ReportsStore` (`run_query`, `get_schema`,
+  `save_report`, `list_reports`), appends the results, and tracks per-turn
   self-correct/empty-result state (the resilience mechanisms in §5).
+  `delete_reports` is never dispatched here — see `resolve_delete` below.
 - **`give_up`** — terminal node reached when a tool error isn't
   self-correctable or the self-correct budget (2 retries) is exhausted;
   emits the error class's graceful user-facing message and ends the turn.
+- **`resolve_delete`** — reached instead of `tools` for any round
+  containing a `delete_reports` call: resolves the request into exact
+  candidate reports via `ReportsStore.find_candidates` (scoped to the
+  current user, never cross-user), then either declines immediately (zero
+  candidates — no confirmation needed for a no-op) or calls `interrupt()`
+  to pause the graph and surface the exact candidates for the user's
+  explicit yes/no on the next turn (the coded half of §4's delete path and
+  §6's requirement 3). See §4 for the full mechanics, including the
+  LangGraph replay nuance around code placed before an `interrupt()` call.
 - **Solid edges** (`__start__ → guardrail`, `blocked → __end__`,
-  `give_up → __end__`) always fire. **Dashed edges** are conditional
-  routing: out of `guardrail` to `blocked` if the message matched a denylist
-  pattern, else `call_model`; out of `call_model` to `tools` only if the
-  model's reply contains a function call, else `__end__`; out of `tools`
-  back to `call_model` unless the self-correct budget is exhausted, in
-  which case to `give_up` — the bounded self-correct loop described in §5.
-  Backoff on transient BigQuery/provider errors happens beneath this graph
-  entirely, inside `bq_tool.py`/the provider classes — a typed transient
-  error reaching `tools`/`call_model` means backoff already ran out, so
-  it's treated as non-self-correctable here.
+  `give_up → __end__`, `resolve_delete → __end__`) always fire. **Dashed
+  edges** are conditional routing: out of `guardrail` to `blocked` if the
+  message matched a denylist pattern, else `call_model`; out of
+  `call_model` to `resolve_delete` if the model's reply contains a
+  `delete_reports` call, to `tools` if it contains any other function
+  call, else `__end__`; out of `tools` back to `call_model` unless the
+  self-correct budget is exhausted, in which case to `give_up` — the
+  bounded self-correct loop described in §5. Backoff on transient
+  BigQuery/provider errors happens beneath this graph entirely, inside
+  `bq_tool.py`/the provider classes — a typed transient error reaching
+  `tools`/`call_model` means backoff already ran out, so it's treated as
+  non-self-correctable here.
 
 ## 3. Component Reasoning
 
 **Orchestrator — LangGraph.** Two requirements map directly onto its
 primitives: `interrupt()`/resume for the confirm-before-delete flow
-(requirement 3, docs only), and checkpointing for conversation-state
-persistence (requirement 4, docs only). Used for these mechanisms
+(requirement 3, coded — see §4/§6), and checkpointing for conversation-
+state persistence (requirement 4, docs only). Used for these mechanisms
 specifically, not adopted decoratively — the architecture diagram maps
 ~1:1 onto actual graph nodes. Also weighed against multi-agent frameworks
 and provider-bundled agent runtimes; see
@@ -328,14 +345,38 @@ maintenance: dedup near-identical trios, down-weight/archive trios past a
 freshness horizon (e.g. 12 months), and version trios rather than
 overwrite them in place.
 
-**Saved Reports Store (docs only).** Cloud SQL/Postgres, schema: `id,
-owner, title, content, conversation_id, created_at, tags` — gives real
-queryable delete-scoping (`WHERE owner = ? AND content LIKE ?`), which is
-what the confirm-then-delete flow in requirement 3 actually needs rather
-than asserts in prose. Not built in the prototype (§9); "create a report
-with action items" — the base deliverable-3 ask, distinct from
-requirement 3 — is satisfied by the agent formatting its chat answer as a
-report, with no persistence layer required.
+**Saved Reports Store — coded, Postgres in both the prototype and
+production.** Schema: `id, owner, title, content, conversation_id,
+created_at, tags` — gives real queryable delete-scoping (`WHERE owner =
+%s AND ...`), which is what the confirm-then-delete flow in requirement 3
+actually needs rather than asserts in prose. `ReportsStore`
+(`reports_store.py`) owns its own `psycopg` (v3) connection directly, the
+same way `BigQueryTool` owns its own `bigquery.Client` — no ORM, matching
+this codebase's existing preference for a thin wrapper over the driver.
+Unlike the rest of this design, the prototype and production stores are
+the same technology here, not a simplified stand-in: local dev/testing
+runs against a real Postgres via `docker-compose.yml` (`postgres:16`,
+two databases — `retail_agent_reports` for interactive use,
+`retail_agent_reports_test` for the test suite, so running `uv run
+pytest` never truncates reports saved during manual testing), and
+production points `REPORTS_DATABASE_URL` at Cloud SQL for Postgres
+instead. One deliberate asymmetry with `bq_tool.py`: `ReportsStore` skips
+`resilience.bounded_backoff` — this store has no "brief rate-limit or
+server hiccup, retry the same call" failure mode the way a third-party
+network API (BigQuery, Gemini) does, so retrying here would be unearned
+complexity (see docs/implementation-notes.md).
+
+`owner` is `getpass.getuser()` (the OS username of whoever is running the
+CLI process) in the prototype — there's no login system to resolve a real
+per-manager identity from, and this is a single-process, single-user tool
+regardless. Every store call is scoped by `owner` (never cross-user,
+re-asserted at delete time too, not just at candidate selection — defense
+in depth), so the scoping *behavior* requirement 3 asks for is real even
+though the prototype's identity source is a placeholder for the Firestore-
+backed per-manager auth production would use. "Create a report with
+action items" — the base deliverable-3 ask, distinct from requirement 3 —
+is satisfied by the agent formatting its chat answer as a report and
+optionally persisting it via `save_report`.
 
 Cloud SQL vs. Firestore below follows one rule: relational/queryable
 access (arbitrary `WHERE` clauses, joins) goes in Cloud SQL; single-key
@@ -377,31 +418,39 @@ this exchange" deep-dive that raw metrics can't.
 
 ## 4. Data Flow
 
-Described here at production scope; the prototype implements only the
-coded steps of the Q&A path below (§9) — Golden Bucket retrieval, persona
-config, user preferences, and the entire Delete path are docs only.
+Described here at production scope; the prototype implements the coded
+steps of both the Q&A path and the Delete path below (§9) — only Golden
+Bucket retrieval, persona config, and user preferences remain docs only.
 
 **Q&A / analysis path**: user message → **coded** rule-based guardrail
 check (regex/keyword denylist for prompt-injection/jailbreak intent —
 `guardrail.py`; a production system would add a semantic classifier here
 for the off-topic/delete-intent distinction this denylist doesn't attempt)
-→ embed question, retrieve top-k Golden Bucket trios → LLM generates SQL
-using trios + schema as context → BQ wrapper validates (read-only check)
-→ dry-run (reject over cap) → execute with timeout + row limit →
-PII-strip the DataFrame → LLM synthesizes the report/answer, treating tool
-output as untrusted data (never as instructions — closes the second-order
-injection path where adversarial text embedded in a row value could
-otherwise be read as a directive) and using persona config + user
-preferences → response returned to the client and logged.
+→ embed question, retrieve top-k Golden Bucket trios (docs only) → LLM
+generates SQL using trios + schema as context → BQ wrapper validates
+(read-only check) → dry-run (reject over cap) → execute with timeout +
+row limit → PII-strip the DataFrame → LLM synthesizes the report/answer,
+treating tool output as untrusted data (never as instructions — closes
+the second-order injection path where adversarial text embedded in a row
+value could otherwise be read as a directive) and using persona config +
+user preferences (both docs only) → response returned to the client and
+logged.
 
-**Delete path**: user message → LLM resolves the request into candidate
-report(s) via a store query scoped to the requesting user (never
-cross-user) → orchestrator lists the exact candidates and pauses via
-`interrupt()` → next user turn: "yes" resumes the graph and executes the
-delete against the store; anything else aborts. Both outcomes are logged.
-Non-mutating actions (e.g. "show me my reports") never trigger this
-pause — only the delete itself does, keeping the added friction to one
-turn. This entire path depends on the Saved Reports Store (§3).
+**Delete path — coded.** User message → model calls `delete_reports`
+(`scope`, optional `title_contains`) → `resolve_delete` resolves the
+request into candidate report(s) via `ReportsStore.find_candidates`,
+scoped to the requesting user (never cross-user, re-asserted again at
+delete time) → zero candidates declines immediately, no pause needed;
+otherwise the node lists the exact candidates and pauses via
+`interrupt()` → next user turn: a deterministic keyword check (not
+another LLM call — `_is_affirmative`) treats "yes"/"confirm"/etc. as
+confirmation and resumes the graph to execute the delete against the
+store; anything else aborts. Both outcomes are logged
+(`reports_deleted`/`reports_delete_aborted`). Non-mutating actions (e.g.
+"show me my reports") never trigger this pause — only `delete_reports`
+does, keeping the added friction to one turn. This entire path depends on
+the Saved Reports Store (§3); see §2a for the `resolve_delete` node and
+§6 requirement 3 for the full safety rationale.
 
 ## 5. Error Handling & Fallback Strategies
 
@@ -503,12 +552,21 @@ Defense in depth: the read-only SQL check and the service account's IAM
 read-only role are independent backstops against a malicious or buggy
 query in the first place.
 
-**3. High-Stakes Oversight — docs only** (eligible for the prototype,
-deliberately not coded — see §9). See delete path in §4. The
-resolve-then-list-then-confirm shape is the intended safeguard; the
-confirmation mechanism itself (a plain yes/no next turn) is deliberately
-boring so it wouldn't become UX friction for a routine action users are
-allowed to take on their own reports.
+**3. High-Stakes Oversight — coded.** See delete path in §4 and the
+`resolve_delete` node in §2a. The resolve-then-list-then-confirm shape is
+the safeguard; the confirmation mechanism itself (a plain yes/no next
+turn, checked deterministically rather than by another LLM call) is
+deliberately boring so it wouldn't become UX friction for a routine
+action users are allowed to take on their own reports. Resuming a paused
+confirmation bypasses the input-side guardrail (§2a), but the
+confirmation check is a narrow allowlist where anything unmatched aborts
+— there's no privilege-escalation path, only a UX rough edge if the user
+types a new, unrelated question instead of a yes/no (it's swallowed as a
+"no" rather than answered; see docs/implementation-notes.md). Owner
+scoping in the prototype uses `getpass.getuser()` (the OS username of
+whoever runs the CLI) rather than real per-manager auth, since there's no
+login system to resolve an identity from — production would source
+`owner` from the same auth the rest of the service already requires.
 
 **4. Continuous Improvement — docs only.** User-level: preference
 profile (§3), injected into the system prompt. System-level: explicitly
@@ -552,10 +610,11 @@ the intended production approach only.
 
 ## 8. Setup Instructions & Example Run
 
-Two independent things need to be configured, and they have different
+Three independent things need to be configured, and they have different
 prerequisites — Gemini is a single API key with nothing else to install;
 BigQuery needs the `gcloud` CLI and a real GCP project, even though the
-dataset being queried (`thelook_ecommerce`) is public.
+dataset being queried (`thelook_ecommerce`) is public; the Saved Reports
+Store needs a running Postgres, provided locally via `docker-compose.yml`.
 
 **1. Python environment**
 
@@ -581,12 +640,27 @@ dataset being queried (`thelook_ecommerce`) is public.
   create local Application Default Credentials
 - Set `GOOGLE_CLOUD_PROJECT` in `.env` to that project's ID
 
+**4. Saved Reports Store (Postgres)**
+
+- Requires Docker (or an already-running Postgres — see below)
+- `docker compose up -d postgres` starts a local Postgres (`postgres:16`)
+  with two databases: `retail_agent_reports` (what the CLI uses) and
+  `retail_agent_reports_test` (what the test suite uses, so running tests
+  never truncates reports saved during interactive use)
+- `ReportsStore` creates its own `reports` table on first connect (`CREATE
+  TABLE IF NOT EXISTS`) — no separate migration step
+- No Docker? Point `REPORTS_DATABASE_URL` at any reachable Postgres
+  instance instead (a local install, Cloud SQL, etc.) — the default in
+  `config.py` matches the `docker-compose.yml` credentials
+  (`postgresql://retail_agent:retail_agent@localhost:5432/retail_agent_reports`)
+
 ```bash
 gcloud auth application-default login
 cp .env.example .env   # fill in GOOGLE_CLOUD_PROJECT and GEMINI_API_KEY
 # or export them directly — .env is picked up automatically (python-dotenv),
 # but real environment variables always take precedence over it.
 
+docker compose up -d postgres
 uv sync
 uv run retail-agent
 ```
@@ -598,20 +672,28 @@ skipped — either the BigQuery API isn't enabled on the project named by
 `gcloud auth application-default login` was never run (or was run for a
 different account/project than the one in `.env`). Gemini-side failures
 (invalid/missing `GEMINI_API_KEY`) surface as a graceful provider error
-message rather than a crash — see §5.
+message rather than a crash — see §5. A reports-store connection failure
+(Postgres not running, wrong `REPORTS_DATABASE_URL`) surfaces as a
+startup error naming `docker compose up -d postgres` as the likely fix.
 
 Optional env vars (defaults shown): `GEMINI_MODEL=gemini-3.6-flash`,
 `BQ_MAX_BYTES_BILLED=1000000000` (~1GB), `BQ_ROW_LIMIT=500`,
-`BQ_QUERY_TIMEOUT_SECONDS=30`, `LOG_LEVEL=INFO`.
+`BQ_QUERY_TIMEOUT_SECONDS=30`, `LOG_LEVEL=INFO`,
+`REPORTS_DATABASE_URL=postgresql://retail_agent:retail_agent@localhost:5432/retail_agent_reports`.
 
-Run the test suite: `uv run pytest`. This runs only the unit tests by
-default. `tests/integration/` — live regression checks against real
-BigQuery/Gemini (PII stripping holds even when explicitly selected, and
-one end-to-end smoke question) — deliberately requires
-`GOOGLE_CLOUD_PROJECT`/`GEMINI_API_KEY` as real *exported* environment
-variables, not just values in `.env`, so `uv run pytest` never silently
-runs live, billed calls just because `.env` happens to be configured for
-the CLI. To run them explicitly:
+Run the test suite: `uv run pytest`. This runs the unit tests by default,
+including `test_reports_store.py` — unlike every other unit test file,
+that one needs a real Postgres reachable at `REPORTS_DATABASE_URL` (or its
+default, matching `docker-compose.yml`'s `retail_agent_reports_test`
+database) to pass, since `ReportsStore` has no fake/mock double the way
+`BigQueryTool`/`GeminiProvider` do in `test_graph.py`/`test_cli.py` — run
+`docker compose up -d postgres` first. `tests/integration/` — live
+regression checks against real BigQuery/Gemini (PII stripping holds even
+when explicitly selected, and one end-to-end smoke question) —
+deliberately requires `GOOGLE_CLOUD_PROJECT`/`GEMINI_API_KEY` as real
+*exported* environment variables, not just values in `.env`, so `uv run
+pytest` never silently runs live, billed calls just because `.env`
+happens to be configured for the CLI. To run them explicitly:
 `set -a && source .env && set +a && uv run pytest tests/integration`.
 
 Example session:
@@ -621,20 +703,26 @@ Example session:
 [agent generates SQL, queries BigQuery read-only, strips PII, returns an
  analysis]
 
-> Turn that into a report with action items for next quarter
+> Turn that into a report with action items for next quarter, and save it
 [agent formats the analysis as a report — summary, key findings, action
- items — returned in the chat; not persisted, since the Saved Reports
- store (§3) isn't built in the prototype]
+ items — and calls save_report to persist it to the Saved Reports Store]
+
+> Delete that report
+This would delete the following report(s):
+  - [1] Churn Spike — Q_ Action Items (saved 2026-...)
+Type 'yes' to confirm deletion, or anything else to cancel.
+> yes
+Agent: Deleted 1 report(s).
 ```
 
-Golden Bucket retrieval and the delete-confirmation flow shown in earlier
-drafts of this example aren't in the prototype — see §9.
+Golden Bucket retrieval shown in earlier drafts of this example isn't in
+the prototype — see §9.
 
 Type `exit` or `quit` to leave the REPL (Ctrl-D/Ctrl-C also work).
 
 **Inspecting internals (PII stripping, self-correct).** `retail-agent`
 prints only the final `Agent: ...` answer per turn — enough to use the
-agent, not enough to see the two coded requirements actually fire.
+agent, not enough to see the coded requirements actually fire.
 `scripts/trace.py` runs one question through the same graph and prints
 every message in the resulting state (every tool call, every tool
 response — post-PII-strip — every model turn) plus the resilience
@@ -653,18 +741,18 @@ uv run python scripts/trace.py "What are the top 5 product categories by revenue
 |---|---|---|
 | 1. Hybrid Intelligence | Docs only | Vertex AI Vector Search, human-curated updates |
 | 2. Safety & PII Masking | **Coded** — injection-denylist guardrail + untrusted-tool-output handling + name-based PII stripping (schema-verified) | Same, at scale, with a semantic classifier replacing the denylist |
-| 3. High-Stakes Oversight | Docs only — eligible for the prototype, deliberately not coded | Cloud SQL reports store + interrupt-based confirm |
+| 3. High-Stakes Oversight | **Coded** — Postgres-backed Saved Reports Store (`ReportsStore`/`psycopg`) + `interrupt()`/`Command(resume=...)`-based confirm-then-delete (`resolve_delete` node) | Same store technology as the prototype (Cloud SQL for Postgres instead of local/docker Postgres); real per-manager auth resolving `owner` instead of the OS username |
 | 4. Continuous Improvement | Docs only | Firestore preference store; human-gated system learning |
 | 5. Resilience & Error Handling | **Coded** — typed errors, self-correct, backoff | Same, at scale |
 | 6. Quality Assurance | Docs only — eligible for the prototype, deliberately not coded | Golden eval set + scoring script, judge-drift audits |
 | 7. Observability | Docs only — eligible for the prototype, deliberately not coded | Structured JSON logs → Cloud Logging + Monitoring dashboards/alerts + Langfuse (self-hosted) for conversation-level tracing |
 | 8. Agility (Persona) | Docs only | Firestore/Cloud Storage config, admin surface |
 
-Exactly 2 of 8 requirements are coded (both eligible for the prototype per
-the assignment's deliverable-3 list, which allows any 2 of 5). The other 3
-eligible requirements (High-Stakes Oversight, Quality Assurance,
-Observability) are a deliberate scope decision, not a time cutoff — the
-build order (see `CLAUDE.md`) stops after resilience depth by design. The
+3 of 8 requirements are coded (all three eligible for the prototype per
+the assignment's deliverable-3 list, which allows any 2 of 5). The other 2
+eligible requirements (Quality Assurance, Observability) are a deliberate
+scope decision, not a time cutoff — the build order (see `CLAUDE.md`)
+adds High-Stakes Oversight after resilience depth, then stops. The
 remaining 3 requirements (Hybrid Intelligence, Continuous Improvement,
 Agility) were never in the assignment's prototype-eligible list, so
 they're designed here in full but were never candidates for coding
