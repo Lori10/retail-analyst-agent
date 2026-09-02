@@ -102,6 +102,15 @@ class ProviderAuthError(ProviderError):
     graceful_message = "There's a configuration problem talking to the language model provider."
 
 
+class ReportsStoreError(AgentError):
+    """Raised by `ReportsStore` when an underlying `sqlite3.Error` occurs
+    (disk error, locked database, etc.). Never self-correctable — no query
+    rewrite fixes a storage failure."""
+
+    self_correctable = False
+    graceful_message = "I couldn't reach the saved reports store right now. Please try again shortly."
+
+
 class GuardrailBlockedError(AgentError):
     """Raised by `guardrail.check_user_input` when a user message matches a
     known prompt-injection/jailbreak pattern.
@@ -131,6 +140,7 @@ _ERROR_CLASSES_BY_NAME = {
         ProviderTransientError,
         ProviderAuthError,
         GuardrailBlockedError,
+        ReportsStoreError,
     )
 }
 

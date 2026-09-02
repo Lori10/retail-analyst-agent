@@ -10,6 +10,7 @@ from retail_agent.errors import (
     QuerySyntaxError,
     QueryTooExpensiveError,
     QueryTransientError,
+    ReportsStoreError,
     SQLSafetyError,
     graceful_message_for,
 )
@@ -24,6 +25,7 @@ NOT_SELF_CORRECTABLE = {
     ProviderTransientError,
     ProviderAuthError,
     GuardrailBlockedError,
+    ReportsStoreError,
 }
 
 
