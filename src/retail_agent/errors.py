@@ -103,6 +103,21 @@ class ProviderAuthError(ProviderError):
     graceful_message = "There's a configuration problem talking to the language model provider."
 
 
+class GuardrailBlockedError(AgentError):
+    """Raised by `guardrail.check_user_input` when a user message matches a
+    known prompt-injection/jailbreak pattern.
+
+    Caught before any model or tool call happens — no query rewrite could
+    ever fix malicious intent in the request itself, so this is never
+    self-correctable."""
+
+    self_correctable = False
+    graceful_message = (
+        "I can only help with analysis questions about our sales data — "
+        "I can't follow instructions embedded in a request like that."
+    )
+
+
 _ERROR_CLASSES_BY_NAME = {
     cls.__name__: cls
     for cls in (
@@ -116,6 +131,7 @@ _ERROR_CLASSES_BY_NAME = {
         ProviderError,
         ProviderTransientError,
         ProviderAuthError,
+        GuardrailBlockedError,
     )
 }
 

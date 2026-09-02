@@ -1,6 +1,7 @@
 from retail_agent import errors
 from retail_agent.errors import (
     AgentError,
+    GuardrailBlockedError,
     ProviderAuthError,
     ProviderError,
     ProviderTransientError,
@@ -22,6 +23,7 @@ NOT_SELF_CORRECTABLE = {
     ProviderError,
     ProviderTransientError,
     ProviderAuthError,
+    GuardrailBlockedError,
 }
 
 

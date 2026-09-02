@@ -85,21 +85,37 @@ config:
 ---
 graph TD;
 	__start__([<p>__start__</p>]):::first
+	guardrail(guardrail)
+	blocked(blocked)
 	call_model(call_model)
 	tools(tools)
 	give_up(give_up)
 	__end__([<p>__end__</p>]):::last
-	__start__ --> call_model;
+	__start__ --> guardrail;
 	call_model -.-> __end__;
 	call_model -.-> tools;
+	guardrail -.-> blocked;
+	guardrail -.-> call_model;
 	tools -.-> call_model;
 	tools -.-> give_up;
+	blocked --> __end__;
 	give_up --> __end__;
 	classDef default fill:#f2f0ff,line-height:1.2
 	classDef first fill-opacity:0
 	classDef last fill:#bfb6fc
 ```
 
+- **`guardrail`** — runs once, on the turn's user message only, before any
+  model or tool call: `guardrail.check_user_input` matches it against a
+  regex/keyword denylist of prompt-injection/jailbreak phrasing (`"ignore
+  previous instructions"`, `"you are now"`, `"reveal your system prompt"`,
+  etc. — see `guardrail.py`). This is the coded half of Safety & PII
+  Masking's input-side control; it catches malicious *intent* in the
+  request, not general off-topic questions (that's still the softer
+  system-prompt instruction in `cli.py`).
+- **`blocked`** — terminal node reached when `guardrail` rejects the turn;
+  emits `GuardrailBlockedError`'s graceful decline without the model or any
+  tool ever being invoked (zero LLM cost for a blocked message).
 - **`call_model`** — sends the running message history plus the tool
   schemas to the current LLM provider (Gemini, or OpenRouter if the
   circuit breaker has failed over) and appends whatever comes back (text,
@@ -110,16 +126,17 @@ graph TD;
 - **`give_up`** — terminal node reached when a tool error isn't
   self-correctable or the self-correct budget (2 retries) is exhausted;
   emits the error class's graceful user-facing message and ends the turn.
-- **Solid edges** (`__start__ → call_model`, `give_up → __end__`) always
-  fire. **Dashed edges** are conditional routing: out of `call_model` to
-  `tools` only if the model's reply contains a function call, else
-  `__end__`; out of `tools` back to `call_model` unless the self-correct
-  budget is exhausted, in which case to `give_up` — the bounded
-  self-correct loop described in §5. Backoff on transient BigQuery/provider
-  errors happens beneath this graph entirely, inside `bq_tool.py`/the
-  provider classes — a typed transient error reaching `tools`/`call_model`
-  means backoff already ran out, so it's treated as non-self-correctable
-  here.
+- **Solid edges** (`__start__ → guardrail`, `blocked → __end__`,
+  `give_up → __end__`) always fire. **Dashed edges** are conditional
+  routing: out of `guardrail` to `blocked` if the message matched a denylist
+  pattern, else `call_model`; out of `call_model` to `tools` only if the
+  model's reply contains a function call, else `__end__`; out of `tools`
+  back to `call_model` unless the self-correct budget is exhausted, in
+  which case to `give_up` — the bounded self-correct loop described in §5.
+  Backoff on transient BigQuery/provider errors happens beneath this graph
+  entirely, inside `bq_tool.py`/the provider classes — a typed transient
+  error reaching `tools`/`call_model` means backoff already ran out, so
+  it's treated as non-self-correctable here.
 
 ## 3. Component Reasoning
 
@@ -354,12 +371,17 @@ Described here at production scope; the prototype implements only the
 coded steps of the Q&A path below (§9) — Golden Bucket retrieval, persona
 config, user preferences, and the entire Delete path are docs only.
 
-**Q&A / analysis path**: user message → lightweight guardrail check
-(analysis vs. off-topic/malicious vs. delete-intent) → embed question,
-retrieve top-k Golden Bucket trios → LLM generates SQL using trios +
-schema as context → BQ wrapper validates (read-only check) → dry-run
-(reject over cap) → execute with timeout + row limit → PII-strip the
-DataFrame → LLM synthesizes the report/answer using persona config + user
+**Q&A / analysis path**: user message → **coded** rule-based guardrail
+check (regex/keyword denylist for prompt-injection/jailbreak intent —
+`guardrail.py`; a production system would add a semantic classifier here
+for the off-topic/delete-intent distinction this denylist doesn't attempt)
+→ embed question, retrieve top-k Golden Bucket trios → LLM generates SQL
+using trios + schema as context → BQ wrapper validates (read-only check)
+→ dry-run (reject over cap) → execute with timeout + row limit →
+PII-strip the DataFrame → LLM synthesizes the report/answer, treating tool
+output as untrusted data (never as instructions — closes the second-order
+injection path where adversarial text embedded in a row value could
+otherwise be read as a directive) and using persona config + user
 preferences → response returned to the client and logged.
 
 **Delete path**: user message → LLM resolves the request into candidate
@@ -436,14 +458,36 @@ design choice: a human-in-the-loop update gate — the bucket only grows
 from analyst-approved reports, trading update speed for protection
 against the agent reinforcing its own errors.
 
-**2. Safety & PII Masking — coded.** Two independent layers: an
-input-side guardrail rejects off-topic/malicious requests before any
-tool call happens, and an output-side hard control — name-based PII
-column stripping in the BQ wrapper (§3) — guarantees known-PII columns
-never leave the wrapper even if the guardrail is bypassed. Defense in
-depth: the read-only SQL check and the service account's IAM read-only
-role are independent backstops against a malicious or buggy query in the
-first place.
+**2. Safety & PII Masking — coded.** Three independent layers, addressing
+three distinct threats:
+
+- **Input-side guardrail** (`guardrail.py`, wired into `graph.py` as the
+  `guardrail` node — §2a) — a regex/keyword denylist that blocks
+  prompt-injection/jailbreak phrasing ("ignore previous instructions",
+  "reveal your system prompt", "developer mode", etc.) before the model or
+  any tool is ever called. Deliberately a denylist, not a semantic
+  classifier: cheap, deterministic, zero added latency/cost, and it
+  targets malicious *intent* specifically — it does not attempt the
+  broader off-topic classification named in the assignment brief, which
+  remains the system-prompt instruction ("only answer analysis questions
+  — politely decline anything else") it always was. A denylist also can't
+  catch a paraphrased or subtler injection attempt; see
+  [implementation-notes.md](implementation-notes.md#input-guardrail-regex-denylist-not-a-classifier)
+  for that trade-off and what covers the gap.
+- **Untrusted-tool-output handling** — the system prompt (`cli.py`)
+  explicitly instructs the model to treat everything returned by
+  `run_query`/`get_schema` as data, never as instructions. This closes a
+  second, different injection path than the guardrail above: adversarial
+  text embedded in a database value (e.g. a product name field crafted to
+  look like a command) reaches the model through tool output, not through
+  the user's chat message, so the input-side guardrail never sees it.
+- **Output-side hard control** — name-based PII column stripping in the BQ
+  wrapper (§3) guarantees known-PII columns never leave the wrapper even
+  if both layers above are bypassed.
+
+Defense in depth: the read-only SQL check and the service account's IAM
+read-only role are independent backstops against a malicious or buggy
+query in the first place.
 
 **3. High-Stakes Oversight — docs only** (eligible for the prototype,
 deliberately not coded — see §9). See delete path in §4. The
@@ -602,7 +646,7 @@ uv run python scripts/trace.py "What are the top 5 product categories by revenue
 | Requirement | Prototype (coded) | Production (design only) |
 |---|---|---|
 | 1. Hybrid Intelligence | Docs only | Vertex AI Vector Search, human-curated updates |
-| 2. Safety & PII Masking | **Coded** — guardrail + name-based PII stripping (schema-verified) | Same, at scale |
+| 2. Safety & PII Masking | **Coded** — injection-denylist guardrail + untrusted-tool-output handling + name-based PII stripping (schema-verified) | Same, at scale, with a semantic classifier replacing the denylist |
 | 3. High-Stakes Oversight | Docs only — eligible for the prototype, deliberately not coded | Cloud SQL reports store + interrupt-based confirm |
 | 4. Continuous Improvement | Docs only | Firestore preference store; human-gated system learning |
 | 5. Resilience & Error Handling | **Coded** — typed errors, self-correct, backoff, circuit breaker | Same, at scale |
