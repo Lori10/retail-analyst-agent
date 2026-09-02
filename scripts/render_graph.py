@@ -17,7 +17,7 @@ from retail_agent.graph import build_graph
 
 
 def main() -> None:
-    graph = build_graph(MagicMock(), MagicMock(), system_instruction="")
+    graph = build_graph(MagicMock(), MagicMock(), MagicMock(), "render-graph-placeholder", system_instruction="")
     print(graph.get_graph().draw_mermaid())
 
 

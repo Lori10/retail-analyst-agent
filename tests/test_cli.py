@@ -1,7 +1,16 @@
 import pandas as pd
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.types import Command
 
-from retail_agent.cli import SYSTEM_INSTRUCTION, _progress_message, _response_text, _stream_progress, _tool_result_message
+from retail_agent.cli import (
+    SYSTEM_INSTRUCTION,
+    _build_stream_input,
+    _format_confirmation_prompt,
+    _progress_message,
+    _response_text,
+    _stream_progress,
+    _tool_result_message,
+)
 from retail_agent.errors import GuardrailBlockedError, QuerySyntaxError
 from retail_agent.graph import build_graph
 
@@ -22,6 +31,45 @@ class FakeProvider:
 
     def generate(self, messages, system_instruction):
         return self._responses.pop(0)
+
+
+class FakeReportsStore:
+    """Minimal reports store double — same shape as test_graph.py's, but
+    duplicated here so this test file doesn't reach across modules."""
+
+    def __init__(self):
+        self._reports = []
+        self._next_id = 1
+
+    def save_report(self, *, owner, title, content, conversation_id, tags=None):
+        report = {
+            "id": self._next_id,
+            "owner": owner,
+            "title": title,
+            "content": content,
+            "conversation_id": conversation_id,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "tags": tags or [],
+        }
+        self._next_id += 1
+        self._reports.append(report)
+        return report
+
+    def list_reports(self, owner):
+        return [r for r in self._reports if r["owner"] == owner]
+
+    def find_candidates(self, owner, *, scope, conversation_id=None, title_contains=None):
+        results = [r for r in self._reports if r["owner"] == owner]
+        if scope == "conversation":
+            results = [r for r in results if r["conversation_id"] == conversation_id]
+        if title_contains:
+            results = [r for r in results if title_contains.lower() in r["title"].lower()]
+        return results
+
+    def delete_reports(self, owner, ids):
+        before = len(self._reports)
+        self._reports = [r for r in self._reports if not (r["owner"] == owner and r["id"] in ids)]
+        return before - len(self._reports)
 
 
 class FakeBigQueryTool:
@@ -193,7 +241,7 @@ def test_streaming_a_full_turn_yields_progress_then_final_answer():
             _model_response(text="Total revenue is 42."),
         ]
     )
-    graph = build_graph(provider, FakeBigQueryTool(), system_instruction="test")
+    graph = build_graph(provider, FakeBigQueryTool(), FakeReportsStore(), "test-owner", system_instruction="test")
 
     progress_lines = []
     final_message = None
@@ -227,7 +275,7 @@ def test_streaming_a_self_correcting_turn_shows_retry_notice_before_final_answer
             },
         ]
     )
-    graph = build_graph(provider, bq_tool, system_instruction="test")
+    graph = build_graph(provider, bq_tool, FakeReportsStore(), "test-owner", system_instruction="test")
 
     progress_lines = []
     final_message = None
@@ -247,7 +295,7 @@ def test_streaming_a_blocked_turn_shows_no_progress_before_the_decline():
     # failed to short-circuit, call_model would try to pop from an empty
     # list and blow up instead of yielding a graceful decline.
     provider = FakeProvider([])
-    graph = build_graph(provider, FakeBigQueryTool(), system_instruction="test")
+    graph = build_graph(provider, FakeBigQueryTool(), FakeReportsStore(), "test-owner", system_instruction="test")
 
     progress_lines = []
     final_message = None
@@ -260,3 +308,57 @@ def test_streaming_a_blocked_turn_shows_no_progress_before_the_decline():
 
     assert progress_lines == []
     assert _response_text(final_message) == GuardrailBlockedError.graceful_message
+
+
+# -- _build_stream_input -------------------------------------------------------
+
+
+def test_build_stream_input_returns_fresh_turn_state_normally():
+    stream_input = _build_stream_input("What's total revenue?", awaiting_confirmation=False)
+    assert stream_input["messages"][0].content == "What's total revenue?"
+    assert stream_input["self_correct_attempts"] == 0
+    assert stream_input["empty_result_sanity_checked"] is False
+    assert stream_input["last_tool_errors"] == []
+    assert stream_input["blocked"] is False
+
+
+def test_build_stream_input_returns_resume_command_when_awaiting_confirmation():
+    stream_input = _build_stream_input("yes", awaiting_confirmation=True)
+    assert isinstance(stream_input, Command)
+    assert stream_input.resume == "yes"
+
+
+# -- _format_confirmation_prompt -----------------------------------------------
+
+
+def test_format_confirmation_prompt_lists_candidate_ids_and_titles():
+    interrupt_value = {
+        "type": "confirm_delete",
+        "candidates": [
+            {"id": 1, "title": "Q1 Report", "created_at": "2026-01-01T00:00:00+00:00"},
+            {"id": 2, "title": "Q2 Report", "created_at": "2026-04-01T00:00:00+00:00"},
+        ],
+    }
+    prompt = _format_confirmation_prompt(interrupt_value)
+    assert "[1] Q1 Report" in prompt
+    assert "[2] Q2 Report" in prompt
+    assert "yes" in prompt.lower()
+
+
+# -- _stream_progress: resolve_delete -------------------------------------------
+
+
+def test_stream_progress_resolve_delete_is_final():
+    tool_message = ToolMessage(content='{"deleted": 1}', tool_call_id="c1", name="delete_reports")
+    ai_message = AIMessage(content="Deleted 1 report(s).")
+    progress, final = _stream_progress({"resolve_delete": {"messages": [tool_message, ai_message]}})
+    assert progress is None
+    assert final is ai_message
+
+
+# -- SYSTEM_INSTRUCTION: delete confirmation is automatic -----------------------
+
+
+def test_system_instruction_mentions_delete_confirmation_is_automatic():
+    assert "delete_reports" in SYSTEM_INSTRUCTION
+    assert "confirm" in SYSTEM_INSTRUCTION.lower()

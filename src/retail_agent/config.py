@@ -22,6 +22,8 @@ class Config:
         row_limit: Maximum rows fetched per query.
         query_timeout_seconds: BigQuery client-side wait timeout.
         log_level: Root log level passed to `logging.basicConfig`.
+        reports_database_url: Postgres connection string for the Saved
+            Reports store.
     """
 
     project_id: str
@@ -31,6 +33,7 @@ class Config:
     row_limit: int
     query_timeout_seconds: float
     log_level: str
+    reports_database_url: str
 
 
 def load_config() -> Config:
@@ -72,4 +75,7 @@ def load_config() -> Config:
         row_limit=int(os.environ.get("BQ_ROW_LIMIT", 500)),
         query_timeout_seconds=float(os.environ.get("BQ_QUERY_TIMEOUT_SECONDS", 30)),
         log_level=os.environ.get("LOG_LEVEL", "INFO"),
+        reports_database_url=os.environ.get(
+            "REPORTS_DATABASE_URL", "postgresql://retail_agent:retail_agent@localhost:5432/retail_agent_reports"
+        ),
     )

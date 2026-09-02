@@ -24,15 +24,14 @@ Design decisions and HLD live in @docs/design.md (source of truth; update it whe
   cleverness.
 
 ## Prototype scope (requirements implemented in code)
-Coded: Safety & PII Masking, Resilience & Graceful Error Handling — exactly
-these two, satisfying the assignment's "at least 2 of 5" minimum for
-deliverable 3. Nothing else gets coded, including the other three
-prototype-eligible requirements.
-Docs only: High-Stakes Oversight (delete confirmation), Observability
-(structured tracing), Quality Assurance (golden-set eval harness) — all
-eligible for the prototype but deliberately left as design only, to keep
-the coded surface to exactly two slices. Also docs only, and never eligible
-for the prototype in the first place: Hybrid Intelligence/Golden Bucket,
+Coded: Safety & PII Masking, Resilience & Graceful Error Handling,
+High-Stakes Oversight (Saved Reports Store + interrupt-based
+confirm-then-delete) — three of the assignment's five prototype-eligible
+requirements, exceeding the "at least 2 of 5" minimum for deliverable 3.
+Docs only: Observability (structured tracing), Quality Assurance
+(golden-set eval harness) — both eligible for the prototype but
+deliberately left as design only. Also docs only, and never eligible for
+the prototype in the first place: Hybrid Intelligence/Golden Bucket,
 Continuous Improvement, Agility/Persona Management.
 
 ## Workflow
@@ -41,12 +40,11 @@ Continuous Improvement, Agility/Persona Management.
 - Build order: (1) thin end-to-end skeleton — CLI → LangGraph tool-calling
   loop → Gemini → BQ wrapper with PII stripping and cost/timeout/row caps;
   (2) resilience depth — typed errors, bounded self-correct, backoff;
-  (3) polish — docs, clean-machine setup test.
-  The prototype stops at (2). High-Stakes Oversight (reports store +
-  interrupt-based confirm-then-delete), observability (structured JSON
-  tracing), and a QA/eval harness are all designed in docs/design.md but
-  deliberately not coded — scope is fixed at exactly the two requirements
-  above.
+  (3) High-Stakes Oversight — Postgres-backed Saved Reports Store,
+  `interrupt()`/`Command(resume=...)`-based confirm-then-delete flow;
+  (4) polish — docs, clean-machine setup test.
+  Observability (structured JSON tracing) and a QA/eval harness are
+  designed in docs/design.md but deliberately not coded.
 - Write tests for PII filtering and delete confirmation first.
 - Ask before adding a dependency.
 
