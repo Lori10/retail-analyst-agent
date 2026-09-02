@@ -5,7 +5,8 @@ Design decisions and HLD live in @docs/design.md (source of truth; update it whe
 
 ## Constraints
 - Python 3.11, uv for deps
-- LLM: Gemini via google-genai, behind a provider interface; OpenRouter as fallback
+- LLM: Gemini only, via `langchain-google-genai`'s `ChatGoogleGenerativeAI`.
+  No fallback provider.
 - Orchestration: LangGraph (`langgraph` + `langchain-core`). Used for real —
   `interrupt()`/resume for the confirm-before-delete flow, checkpointing for
   conversation state — not added decoratively.
@@ -39,8 +40,8 @@ Continuous Improvement, Agility/Persona Management.
 - Work in small vertical slices; each slice runnable end to end.
 - Build order: (1) thin end-to-end skeleton — CLI → LangGraph tool-calling
   loop → Gemini → BQ wrapper with PII stripping and cost/timeout/row caps;
-  (2) resilience depth — typed errors, bounded self-correct, backoff,
-  provider circuit breaker; (3) polish — docs, clean-machine setup test.
+  (2) resilience depth — typed errors, bounded self-correct, backoff;
+  (3) polish — docs, clean-machine setup test.
   The prototype stops at (2). High-Stakes Oversight (reports store +
   interrupt-based confirm-then-delete), observability (structured JSON
   tracing), and a QA/eval harness are all designed in docs/design.md but

@@ -81,8 +81,8 @@ class QueryTransientError(QueryExecutionError):
 
 
 class ProviderError(AgentError):
-    """Base class for LLM provider (Gemini/OpenRouter) call failures that
-    aren't more specifically classified below."""
+    """Base class for Gemini provider call failures that aren't more
+    specifically classified below."""
 
     self_correctable = False
     graceful_message = "I'm having trouble reaching the language model right now. Please try again."
@@ -91,8 +91,7 @@ class ProviderError(AgentError):
 class ProviderTransientError(ProviderError):
     """Raised for a provider rate-limit (HTTP 429) or server error (5xx).
     Reaching the graph means `resilience.bounded_backoff` already retried
-    and failed; the `ProviderCircuitBreaker` counts these toward failing
-    over to the fallback provider."""
+    and failed."""
 
 
 class ProviderAuthError(ProviderError):

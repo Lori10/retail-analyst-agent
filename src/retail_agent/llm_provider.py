@@ -1,181 +1,120 @@
 import logging
-from typing import Protocol
 
 import tenacity
-from google import genai
-from google.genai import errors as genai_errors
-from google.genai import types
+from langchain_core.exceptions import ModelAuthenticationError, ModelError, ModelPermissionDeniedError
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 from retail_agent.errors import ProviderAuthError, ProviderError, ProviderTransientError
 from retail_agent.resilience import bounded_backoff
+from retail_agent.tools import TOOLS
 
 logger = logging.getLogger(__name__)
 
 
-class Provider(Protocol):
-    """Structural interface both `GeminiProvider` and `OpenRouterProvider`
-    satisfy, so `graph.py` and `ProviderCircuitBreaker` can treat either one
-    (or a breaker wrapping both) identically."""
+def _is_transient_error(exc: Exception) -> bool:
+    """Whether `exc` looks like a condition another attempt could clear.
 
-    def generate(
-        self,
-        contents: list[types.Content],
-        system_instruction: str,
-        tools: list[types.Tool],
-    ) -> types.GenerateContentResponse:
-        """Send the conversation so far to the model and return its reply.
-
-        Args:
-            contents: The running message history, in `google-genai`'s
-                native `types.Content` shape.
-            system_instruction: The system prompt for this call.
-            tools: Function-calling tool schemas available to the model.
-
-        Returns:
-            The model's response, including any function call(s) it made.
-
-        Raises:
-            ProviderAuthError: The API key/credentials are invalid.
-            ProviderTransientError: The call failed transiently on every
-                retry attempt (rate limit or server error).
-            ProviderError: Any other provider-side failure.
-        """
-        ...
-
-
-def _is_transient_status(code: int) -> bool:
-    """Whether an HTTP status code represents a plausibly-transient failure.
+    `langchain-google-genai` classifies every HTTP-level failure into a
+    `langchain_core.exceptions.ModelError` subclass carrying its own
+    `is_retryable` flag (rate limits and 5xx are retryable; auth/permission/
+    invalid-request/not-found are not) — a real provider-agnostic taxonomy,
+    not the raw `.code`-attribute juggling the old `google-genai`-only
+    classifier needed. A bare `TimeoutError`/`ConnectionError` (a failure
+    before any HTTP response — DNS, network down) never reaches that
+    classification at all, so it's checked for directly, same as before.
 
     Args:
-        code: HTTP status code from a provider response.
+        exc: The exception raised by `self._model.invoke(...)`.
 
     Returns:
-        True for 429 (rate limit) or any 5xx (server error).
+        Whether `exc` should be retried by `bounded_backoff`.
     """
-    return code == 429 or code >= 500
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    return isinstance(exc, ModelError) and exc.is_retryable
 
 
-def _classify_genai_error(exc: genai_errors.APIError) -> ProviderError:
-    """Map a `google-genai` API error into a typed AgentError by HTTP status.
+def _classify_error(exc: Exception) -> ProviderError:
+    """Map a raw exception from `ChatGoogleGenerativeAI.invoke` into a typed
+    `AgentError`.
 
     Args:
-        exc: The exception raised by the `google-genai` client.
+        exc: The exception raised by `self._model.invoke(...)`, after
+            retries (if any) are resolved one way or the other.
 
     Returns:
-        `ProviderAuthError` for 401/403, `ProviderTransientError` for a
-        transient status (see `_is_transient_status`), otherwise the
-        generic `ProviderError`.
+        `ProviderAuthError` for an authentication/permission failure,
+        `ProviderTransientError` for anything `_is_transient_error` matches,
+        otherwise the generic `ProviderError`.
     """
-    if exc.code in (401, 403):
+    if isinstance(exc, (ModelAuthenticationError, ModelPermissionDeniedError)):
         return ProviderAuthError(str(exc))
-    if _is_transient_status(exc.code):
+    if _is_transient_error(exc):
         return ProviderTransientError(str(exc))
     return ProviderError(str(exc))
 
 
-def _is_transient_genai_error(exc: BaseException) -> bool:
-    """Retry predicate for `bounded_backoff`.
-
-    `google.genai.errors` lumps every 4xx into one `ClientError` type and
-    every 5xx into one `ServerError` type — both only distinguishable by
-    their `.code` attribute — so retryability here can't be expressed as a
-    plain exception type the way it can for BigQuery or OpenRouter; it has
-    to inspect the exception's contents.
-
-    Args:
-        exc: The exception raised by the `google-genai` client.
-
-    Returns:
-        True for a client-side timeout/connection error, or a
-        `genai_errors.APIError` with a transient status code.
-    """
-    if isinstance(exc, (TimeoutError, ConnectionError)):
-        return True
-    return isinstance(exc, genai_errors.APIError) and _is_transient_status(exc.code)
-
-
 class GeminiProvider:
-    """Thin wrapper around google-genai. Built as one implementation behind a
-    common shape (generate(contents, system_instruction, tools)) so an
-    OpenRouter provider can be added later without touching the graph."""
+    """Gemini LLM provider, backed by `langchain-google-genai`'s
+    `ChatGoogleGenerativeAI` rather than a raw `google-genai` SDK call —
+    the sole provider (no OpenRouter fallback, no circuit breaker; see
+    docs/design.md §3 for why that tradeoff changed once Gemini was the
+    only provider left)."""
 
     def __init__(self, api_key: str, model: str) -> None:
-        """Initialize the provider with an AI Studio API key.
+        """Build the bound chat model.
 
         Args:
-            api_key: Gemini API key (AI Studio).
-            model: Model name, e.g. `"gemini-3.6-flash"`.
+            api_key: Gemini (AI Studio) API key.
+            model: Gemini model name.
         """
-        self._client = genai.Client(api_key=api_key)
-        self._model = model
+        # max_retries=1 (not 0!) disables the SDK's own retry loop — a
+        # documented quirk of the underlying Google SDK where 0 means "use
+        # the Google default" (5 retries) rather than "no retries". Keeping
+        # `bounded_backoff` below as the single source of retry behavior,
+        # same principle the old OpenRouterProvider's `max_retries=0` (for
+        # the `openai` SDK, where 0 does mean "no retries") documented.
+        self._model = ChatGoogleGenerativeAI(model=model, api_key=api_key, max_retries=1).bind_tools(TOOLS)
 
-    @bounded_backoff(retry=tenacity.retry_if_exception(_is_transient_genai_error), attempts=2, logger=logger)
-    def _generate_raw(
-        self,
-        contents: list[types.Content],
-        system_instruction: str,
-        tools: list[types.Tool],
-    ) -> types.GenerateContentResponse:
-        """Call Gemini directly, retrying a transient failure (see
-        `_is_transient_genai_error`) via the `bounded_backoff` decorator.
+    @bounded_backoff(retry=tenacity.retry_if_exception(_is_transient_error), attempts=2, logger=logger)
+    def _generate_raw(self, messages: list[BaseMessage]) -> AIMessage:
+        """Invoke the bound chat model once, retrying (via the
+        `bounded_backoff` decorator) if the raw exception looks transient.
+        Raises whatever the client itself raises, unclassified —
+        classification happens once, in `generate`, after retries are
+        resolved one way or the other.
 
         Args:
-            contents: The running message history.
-            system_instruction: The system prompt for this call.
-            tools: Function-calling tool schemas available to the model.
+            messages: The full message list to send, including the leading
+                `SystemMessage`.
 
         Returns:
-            The raw `GenerateContentResponse` from `google-genai`.
-
-        Raises:
-            Exception: Whatever the client itself raises, unclassified —
-                classification happens once, in `generate`, after retries
-                are resolved one way or the other.
+            The model's reply.
         """
-        config = types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            tools=tools,
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        )
-        return self._client.models.generate_content(
-            model=self._model,
-            contents=contents,
-            config=config,
-        )
+        return self._model.invoke(messages)
 
-    def generate(
-        self,
-        contents: list[types.Content],
-        system_instruction: str,
-        tools: list[types.Tool],
-    ) -> types.GenerateContentResponse:
-        """Send the conversation so far to Gemini and return its reply.
-
-        Transient failures are retried (see `_generate_raw`) before ever
-        reaching the classification step here, so this only classifies
-        what's left: an error `_generate_raw` never retried in the first
-        place, or one that survived every retry attempt.
+    def generate(self, messages: list[BaseMessage], system_instruction: str) -> AIMessage:
+        """Send the message history to Gemini and return its reply.
 
         Args:
-            contents: The running message history.
+            messages: Conversation history (no system message included —
+                this method prepends one).
             system_instruction: The system prompt for this call.
-            tools: Function-calling tool schemas available to the model.
 
         Returns:
-            The raw `GenerateContentResponse` from `google-genai`.
+            The model's reply as an `AIMessage` (its `.tool_calls` is
+            non-empty when the model chose to call a tool).
 
         Raises:
-            ProviderAuthError: The API key is invalid.
-            ProviderTransientError: The call failed transiently on every
-                retry attempt.
-            ProviderError: Any other provider-side failure.
+            ProviderAuthError: Authentication/permission failure.
+            ProviderTransientError: Rate limit, server error, or a
+                connection/timeout failure that survived every retry.
+            ProviderError: Any other provider call failure.
         """
         try:
-            return self._generate_raw(contents, system_instruction, tools)
-        except genai_errors.APIError as exc:
-            typed = _classify_genai_error(exc)
-            logger.warning("provider_call_failed", extra={"provider": "gemini", "error_class": type(typed).__name__})
+            return self._generate_raw([SystemMessage(content=system_instruction), *messages])
+        except Exception as exc:
+            typed = _classify_error(exc)
+            logger.warning("provider_call_failed", extra={"error_class": type(typed).__name__})
             raise typed from exc
-        except (TimeoutError, ConnectionError) as exc:
-            logger.warning("provider_call_failed", extra={"provider": "gemini", "error_class": "ProviderTransientError"})
-            raise ProviderTransientError(str(exc)) from exc

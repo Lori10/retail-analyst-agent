@@ -27,13 +27,12 @@ flowchart TB
 
     subgraph Agent["Agent Service\n(Cloud Run in prod / local process in prototype)"]
         Orchestrator["Orchestrator\nLangGraph: tool-calling loop +\ninterrupt()-based confirm-before-delete"]
-        Provider["LLM Provider Interface"]
+        Provider["LLM Provider\nlangchain-google-genai\nChatGoogleGenerativeAI"]
         BQWrap["BigQuery Tool Wrapper\nread-only check, dry-run cap,\ntimeout, row limit, PII strip"]
     end
 
-    subgraph LLMs["LLM Providers"]
+    subgraph LLMs["LLM Provider"]
         Gemini["Gemini\nVertex AI (prod) /\nAI Studio (prototype)"]
-        OpenRouter["OpenRouter\n(fallback)"]
     end
 
     subgraph Data["Data & Knowledge"]
@@ -54,7 +53,6 @@ flowchart TB
     CLI --> Orchestrator
     Orchestrator --> Provider
     Provider --> Gemini
-    Provider -. "circuit breaker on failure" .-> OpenRouter
     Orchestrator --> BQWrap
     BQWrap --> BQ
     Orchestrator --> Checkpoints
@@ -116,10 +114,10 @@ graph TD;
 - **`blocked`** — terminal node reached when `guardrail` rejects the turn;
   emits `GuardrailBlockedError`'s graceful decline without the model or any
   tool ever being invoked (zero LLM cost for a blocked message).
-- **`call_model`** — sends the running message history plus the tool
-  schemas to the current LLM provider (Gemini, or OpenRouter if the
-  circuit breaker has failed over) and appends whatever comes back (text,
-  a tool call, or both).
+- **`call_model`** — sends the running message history to Gemini (via
+  `langchain-google-genai`'s `ChatGoogleGenerativeAI`, tools bound with
+  `.bind_tools(...)`) and appends whatever comes back (text, a tool call,
+  or both).
 - **`tools`** — executes every tool call in the latest model message
   against `BigQueryTool`, appends the results, and tracks per-turn
   self-correct/empty-result state (the resilience mechanisms in §5).
@@ -196,9 +194,9 @@ need: every request carries it so the right checkpoint loads regardless
 of which instance handles the request.
 
 The final answer is returned whole, not token-streamed — token-by-token
-streaming would need the provider's `.generate()` to call its SDK's
-streaming method (`generate_content_stream` for Gemini, SSE for
-OpenRouter), which neither provider class does today, so it's left as
+streaming would need the provider's `.generate()` to call
+`ChatGoogleGenerativeAI`'s streaming method (`.stream()`/
+`generate_content_stream`), which it doesn't do today, so it's left as
 future work rather than assumed here. That's a narrower gap than it
 first looks, though: the tool-calling loop that runs before the final
 synthesis call (schema lookups, SQL execution, self-correct retries) has
@@ -214,42 +212,54 @@ Service reaches Cloud SQL, Memorystore, and Firestore the same way it
 reaches BigQuery — its own IAM identity, no separate per-store credential
 to manage.
 
-**LLM provider — Gemini primary, OpenRouter fallback, behind a common
-`Provider` interface.** Gemini via Vertex AI in production (shares
-IAM/audit/quota plumbing with the BigQuery access already required); AI
-Studio key in the prototype for simplicity. Default model is Gemini
-Flash (`gemini-3.6-flash`, see §8), not Pro: both coded turn shapes
-(schema-bound SQL generation, report synthesis over an already-small
-PII-stripped result set) are closer to templated generation than
-open-ended reasoning, so Flash's latency/cost fits a synchronous chat UX
-better. `OpenRouterProvider` (coded)
-calls OpenRouter's OpenAI-compatible endpoint via the `openai` SDK —
-OpenRouter's own documented integration path, chosen to avoid hand-rolled
-request/response JSON translation the SDK already implements and tests;
-its internal retry is disabled so the bounded-backoff wrapper (§5) is the
-single source of retry behavior. `ProviderCircuitBreaker` (hand-rolled,
-in-memory, single-process — no external dependency needed for a
-synchronous CLI) opens after `PROVIDER_FAILURE_THRESHOLD` (default 2)
-consecutive Gemini failures, routes to OpenRouter for
-`PROVIDER_COOLDOWN_SECONDS` (default 60), then retries Gemini — the
-concrete mechanism for "resilient to 3rd-party downtime" (requirement 5).
-Only constructed when `OPENROUTER_API_KEY` is set; with no fallback
-configured, Gemini failures surface directly as a graceful error message.
+**LLM provider — Gemini only, via `langchain-google-genai`'s
+`ChatGoogleGenerativeAI`. No fallback provider.** Gemini via Vertex AI in
+production (shares IAM/audit/quota plumbing with the BigQuery access
+already required); AI Studio key in the prototype for simplicity. Default
+model is Gemini Flash (`gemini-3.6-flash`, see §8), not Pro: both coded
+turn shapes (schema-bound SQL generation, report synthesis over an
+already-small PII-stripped result set) are closer to templated generation
+than open-ended reasoning, so Flash's latency/cost fits a synchronous chat
+UX better.
 
-Both providers talk to their SDK directly rather than through LangChain's
-chat model wrappers — see
+`GeminiProvider` (coded) wraps `ChatGoogleGenerativeAI(...).bind_tools(TOOLS)`
+— tools bound once at construction rather than passed per call, since
+Gemini is the only provider and the tool set never changes mid-conversation.
+`max_retries=1` (not `0`!) disables the SDK's own retry loop — a documented
+quirk of the underlying Google SDK where `max_retries=0` is interpreted as
+"use the Google default" (5 retries) rather than "no retries" — so the
+`bounded_backoff` wrapper (§5) stays the single source of retry behavior,
+same principle the earlier `OpenRouterProvider`'s `max_retries=0` (for the
+`openai` SDK, where `0` genuinely means "no retries") once documented.
+There is no circuit breaker and no fallback provider: with Gemini as the
+only provider, there's nowhere to fail over to, so a Gemini failure that
+survives backoff surfaces directly as a graceful error message (§5) instead
+of being routed anywhere else.
+
+This reverses an earlier decision recorded in
 [implementation-notes.md](implementation-notes.md#llm-provider-raw-sdks-vs-langchain-chat-model-wrappers)
-for the full reasoning. Short version: exception classification is a wash
-either way (LangChain doesn't unify exceptions, so a classifier of the same
-shape is still needed under it), so that's not the real reason. The real
-reasons are a self-pinned exception surface and direct control over exact
-request shape (e.g. disabling the SDK's automatic function-calling so
-the graph drives the loop). What LangChain would remove is the
-hand-rolled message/tool-schema translation `openrouter_provider.py`
-needs today; small at two providers (Gemini itself needs none) but
-doesn't stay small — worth
-revisiting if a third LLM provider is added, or if Hybrid Intelligence's
-Golden Bucket pulls in LangChain's retriever integrations anyway.
+to talk to the Gemini/OpenRouter SDKs directly rather than through
+LangChain's chat model wrappers. That decision was made when a second
+provider (OpenRouter) existed and needed its own hand-rolled message/
+tool-schema translation module — LangChain's chat model interface would
+have made that translation unnecessary, at the cost of a direct request-
+shape control this project wanted to keep at the time. With OpenRouter
+removed, that trade-off no longer applies: there's no second provider's
+translation cost to avoid paying, and `langchain-google-genai`'s
+`ChatGoogleGenerativeAI` now classifies every provider failure into
+`langchain_core.exceptions`' own unified `ModelError` taxonomy
+(`ModelAuthenticationError`, `ModelRateLimitError`, `ModelAPIError`, etc.,
+each carrying an `is_retryable` flag) — a real provider-agnostic exception
+surface that didn't exist when the original raw-SDK decision was made, so
+the "exception classification is a wash" argument from that decision no
+longer holds either. See
+[implementation-notes.md](implementation-notes.md#llm-provider-raw-sdks-vs-langchain-chat-model-wrappers)
+for the full account of what changed. This also means adding or swapping a
+provider later is materially cheaper than it was: every LangChain chat
+model returns the same `AIMessage`/`ToolMessage` shapes, so `graph.py`,
+`tools.py`, and `cli.py` — which now speak that shape natively, not a
+Gemini-specific one — would need no changes; only `llm_provider.py`'s
+constructor and its exception-classification buckets would.
 
 **BigQuery tool wrapper.** `src/provided/bq_runner.py` was supplied by the
 company as an example of how to query BigQuery, not a required
@@ -396,7 +406,7 @@ turn. This entire path depends on the Saved Reports Store (§3).
 ## 5. Error Handling & Fallback Strategies
 
 Coded (`errors.py`, `bq_tool.py`, `graph.py`, `llm_provider.py`,
-`openrouter_provider.py`, `circuit_breaker.py`, `resilience.py`). Every
+`resilience.py`). Every
 `AgentError` subclass carries a `self_correctable: bool` flag and a
 `graceful_message` — the graph routes on the flag, never ad hoc
 isinstance checks, and `errors.graceful_message_for(...)` is the single
@@ -416,8 +426,8 @@ contradiction.
 | Syntax/bad-request (`QuerySyntaxError`, `SQLSafetyError`, `QueryTooExpensiveError`) | Self-correct | Fed back to the model as the tool result; up to 2 retries (`MAX_SELF_CORRECT_ATTEMPTS`), 3rd attempt routes to `give_up` with a graceful message — never an unbounded loop |
 | Permission (`QueryPermissionError`) | None | Straight to `give_up` on first occurrence — no query rewrite fixes an IAM grant |
 | Empty result (0 rows) | One sanity-check pass | Model is nudged once per turn to check its own filters/joins before accepting "zero rows"; a second zero-row result in the same turn is accepted rather than looping |
-| Transient/timeout — BQ or provider (`QueryTransientError`/`ProviderTransientError`) | Backoff (2 attempts, exponential, `tenacity`-based, shared across all 3 retry sites) | If backoff exhausts, the typed error reaches the graph already non-self-correctable → `give_up` (BQ), or propagates to `cli.py`'s top-level `except AgentError` handler (provider), which prints the graceful message and keeps the REPL loop alive |
-| LLM provider failure | Circuit breaker (§3) | Opens after `PROVIDER_FAILURE_THRESHOLD` consecutive Gemini failures, routes to OpenRouter for `PROVIDER_COOLDOWN_SECONDS`, then retries Gemini |
+| Transient/timeout — BQ or provider (`QueryTransientError`/`ProviderTransientError`) | Backoff (2 attempts, exponential, `tenacity`-based, shared across both retry sites) | If backoff exhausts, the typed error reaches the graph already non-self-correctable → `give_up` (BQ), or propagates to `cli.py`'s top-level `except AgentError` handler (provider), which prints the graceful message and keeps the REPL loop alive |
+| LLM provider failure (any `ProviderError`) | None — no fallback provider | Propagates to `cli.py`'s top-level `except AgentError` handler, which prints the graceful message and keeps the REPL loop alive; with Gemini as the only provider there's nowhere to fail over to |
 
 Self-correct operates on the whole model turn, not per tool call — if a
 turn fires multiple tool calls and one fails non-self-correctably while
@@ -435,21 +445,25 @@ see the Observability note in §3) with its error class
 CLI loop; every path terminates in either a valid answer or a bounded,
 legible error message.
 
-Three gaps found during live testing are recorded in
+Gaps found during live testing are recorded in
 [implementation-notes.md](implementation-notes.md#known-gaps-found-during-testing):
 
 - The empty-result check doesn't fire for `COUNT(*)` queries.
-- An invalid API key is classified as a generic `ProviderError` instead of
-  `ProviderAuthError`.
-- That auth/transient distinction isn't used anywhere: `call_model` lets a
+- An invalid API key is still classified as a generic `ProviderError`
+  instead of `ProviderAuthError` — confirmed unchanged after the move to
+  `langchain-google-genai`'s classification (Google's API itself returns
+  HTTP 400 for this case, not 401/403, so no client-side classifier change
+  fixes it).
+- That distinction isn't used anywhere regardless: `call_model` lets any
   `ProviderError` propagate past the graph's curated-message pipeline
-  entirely, and the circuit breaker treats an unrecoverable bad key the
-  same as a recoverable rate limit, cycling open forever instead of
-  surfacing a distinct message.
+  entirely, straight to `cli.py`'s generic `except AgentError` handler,
+  which prints `str(exc)` rather than the class's curated
+  `graceful_message`.
 
-None has a functional or safety impact (the CLI loop never dies and
-OpenRouter still answers), but the last one silently masks a config
-problem behind the fallback provider rather than surfacing it.
+None has a functional or safety impact (the CLI loop never dies either
+way), but the last one means a misconfigured API key surfaces as a raw
+provider error string rather than the friendlier curated message written
+for exactly that case.
 
 ## 6. Requirement-by-Requirement Handling
 
@@ -590,14 +604,6 @@ Optional env vars (defaults shown): `GEMINI_MODEL=gemini-3.6-flash`,
 `BQ_MAX_BYTES_BILLED=1000000000` (~1GB), `BQ_ROW_LIMIT=500`,
 `BQ_QUERY_TIMEOUT_SECONDS=30`, `LOG_LEVEL=INFO`.
 
-Provider fallback / circuit breaker (resilience-depth slice — coded):
-`OPENROUTER_API_KEY` (unset by default — the CLI runs Gemini-only with no
-circuit breaker when it's absent, since there's nowhere to fail over to),
-`OPENROUTER_MODEL=openai/gpt-4o-mini`, `PROVIDER_FAILURE_THRESHOLD=2`
-(consecutive Gemini failures before the breaker opens),
-`PROVIDER_COOLDOWN_SECONDS=60` (how long OpenRouter is used before Gemini
-is tried again).
-
 Run the test suite: `uv run pytest`. This runs only the unit tests by
 default. `tests/integration/` — live regression checks against real
 BigQuery/Gemini (PII stripping holds even when explicitly selected, and
@@ -649,7 +655,7 @@ uv run python scripts/trace.py "What are the top 5 product categories by revenue
 | 2. Safety & PII Masking | **Coded** — injection-denylist guardrail + untrusted-tool-output handling + name-based PII stripping (schema-verified) | Same, at scale, with a semantic classifier replacing the denylist |
 | 3. High-Stakes Oversight | Docs only — eligible for the prototype, deliberately not coded | Cloud SQL reports store + interrupt-based confirm |
 | 4. Continuous Improvement | Docs only | Firestore preference store; human-gated system learning |
-| 5. Resilience & Error Handling | **Coded** — typed errors, self-correct, backoff, circuit breaker | Same, at scale |
+| 5. Resilience & Error Handling | **Coded** — typed errors, self-correct, backoff | Same, at scale |
 | 6. Quality Assurance | Docs only — eligible for the prototype, deliberately not coded | Golden eval set + scoring script, judge-drift audits |
 | 7. Observability | Docs only — eligible for the prototype, deliberately not coded | Structured JSON logs → Cloud Logging + Monitoring dashboards/alerts + Langfuse (self-hosted) for conversation-level tracing |
 | 8. Agility (Persona) | Docs only | Firestore/Cloud Storage config, admin surface |

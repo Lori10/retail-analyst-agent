@@ -22,24 +22,24 @@ import json
 import sys
 import uuid
 
-from google.genai import types
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 from retail_agent.cli import StartupError, _build_graph
 from retail_agent.config import ConfigError, load_config
 
 
-def _print_message(index: int, content: types.Content) -> None:
-    print(f"\n[{index}] {content.role}")
-    for part in content.parts:
-        if part.text:
-            print(f"    text: {part.text}")
-        if part.function_call:
-            args = dict(part.function_call.args or {})
-            print(f"    function_call: {part.function_call.name}({json.dumps(args)})")
-        if part.function_response:
-            payload = part.function_response.response
-            pretty = json.dumps(payload, indent=2).replace("\n", "\n      ")
-            print(f"    function_response[{part.function_response.name}]:\n      {pretty}")
+def _print_message(index: int, message: BaseMessage) -> None:
+    print(f"\n[{index}] {message.type}")
+    if isinstance(message, ToolMessage):
+        payload = json.loads(message.content)
+        pretty = json.dumps(payload, indent=2).replace("\n", "\n      ")
+        print(f"    function_response[{message.name}]:\n      {pretty}")
+        return
+    if message.content:
+        print(f"    text: {message.content}")
+    if isinstance(message, AIMessage):
+        for call in message.tool_calls:
+            print(f"    function_call: {call['name']}({json.dumps(call['args'])})")
 
 
 def _print_resilience_summary(result: dict) -> None:
@@ -70,9 +70,8 @@ def main() -> None:
         sys.exit(1)
 
     print(f"QUESTION: {question}")
-    message = types.Content(role="user", parts=[types.Part(text=question)])
     turn_state = {
-        "messages": [message],
+        "messages": [HumanMessage(content=question)],
         # Same per-turn reset cli.py does — a fresh thread_id per run means
         # this would work fine without it too (call_tools defaults missing
         # keys to 0/False/[] via state.get(...)), but seeding it explicitly
