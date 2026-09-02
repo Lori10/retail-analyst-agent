@@ -8,7 +8,8 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from retail_agent.bq_tool import BigQueryTool
-from retail_agent.errors import AgentError, graceful_message_for
+from retail_agent.errors import AgentError, GuardrailBlockedError, graceful_message_for
+from retail_agent.guardrail import check_user_input
 from retail_agent.llm_provider import Provider
 from retail_agent.tools import TOOLS
 
@@ -30,12 +31,15 @@ class AgentState(TypedDict):
             has already had a sanity-check note injected this turn.
         last_tool_errors: Errors from the most recent `call_tools` pass
             (replaced, not accumulated, each time it runs).
+        blocked: Whether `guardrail_check` rejected this turn's user
+            message; set fresh every turn before anything else reads it.
     """
 
     messages: Annotated[list[types.Content], operator.add]
     self_correct_attempts: int
     empty_result_sanity_checked: bool
     last_tool_errors: list[dict]
+    blocked: bool
 
 
 def _dataframe_to_records(df) -> list[dict]:
@@ -95,6 +99,45 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
         A compiled `StateGraph` with in-memory checkpointing, ready for
         `.invoke(...)`.
     """
+
+    def guardrail_check(state: AgentState) -> dict:
+        """Check the turn's user message against the input-side guardrail
+        before any model or tool call happens.
+
+        Runs once per turn on the newest message only — the graph state
+        accumulates the whole conversation, but only the message that
+        started this turn needs checking.
+
+        Args:
+            state: Current graph state; reads the last message's text.
+
+        Returns:
+            `{"blocked": True/False}` — `route_after_guardrail` decides
+            where to go next; a pass-through turn appends no message here,
+            so it looks exactly as it did before this node existed.
+        """
+        last = state["messages"][-1]
+        text = "".join(part.text for part in last.parts if part.text)
+        try:
+            check_user_input(text)
+        except GuardrailBlockedError as exc:
+            logger.warning("guardrail_blocked", extra={"reason": str(exc)})
+            return {"blocked": True}
+        return {"blocked": False}
+
+    def blocked(state: AgentState) -> dict:
+        """Terminal node reached when `guardrail_check` rejects the turn.
+
+        Returns:
+            `{"messages": [...]}` — a single model-role text message
+            carrying the guardrail's graceful decline, without the model or
+            any tool ever being called for this turn.
+        """
+        return {
+            "messages": [
+                types.Content(role="model", parts=[types.Part(text=GuardrailBlockedError.graceful_message)])
+            ]
+        }
 
     def call_model(state: AgentState) -> dict:
         """Send the message history to the provider and append its reply.
@@ -211,6 +254,18 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
         logger.warning("agent_terminal_error", extra={"error_class": chosen["error_class"]})
         return {"messages": [types.Content(role="model", parts=[types.Part(text=message)])]}
 
+    def route_after_guardrail(state: AgentState) -> str:
+        """Route to `blocked` if `guardrail_check` rejected this turn, else
+        into the normal `call_model` loop.
+
+        Args:
+            state: Current graph state; reads `blocked`.
+
+        Returns:
+            `"blocked"` or `"call_model"`.
+        """
+        return "blocked" if state["blocked"] else "call_model"
+
     def route_after_model(state: AgentState) -> str:
         """Route to `tools` if the model's last message made a function
         call, else end the turn.
@@ -248,10 +303,14 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
         return "call_model"
 
     graph = StateGraph(AgentState)
+    graph.add_node("guardrail", guardrail_check)
+    graph.add_node("blocked", blocked)
     graph.add_node("call_model", call_model)
     graph.add_node("tools", call_tools)
     graph.add_node("give_up", give_up)
-    graph.add_edge(START, "call_model")
+    graph.add_edge(START, "guardrail")
+    graph.add_conditional_edges("guardrail", route_after_guardrail, {"call_model": "call_model", "blocked": "blocked"})
+    graph.add_edge("blocked", END)
     graph.add_conditional_edges("call_model", route_after_model, {"tools": "tools", END: END})
     graph.add_conditional_edges("tools", route_after_tools, {"call_model": "call_model", "give_up": "give_up"})
     graph.add_edge("give_up", END)

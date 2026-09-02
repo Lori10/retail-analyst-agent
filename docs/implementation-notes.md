@@ -123,6 +123,51 @@ exactly the schema-drift scenario this control needs to survive; in
 production this check should be a scheduled job diffing the live schema
 against the registry, not a one-time manual pass.
 
+## Input Guardrail: Regex Denylist, Not a Classifier
+
+`guardrail.check_user_input` (wired into `graph.py` as the `guardrail`
+node, run before `call_model` on every turn) blocks a fixed set of
+prompt-injection/jailbreak phrasings — "ignore previous instructions",
+"you are now", "reveal your system prompt", "developer mode", "jailbreak",
+"bypass your rules", and a few close variants. This exists specifically to
+close a gap found during a design review: design.md had described an
+"input-side guardrail" as coded since the Safety & PII Masking requirement
+was first scoped in, but no such control actually existed in code — the
+only enforcement was the system prompt's own "politely decline anything
+else" instruction, which a model can simply choose not to follow. This
+module is the fix for that gap, not a pre-existing control.
+
+It's a regex/keyword denylist, deliberately, for the same reason
+`sql_safety.py`'s read-only check is a regex allowlist rather than a full
+parser: cheap, deterministic, and zero added latency or LLM cost ahead of
+the first real model call — important because this check runs on *every*
+turn, including all the ordinary ones. The trade-off that comes with a
+denylist is real: it catches the common, mechanical forms of "override
+your instructions" phrasing, but it will not catch a semantically
+equivalent request phrased differently enough to dodge every pattern (a
+production system would replace or supplement it with a small
+classification pass — "analysis | off-topic | malicious" — at the cost of
+one extra cheap LLM call per turn). It also does not attempt the broader
+off-topic classification named in the assignment brief ("politely decline
+anything else") — that remains the system prompt's job, unenforced beyond
+the model's own instruction-following, exactly as it was before this
+module existed. The two are different problems: malicious intent is
+worth a hard, testable control because a jailbreak attempt is adversarial
+by construction; "is this on-topic" is a much fuzzier classification where
+a regex denylist would produce more false positives (blocking legitimate
+questions) than it's worth for a prototype.
+
+This module only covers requests arriving through the user's own chat
+message. A related but distinct path — adversarial text embedded in *data*
+that comes back from `run_query`/`get_schema` (e.g. a crafted product name
+field read back into the model's context) — can't be caught by inspecting
+the user's message at all, since the attacker's text never appears there.
+That path is closed separately, in the system prompt (`cli.py`), which
+instructs the model to treat all tool output as data, never as
+instructions. See `test_guardrail.py` for the denylist's test coverage and
+`test_cli.py::test_system_instruction_treats_tool_output_as_untrusted_data`
+for the untrusted-tool-output check.
+
 ## Two Retry Mechanisms: Backoff vs. Self-Correct
 
 Design.md §5 names two retry mechanisms that share vocabulary ("transient,"
