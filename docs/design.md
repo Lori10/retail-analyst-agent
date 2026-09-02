@@ -178,12 +178,21 @@ checkpointer above and the (stateless, scale-to-zero) Cloud Run instance
 need: every request carries it so the right checkpoint loads regardless
 of which instance handles the request.
 
-The response is returned whole, not token-streamed, matching the
-prototype's synchronous request/response CLI. Streaming would help
-perceived latency, but only partially: the orchestrator's tool-calling
-loop (schema lookups, SQL execution, self-correct retries) runs before
-the final synthesis call, so only that last call has anything to stream.
-Not assumed here. The Agent
+The final answer is returned whole, not token-streamed — token-by-token
+streaming would need the provider's `.generate()` to call its SDK's
+streaming method (`generate_content_stream` for Gemini, SSE for
+OpenRouter), which neither provider class does today, so it's left as
+future work rather than assumed here. That's a narrower gap than it
+first looks, though: the tool-calling loop that runs before the final
+synthesis call (schema lookups, SQL execution, self-correct retries) has
+no answer text to stream, but it does have node-level *progress* to
+report, and that's cheap regardless of provider-level streaming — the
+CLI (coded) uses LangGraph's `graph.stream(..., stream_mode="updates")`
+instead of `.invoke()`, printing a one-line status (`"Looking up schema
+for orders..."`, `"Running a query..."`, `"Got 7 row(s)."`, `"That
+didn't work, retrying..."`) after each `call_model`/`tools` node instead
+of staying silent until the whole turn completes (`cli.py`'s
+`_stream_progress`). The Agent
 Service reaches Cloud SQL, Memorystore, and Firestore the same way it
 reaches BigQuery — its own IAM identity, no separate per-store credential
 to manage.
