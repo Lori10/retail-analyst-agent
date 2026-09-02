@@ -3,15 +3,14 @@ import logging
 import operator
 from typing import Annotated, TypedDict
 
-from google.genai import types
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from retail_agent.bq_tool import BigQueryTool
 from retail_agent.errors import AgentError, GuardrailBlockedError, graceful_message_for
 from retail_agent.guardrail import check_user_input
-from retail_agent.llm_provider import Provider
-from retail_agent.tools import TOOLS
+from retail_agent.llm_provider import GeminiProvider
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +34,7 @@ class AgentState(TypedDict):
             message; set fresh every turn before anything else reads it.
     """
 
-    messages: Annotated[list[types.Content], operator.add]
+    messages: Annotated[list[BaseMessage], operator.add]
     self_correct_attempts: int
     empty_result_sanity_checked: bool
     last_tool_errors: list[dict]
@@ -46,14 +45,13 @@ def _dataframe_to_records(df) -> list[dict]:
     """Convert a query result DataFrame into JSON-safe records.
 
     Routes through JSON (not `.to_dict()`) so numpy/Timestamp values become
-    plain JSON-safe types before they hit the genai SDK's proto Struct.
+    plain JSON-safe types before they're embedded in a `ToolMessage`.
 
     Args:
         df: The (already PII-stripped) query result DataFrame.
 
     Returns:
-        A list of plain dicts, one per row, safe to embed in a
-        `FunctionResponse`.
+        A list of plain dicts, one per row.
     """
     return json.loads(df.to_json(orient="records", date_format="iso"))
 
@@ -67,7 +65,7 @@ def _run_tool(bq_tool: BigQueryTool, name: str, args: dict) -> dict:
         args: The model-supplied arguments for that tool.
 
     Returns:
-        A JSON-safe payload suitable for a `FunctionResponse`.
+        A JSON-safe payload suitable for a `ToolMessage`.
 
     Raises:
         AgentError: Propagated unchanged from `bq_tool.run_query`/
@@ -85,12 +83,11 @@ def _run_tool(bq_tool: BigQueryTool, name: str, args: dict) -> dict:
     return {"error": f"Unknown tool: {name}"}
 
 
-def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: str):
+def build_graph(provider: GeminiProvider, bq_tool: BigQueryTool, system_instruction: str):
     """Compile the agent's LangGraph tool-calling loop.
 
     Args:
-        provider: The LLM provider (or `ProviderCircuitBreaker` wrapping
-            two of them) used by the `call_model` node.
+        provider: The LLM provider used by the `call_model` node.
         bq_tool: The BigQuery wrapper used by the `tools` node.
         system_instruction: The system prompt sent on every `call_model`
             invocation.
@@ -116,8 +113,7 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
             where to go next; a pass-through turn appends no message here,
             so it looks exactly as it did before this node existed.
         """
-        last = state["messages"][-1]
-        text = "".join(part.text for part in last.parts if part.text)
+        text = state["messages"][-1].content
         try:
             check_user_input(text)
         except GuardrailBlockedError as exc:
@@ -129,15 +125,11 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
         """Terminal node reached when `guardrail_check` rejects the turn.
 
         Returns:
-            `{"messages": [...]}` — a single model-role text message
-            carrying the guardrail's graceful decline, without the model or
-            any tool ever being called for this turn.
+            `{"messages": [...]}` — a single `AIMessage` carrying the
+            guardrail's graceful decline, without the model or any tool
+            ever being called for this turn.
         """
-        return {
-            "messages": [
-                types.Content(role="model", parts=[types.Part(text=GuardrailBlockedError.graceful_message)])
-            ]
-        }
+        return {"messages": [AIMessage(content=GuardrailBlockedError.graceful_message)]}
 
     def call_model(state: AgentState) -> dict:
         """Send the message history to the provider and append its reply.
@@ -154,45 +146,38 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
                 not caught here — see `cli.py`'s `except AgentError` for
                 where it's ultimately handled.
         """
-        response = provider.generate(
-            contents=state["messages"],
-            system_instruction=system_instruction,
-            tools=TOOLS,
-        )
-        return {"messages": [response.candidates[0].content]}
+        response = provider.generate(messages=state["messages"], system_instruction=system_instruction)
+        return {"messages": [response]}
 
     def call_tools(state: AgentState) -> dict:
-        """Execute every function call in the latest model message.
+        """Execute every tool call in the latest model message.
 
         Dispatches each to `_run_tool`, turns the result (or a caught
-        `AgentError`) into a `FunctionResponse`, injects a one-time
-        sanity-check note on the first zero-row `run_query` result, and
-        tracks `self_correct_attempts`/`last_tool_errors` for
-        `route_after_tools` to act on.
+        `AgentError`) into a `ToolMessage`, injects a one-time sanity-check
+        note on the first zero-row `run_query` result, and tracks
+        `self_correct_attempts`/`last_tool_errors` for `route_after_tools`
+        to act on.
 
         Args:
             state: Current graph state; reads `messages` (for the model's
-                function calls) and the prior `self_correct_attempts`/
+                tool calls) and the prior `self_correct_attempts`/
                 `empty_result_sanity_checked` to continue counting within
                 the same turn.
 
         Returns:
-            A dict updating `messages` (the tool responses), plus the
-            (possibly incremented) `self_correct_attempts`,
+            A dict updating `messages` (one `ToolMessage` per tool call),
+            plus the (possibly incremented) `self_correct_attempts`,
             `empty_result_sanity_checked`, and this pass's `last_tool_errors`.
         """
-        last = state["messages"][-1]
-        response_parts = []
+        last: AIMessage = state["messages"][-1]
+        tool_messages: list[ToolMessage] = []
         self_correct_attempts = state.get("self_correct_attempts", 0)
         empty_result_checked = state.get("empty_result_sanity_checked", False)
         errors: list[dict] = []
 
-        for part in last.parts:
-            if part.function_call is None:
-                continue
-            call = part.function_call
+        for call in last.tool_calls:
             try:
-                payload = _run_tool(bq_tool, call.name, call.args or {})
+                payload = _run_tool(bq_tool, call["name"], call["args"] or {})
             except AgentError as exc:
                 payload = {"error": str(exc), "error_class": type(exc).__name__}
                 errors.append(
@@ -202,11 +187,11 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
                         "self_correctable": exc.self_correctable,
                     }
                 )
-                logger.warning("tool_call_error", extra={"tool": call.name, "error_class": type(exc).__name__})
+                logger.warning("tool_call_error", extra={"tool": call["name"], "error_class": type(exc).__name__})
                 if exc.self_correctable:
                     self_correct_attempts += 1
             else:
-                if call.name == "run_query" and payload.get("row_count") == 0 and not empty_result_checked:
+                if call["name"] == "run_query" and payload.get("row_count") == 0 and not empty_result_checked:
                     payload = {
                         **payload,
                         "note": (
@@ -216,18 +201,12 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
                     }
                     empty_result_checked = True
 
-            response_parts.append(
-                types.Part(
-                    function_response=types.FunctionResponse(
-                        name=call.name,
-                        response=payload,
-                        id=call.id,
-                    )
-                )
+            tool_messages.append(
+                ToolMessage(content=json.dumps(payload), tool_call_id=call["id"], name=call["name"])
             )
 
         return {
-            "messages": [types.Content(role="user", parts=response_parts)],
+            "messages": tool_messages,
             "self_correct_attempts": self_correct_attempts,
             "empty_result_sanity_checked": empty_result_checked,
             "last_tool_errors": errors,
@@ -245,14 +224,14 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
                 non-empty when this node runs, per `route_after_tools`).
 
         Returns:
-            `{"messages": [...]}` — a single model-role text message
-            carrying the chosen error's graceful message.
+            `{"messages": [...]}` — a single `AIMessage` carrying the
+            chosen error's graceful message.
         """
         errors = state["last_tool_errors"]
         chosen = next((e for e in errors if not e["self_correctable"]), errors[0])
         message = graceful_message_for(chosen["error_class"])
         logger.warning("agent_terminal_error", extra={"error_class": chosen["error_class"]})
-        return {"messages": [types.Content(role="model", parts=[types.Part(text=message)])]}
+        return {"messages": [AIMessage(content=message)]}
 
     def route_after_guardrail(state: AgentState) -> str:
         """Route to `blocked` if `guardrail_check` rejected this turn, else
@@ -267,8 +246,8 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
         return "blocked" if state["blocked"] else "call_model"
 
     def route_after_model(state: AgentState) -> str:
-        """Route to `tools` if the model's last message made a function
-        call, else end the turn.
+        """Route to `tools` if the model's last message made a tool call,
+        else end the turn.
 
         Args:
             state: Current graph state; only `messages` is read.
@@ -276,8 +255,8 @@ def build_graph(provider: Provider, bq_tool: BigQueryTool, system_instruction: s
         Returns:
             `"tools"` or `END`.
         """
-        last = state["messages"][-1]
-        if any(part.function_call is not None for part in last.parts):
+        last: AIMessage = state["messages"][-1]
+        if last.tool_calls:
             return "tools"
         return END
 

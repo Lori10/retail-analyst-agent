@@ -1,12 +1,16 @@
 import pytest
-from google.genai import errors as genai_errors
+from langchain_core.exceptions import (
+    ModelAPIError,
+    ModelAuthenticationError,
+    ModelInvalidRequestError,
+    ModelPermissionDeniedError,
+    ModelRateLimitError,
+)
+from langchain_core.messages import AIMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 from retail_agent.errors import ProviderAuthError, ProviderError, ProviderTransientError
 from retail_agent.llm_provider import GeminiProvider
-
-
-def _api_error(code):
-    return genai_errors.APIError(code, {"error": {"message": "boom", "status": "ERROR"}})
 
 
 class _Counter:
@@ -14,19 +18,23 @@ class _Counter:
         self.calls = 0
 
 
-def _provider_with_script(script):
+def _provider_with_script(monkeypatch, script):
+    """Build a `GeminiProvider` whose underlying `ChatGoogleGenerativeAI.invoke`
+    is replaced with a canned script, patched at the class level since the
+    `.bind_tools(...)`-wrapped instance is a pydantic model that rejects
+    arbitrary instance attribute assignment."""
     provider = GeminiProvider(api_key="fake-key", model="fake-model")
     script = list(script)
     counter = _Counter()
 
-    def fake_generate_content(model, contents, config):
+    def fake_invoke(self, *args, **kwargs):
         counter.calls += 1
         item = script.pop(0)
         if isinstance(item, Exception):
             raise item
         return item
 
-    provider._client.models.generate_content = fake_generate_content
+    monkeypatch.setattr(ChatGoogleGenerativeAI, "invoke", fake_invoke)
     return provider, counter
 
 
@@ -35,61 +43,71 @@ def _no_real_sleep(monkeypatch):
     monkeypatch.setattr(GeminiProvider._generate_raw.retry, "sleep", lambda seconds: None)
 
 
-def test_auth_error_raises_provider_auth_error_without_retry():
-    provider, counter = _provider_with_script([_api_error(403)])
+def test_auth_error_raises_provider_auth_error_without_retry(monkeypatch):
+    provider, counter = _provider_with_script(monkeypatch, [ModelAuthenticationError("bad key")])
     with pytest.raises(ProviderAuthError):
-        provider.generate(contents=[], system_instruction="x", tools=[])
+        provider.generate(messages=[], system_instruction="x")
     assert counter.calls == 1
 
 
-def test_rate_limit_is_retried_and_succeeds():
-    provider, counter = _provider_with_script([_api_error(429), "ok"])
-    result = provider.generate(contents=[], system_instruction="x", tools=[])
-    assert result == "ok"
+def test_permission_denied_raises_provider_auth_error_without_retry(monkeypatch):
+    provider, counter = _provider_with_script(monkeypatch, [ModelPermissionDeniedError("forbidden")])
+    with pytest.raises(ProviderAuthError):
+        provider.generate(messages=[], system_instruction="x")
+    assert counter.calls == 1
+
+
+def test_rate_limit_is_retried_and_succeeds(monkeypatch):
+    reply = AIMessage(content="ok")
+    provider, counter = _provider_with_script(monkeypatch, [ModelRateLimitError("slow down"), reply])
+    result = provider.generate(messages=[], system_instruction="x")
+    assert result is reply
     assert counter.calls == 2
 
 
-def test_server_error_exhausts_retries_and_raises_transient():
-    provider, counter = _provider_with_script([_api_error(500), _api_error(503)])
+def test_server_error_exhausts_retries_and_raises_transient(monkeypatch):
+    provider, counter = _provider_with_script(monkeypatch, [ModelAPIError("boom"), ModelAPIError("boom again")])
     with pytest.raises(ProviderTransientError):
-        provider.generate(contents=[], system_instruction="x", tools=[])
+        provider.generate(messages=[], system_instruction="x")
     assert counter.calls == 2
 
 
-def test_other_client_error_raises_generic_provider_error_without_retry():
-    provider, counter = _provider_with_script([_api_error(400)])
+def test_invalid_request_error_raises_generic_provider_error_without_retry(monkeypatch):
+    provider, counter = _provider_with_script(monkeypatch, [ModelInvalidRequestError("bad request")])
     with pytest.raises(ProviderError):
-        provider.generate(contents=[], system_instruction="x", tools=[])
+        provider.generate(messages=[], system_instruction="x")
     assert counter.calls == 1
 
 
-def test_timeout_error_is_treated_as_transient():
-    provider, counter = _provider_with_script([TimeoutError("client timed out"), "ok"])
-    result = provider.generate(contents=[], system_instruction="x", tools=[])
-    assert result == "ok"
+def test_timeout_error_is_treated_as_transient(monkeypatch):
+    reply = AIMessage(content="ok")
+    provider, counter = _provider_with_script(monkeypatch, [TimeoutError("client timed out"), reply])
+    result = provider.generate(messages=[], system_instruction="x")
+    assert result is reply
     assert counter.calls == 2
 
 
-def test_connection_error_is_treated_as_transient():
-    provider, counter = _provider_with_script([ConnectionError("connection reset"), "ok"])
-    result = provider.generate(contents=[], system_instruction="x", tools=[])
-    assert result == "ok"
+def test_connection_error_is_treated_as_transient(monkeypatch):
+    reply = AIMessage(content="ok")
+    provider, counter = _provider_with_script(monkeypatch, [ConnectionError("connection reset"), reply])
+    result = provider.generate(messages=[], system_instruction="x")
+    assert result is reply
     assert counter.calls == 2
 
 
-def test_timeout_error_exhausts_retries_and_raises_provider_transient_error():
+def test_timeout_error_exhausts_retries_and_raises_provider_transient_error(monkeypatch):
     provider, counter = _provider_with_script(
-        [TimeoutError("client timed out"), TimeoutError("client timed out again")]
+        monkeypatch, [TimeoutError("client timed out"), TimeoutError("client timed out again")]
     )
     with pytest.raises(ProviderTransientError):
-        provider.generate(contents=[], system_instruction="x", tools=[])
+        provider.generate(messages=[], system_instruction="x")
     assert counter.calls == 2
 
 
-def test_connection_error_exhausts_retries_and_raises_provider_transient_error():
+def test_connection_error_exhausts_retries_and_raises_provider_transient_error(monkeypatch):
     provider, counter = _provider_with_script(
-        [ConnectionError("connection reset"), ConnectionError("connection reset again")]
+        monkeypatch, [ConnectionError("connection reset"), ConnectionError("connection reset again")]
     )
     with pytest.raises(ProviderTransientError):
-        provider.generate(contents=[], system_instruction="x", tools=[])
+        provider.generate(messages=[], system_instruction="x")
     assert counter.calls == 2

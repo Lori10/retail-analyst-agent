@@ -13,7 +13,7 @@ clean checkout or CI without live credentials never fails here.
 import os
 
 import pytest
-from google.genai import types
+from langchain_core.messages import HumanMessage
 
 from retail_agent.cli import _build_graph
 from retail_agent.config import load_config
@@ -26,7 +26,7 @@ pytestmark = pytest.mark.skipif(
 
 def test_live_question_returns_a_real_answer():
     graph = _build_graph(load_config())
-    message = types.Content(role="user", parts=[types.Part(text="How many orders are in the dataset?")])
+    message = HumanMessage(content="How many orders are in the dataset?")
 
     result = graph.invoke(
         {"messages": [message]},
@@ -34,5 +34,4 @@ def test_live_question_returns_a_real_answer():
     )
 
     final = result["messages"][-1]
-    text = "".join(part.text for part in final.parts if part.text)
-    assert text.strip()
+    assert final.content.strip()

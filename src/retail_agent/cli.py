@@ -1,17 +1,16 @@
+import json
 import logging
 import sys
 
 from google.auth.exceptions import DefaultCredentialsError
 from google.cloud import bigquery
-from google.genai import types
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from retail_agent.bq_tool import BigQueryTool
-from retail_agent.circuit_breaker import ProviderCircuitBreaker
 from retail_agent.config import ConfigError, load_config
 from retail_agent.errors import AgentError
 from retail_agent.graph import build_graph
 from retail_agent.llm_provider import GeminiProvider
-from retail_agent.openrouter_provider import OpenRouterProvider
 
 
 class StartupError(Exception):
@@ -35,44 +34,50 @@ SYSTEM_INSTRUCTION = (
 THREAD_CONFIG = {"configurable": {"thread_id": "cli-session"}}
 
 
-def _response_text(content: types.Content) -> str:
-    """Concatenate the text parts of a model message.
+def _response_text(message: BaseMessage) -> str:
+    """Extract the plain text of a model message.
 
     Args:
-        content: A `types.Content` message, typically the final message in
-            a turn's result.
+        message: An `AIMessage`, typically the final message in a turn's
+            result.
 
     Returns:
-        The concatenated text of all text parts (empty string if none).
+        The message's text: `.content` as-is if it's already a `str`, or
+        the concatenated text blocks if it's a list (LangChain messages can
+        carry either shape depending on provider/response).
     """
-    return "".join(part.text for part in content.parts if part.text)
+    content = message.content
+    if isinstance(content, str):
+        return content
+    return "".join(block["text"] for block in content if isinstance(block, dict) and block.get("type") == "text")
 
 
-def _progress_message(call: types.FunctionCall) -> str:
-    """One-line status text for a function call the model just made, shown
+def _progress_message(call: dict) -> str:
+    """One-line status text for a tool call the model just made, shown
     before its result comes back — so the CLI isn't silent during the
     schema-lookup/query/self-correct loop that runs before a turn's final
     answer.
 
     Args:
-        call: A `types.FunctionCall` from the model's latest reply.
+        call: One entry from `AIMessage.tool_calls` (a dict with `name`,
+            `args`, `id`).
 
     Returns:
         A short human-readable status line.
     """
-    if call.name == "get_schema":
-        table = (call.args or {}).get("table_name")
+    if call["name"] == "get_schema":
+        table = (call["args"] or {}).get("table_name")
         return f"Looking up schema for {table}..." if table else "Looking up schema..."
-    if call.name == "run_query":
+    if call["name"] == "run_query":
         return "Running a query..."
-    return f"Calling {call.name}..."
+    return f"Calling {call['name']}..."
 
 
 def _tool_result_message(payload: dict) -> str | None:
     """One-line status text for a successful tool result.
 
     Args:
-        payload: A `FunctionResponse.response` payload from `graph.py`'s
+        payload: A `ToolMessage`'s JSON-decoded content, from `graph.py`'s
             `_run_tool` (never called for an error payload — see
             `_stream_progress`).
 
@@ -87,7 +92,7 @@ def _tool_result_message(payload: dict) -> str | None:
     return None
 
 
-def _stream_progress(update: dict) -> tuple[str | None, types.Content | None]:
+def _stream_progress(update: dict) -> tuple[str | None, BaseMessage | None]:
     """Turn one `graph.stream(..., stream_mode="updates")` event into either
     an interstitial progress line or the turn's final message.
 
@@ -102,40 +107,38 @@ def _stream_progress(update: dict) -> tuple[str | None, types.Content | None]:
             keyed by node name.
 
     Returns:
-        A `(progress_text, final_content)` pair where exactly one side is
-        set: `progress_text` for a `call_model` reply that made a function
-        call, or a `tools` result; `final_content` for a `call_model` reply
-        with no function call, or `give_up`/`blocked` (all three end the
-        turn). Neither side is set for `guardrail` — it never appends a
-        message (see `graph.py`'s `guardrail_check`), so there's nothing to
-        show or return yet.
+        A `(progress_text, final_message)` pair where exactly one side is
+        set: `progress_text` for a `call_model` reply that made a tool
+        call, or a `tools` result; `final_message` for a `call_model` reply
+        with no tool call, or `give_up`/`blocked` (all three end the turn).
+        Neither side is set for `guardrail` — it never appends a message
+        (see `graph.py`'s `guardrail_check`), so there's nothing to show or
+        return yet.
     """
     ((node_name, output),) = update.items()
 
     if node_name == "guardrail":
         return None, None
 
-    content = output["messages"][0]
+    messages = output["messages"]
 
     if node_name in ("give_up", "blocked"):
-        return None, content
+        return None, messages[0]
 
     if node_name == "call_model":
-        calls = [part.function_call for part in content.parts if part.function_call is not None]
-        if not calls:
-            return None, content
-        return "\n".join(_progress_message(call) for call in calls), None
+        message: AIMessage = messages[0]
+        if not message.tool_calls:
+            return None, message
+        return "\n".join(_progress_message(call) for call in message.tool_calls), None
 
     if node_name == "tools":
         lines = []
-        for part in content.parts:
-            fr = part.function_response
-            if fr is None:
-                continue
-            if "error" in fr.response:
+        for message in messages:
+            payload = json.loads(message.content)
+            if "error" in payload:
                 lines.append("That didn't work, retrying...")
             else:
-                line = _tool_result_message(fr.response)
+                line = _tool_result_message(payload)
                 if line:
                     lines.append(line)
         return ("\n".join(lines) if lines else None), None
@@ -144,7 +147,7 @@ def _stream_progress(update: dict) -> tuple[str | None, types.Content | None]:
 
 
 def _build_graph(config):
-    """Construct the BigQuery client, LLM provider(s), and compiled graph.
+    """Construct the BigQuery client, LLM provider, and compiled graph.
 
     Args:
         config: A loaded `Config`.
@@ -172,16 +175,7 @@ def _build_graph(config):
         row_limit=config.row_limit,
         timeout_seconds=config.query_timeout_seconds,
     )
-    gemini = GeminiProvider(api_key=config.gemini_api_key, model=config.gemini_model)
-    if config.openrouter_api_key:
-        provider = ProviderCircuitBreaker(
-            primary=gemini,
-            fallback=OpenRouterProvider(api_key=config.openrouter_api_key, model=config.openrouter_model),
-            failure_threshold=config.provider_failure_threshold,
-            cooldown_seconds=config.provider_cooldown_seconds,
-        )
-    else:
-        provider = gemini
+    provider = GeminiProvider(api_key=config.gemini_api_key, model=config.gemini_model)
     return build_graph(provider, bq_tool, SYSTEM_INSTRUCTION)
 
 
@@ -220,9 +214,8 @@ def main() -> None:
         if user_input.lower() in {"exit", "quit"}:
             break
 
-        user_message = types.Content(role="user", parts=[types.Part(text=user_input)])
         turn_state = {
-            "messages": [user_message],
+            "messages": [HumanMessage(content=user_input)],
             # Reset every turn: a "turn" is exactly one graph.stream() call,
             # so self-correct/empty-result budgets never leak across turns.
             "self_correct_attempts": 0,
@@ -230,10 +223,10 @@ def main() -> None:
             "last_tool_errors": [],
             "blocked": False,
         }
-        final_content = None
+        final_message = None
         try:
             for update in graph.stream(turn_state, config=THREAD_CONFIG, stream_mode="updates"):
-                progress, final_content = _stream_progress(update)
+                progress, final_message = _stream_progress(update)
                 if progress:
                     print(progress)
         except AgentError as exc:
@@ -243,7 +236,7 @@ def main() -> None:
             print(f"Agent: Something went wrong on my end ({type(exc).__name__}). Please try again.")
             continue
 
-        print(f"Agent: {_response_text(final_content)}")
+        print(f"Agent: {_response_text(final_message)}")
 
 
 if __name__ == "__main__":
