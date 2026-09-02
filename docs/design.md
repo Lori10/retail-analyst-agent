@@ -255,17 +255,34 @@ schema during development, not just typed from the brief — that check
 caught two columns (`postal_code`, `user_geom`) absent from the
 assignment's original PII list before they could leak.
 
-**Golden Bucket (docs only).** Question embedded at query time
-(`text-embedding-004`), top-k (e.g. k=3) cosine/ANN retrieval against
+**Golden Bucket (docs only).** Only the question half of each trio is
+embedded, with `text-embedding-004` — both at insert time (when a trio is
+added to the bucket) and at query time (the incoming user question), so
+both sides land in the same vector space for cosine comparison. The SQL
+and report text are stored as plain payload, not embedded, and are
+returned alongside their matching question once retrieved — no chunking,
+since a trio is already a small, self-contained record. `text-embedding-004`
+specifically to stay inside the Google/Vertex ecosystem already used for
+Gemini rather than adding a second embeddings vendor for one small piece
+of the system. Retrieval is top-k (e.g. k=3) cosine/ANN search against
 **pgvector on Cloud SQL** — retrieved (question, sql, report) trios are
 injected as few-shot context before SQL generation and again as
-style/structure cues before report writing. pgvector over Vertex AI
-Vector Search because the human-curated update path (below) keeps the
-corpus in the thousands of vectors, not millions — comfortably inside
-pgvector's range, and it co-locates with the Saved Reports Store's Cloud
-SQL instance instead of paying for a second managed vector service;
-Vertex AI Vector Search would be worth revisiting if the bucket is ever
-seeded from a large historical archive instead of growing incrementally.
+style/structure cues before report writing.
+
+pgvector over Vertex AI Vector Search because the two aren't managed at
+the same level: Cloud SQL manages the *database* (patching, backups,
+HA), but pgvector is an extension on top of it — index type/parameters
+(HNSW/IVFFlat) and scaling are still ours to own, and vector search
+shares compute with whatever else runs on that instance (here, also the
+Saved Reports Store). Vertex AI Vector Search is a dedicated managed
+*vector-search product* — no index tuning, independent scaling, built for
+much larger corpora. That gap is acceptable here because the
+human-curated update path (below) keeps the corpus in the thousands of
+vectors, not millions — comfortably inside pgvector's range — and
+co-locating with the Saved Reports Store's Cloud SQL instance avoids
+paying for a second managed vector service. Vertex AI Vector Search would
+be worth revisiting if the bucket is ever seeded from a large historical
+archive instead of growing incrementally.
 
 Update path is human-curated, not automatic: a trio is appended only
 after a human analyst approves or edits the generated report,
