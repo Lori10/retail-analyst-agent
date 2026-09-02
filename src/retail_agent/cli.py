@@ -44,6 +44,94 @@ def _response_text(content: types.Content) -> str:
     return "".join(part.text for part in content.parts if part.text)
 
 
+def _progress_message(call: types.FunctionCall) -> str:
+    """One-line status text for a function call the model just made, shown
+    before its result comes back — so the CLI isn't silent during the
+    schema-lookup/query/self-correct loop that runs before a turn's final
+    answer.
+
+    Args:
+        call: A `types.FunctionCall` from the model's latest reply.
+
+    Returns:
+        A short human-readable status line.
+    """
+    if call.name == "get_schema":
+        table = (call.args or {}).get("table_name")
+        return f"Looking up schema for {table}..." if table else "Looking up schema..."
+    if call.name == "run_query":
+        return "Running a query..."
+    return f"Calling {call.name}..."
+
+
+def _tool_result_message(payload: dict) -> str | None:
+    """One-line status text for a successful tool result.
+
+    Args:
+        payload: A `FunctionResponse.response` payload from `graph.py`'s
+            `_run_tool` (never called for an error payload — see
+            `_stream_progress`).
+
+    Returns:
+        A short status line, or `None` if the payload shape isn't one this
+        prints a line for.
+    """
+    if "row_count" in payload:
+        return f"Got {payload['row_count']} row(s)."
+    if "columns" in payload:
+        return "Got the schema."
+    return None
+
+
+def _stream_progress(update: dict) -> tuple[str | None, types.Content | None]:
+    """Turn one `graph.stream(..., stream_mode="updates")` event into either
+    an interstitial progress line or the turn's final message.
+
+    `stream_mode="updates"` yields one `{node_name: node_output}` dict per
+    graph node as it finishes (see `graph.py`'s `call_model`/`tools`/
+    `give_up`) — this is what lets the CLI show something while the
+    schema-lookup/query/self-correct loop runs instead of staying silent
+    until the whole turn completes.
+
+    Args:
+        update: One event from the stream — exactly one node's output,
+            keyed by node name.
+
+    Returns:
+        A `(progress_text, final_content)` pair where exactly one side is
+        set: `progress_text` for a `call_model` reply that made a function
+        call, or a `tools` result; `final_content` for a `call_model` reply
+        with no function call, or `give_up` (both end the turn).
+    """
+    ((node_name, output),) = update.items()
+    content = output["messages"][0]
+
+    if node_name == "give_up":
+        return None, content
+
+    if node_name == "call_model":
+        calls = [part.function_call for part in content.parts if part.function_call is not None]
+        if not calls:
+            return None, content
+        return "\n".join(_progress_message(call) for call in calls), None
+
+    if node_name == "tools":
+        lines = []
+        for part in content.parts:
+            fr = part.function_response
+            if fr is None:
+                continue
+            if "error" in fr.response:
+                lines.append("That didn't work, retrying...")
+            else:
+                line = _tool_result_message(fr.response)
+                if line:
+                    lines.append(line)
+        return ("\n".join(lines) if lines else None), None
+
+    return None, None
+
+
 def _build_graph(config):
     """Construct the BigQuery client, LLM provider(s), and compiled graph.
 
@@ -51,7 +139,7 @@ def _build_graph(config):
         config: A loaded `Config`.
 
     Returns:
-        A compiled LangGraph graph ready for `.invoke(...)`.
+        A compiled LangGraph graph ready for `.stream(...)`.
 
     Raises:
         StartupError: BigQuery credentials are missing/invalid, or the
@@ -124,14 +212,18 @@ def main() -> None:
         user_message = types.Content(role="user", parts=[types.Part(text=user_input)])
         turn_state = {
             "messages": [user_message],
-            # Reset every turn: a "turn" is exactly one graph.invoke() call,
+            # Reset every turn: a "turn" is exactly one graph.stream() call,
             # so self-correct/empty-result budgets never leak across turns.
             "self_correct_attempts": 0,
             "empty_result_sanity_checked": False,
             "last_tool_errors": [],
         }
+        final_content = None
         try:
-            result = graph.invoke(turn_state, config=THREAD_CONFIG)
+            for update in graph.stream(turn_state, config=THREAD_CONFIG, stream_mode="updates"):
+                progress, final_content = _stream_progress(update)
+                if progress:
+                    print(progress)
         except AgentError as exc:
             print(f"Agent: Sorry, I couldn't complete that — {exc}")
             continue
@@ -139,7 +231,7 @@ def main() -> None:
             print(f"Agent: Something went wrong on my end ({type(exc).__name__}). Please try again.")
             continue
 
-        print(f"Agent: {_response_text(result['messages'][-1])}")
+        print(f"Agent: {_response_text(final_content)}")
 
 
 if __name__ == "__main__":
