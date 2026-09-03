@@ -26,13 +26,13 @@ Design decisions and HLD live in @docs/design.md (source of truth; update it whe
 ## Prototype scope (requirements implemented in code)
 Coded: Safety & PII Masking, Resilience & Graceful Error Handling,
 High-Stakes Oversight (Saved Reports Store + interrupt-based
-confirm-then-delete) — three of the assignment's five prototype-eligible
+confirm-then-delete), Observability (structured JSON tracing +
+LangSmith) — four of the assignment's five prototype-eligible
 requirements, exceeding the "at least 2 of 5" minimum for deliverable 3.
-Docs only: Observability (structured tracing), Quality Assurance
-(golden-set eval harness) — both eligible for the prototype but
-deliberately left as design only. Also docs only, and never eligible for
-the prototype in the first place: Hybrid Intelligence/Golden Bucket,
-Continuous Improvement, Agility/Persona Management.
+Docs only: Quality Assurance (golden-set eval harness) — eligible for the
+prototype but deliberately left as design only. Also docs only, and never
+eligible for the prototype in the first place: Hybrid Intelligence/Golden
+Bucket, Continuous Improvement, Agility/Persona Management.
 
 ## Workflow
 - Design before code. Don't write source until docs/design.md is agreed.
@@ -42,9 +42,12 @@ Continuous Improvement, Agility/Persona Management.
   (2) resilience depth — typed errors, bounded self-correct, backoff;
   (3) High-Stakes Oversight — Postgres-backed Saved Reports Store,
   `interrupt()`/`Command(resume=...)`-based confirm-then-delete flow;
-  (4) polish — docs, clean-machine setup test.
-  Observability (structured JSON tracing) and a QA/eval harness are
-  designed in docs/design.md but deliberately not coded.
+  (4) Observability — structured JSON tracing (`tracing.py`, one line per
+  LLM call/tool call/turn to stderr in Cloud-Logging-compatible shape) plus
+  LangSmith auto-instrumentation (env vars only, off by default);
+  (5) polish — docs, clean-machine setup test.
+  A QA/eval harness is designed in docs/design.md but deliberately not
+  coded.
 - Write tests for PII filtering and delete confirmation first.
 - Ask before adding a dependency.
 
