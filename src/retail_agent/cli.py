@@ -2,6 +2,8 @@ import getpass
 import json
 import logging
 import sys
+import time
+import uuid
 
 from google.auth.exceptions import DefaultCredentialsError
 from google.cloud import bigquery
@@ -15,6 +17,7 @@ from retail_agent.errors import AgentError, ConversationStoreError
 from retail_agent.graph import build_graph
 from retail_agent.llm_provider import GeminiProvider
 from retail_agent.reports_store import ReportsStore
+from retail_agent.tracing import configure_tracing, log_event
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +258,106 @@ def _format_confirmation_prompt(interrupt_value: dict) -> str:
     return "\n".join(lines)
 
 
+_OUTCOME_BY_FINAL_NODE = {
+    "call_model": "answered",
+    "blocked": "blocked",
+    "give_up": "give_up",
+    "resolve_delete": "resolve_delete",
+}
+
+
+def _run_turn(
+    graph, stream_input, thread_config: dict, turn_id: str, intent: str, owner: str
+) -> tuple[BaseMessage | None, bool]:
+    """Run one full turn and emit a `turn` trace event summarizing it.
+
+    A "turn" is exactly one `graph.stream()` call — the self-correct retry
+    loop between `call_model` and `tools` happens *inside* that single call
+    (conditional edges, not a new `.stream()` invocation), so timing this call
+    is timing the whole turn, retries included.
+
+    `resolve_delete`'s finer sub-outcomes (confirmed with N deleted, aborted,
+    zero-candidates decline, store error) aren't distinguished in the `turn`
+    event's `outcome` field — they're already logged individually by
+    `graph.py`'s `resolve_delete` node (`reports_deleted`/
+    `reports_delete_aborted`), cross-referenceable by `conversation_id` and
+    timestamp, rather than re-derived here by matching user-facing message
+    text.
+
+    Args:
+        graph: The compiled LangGraph.
+        stream_input: A fresh turn-state dict or a `Command(resume=...)` —
+            see `_build_stream_input`.
+        thread_config: The session's stable `{"configurable": {"thread_id": ...}}`.
+        turn_id: A fresh id for this turn only, so `graph.py`'s `llm_call`/
+            `tool_call` trace events can be correlated back to this turn.
+        intent: The raw text this turn started from — whichever of a new
+            question or a delete-confirmation reply the user just typed.
+            There's no intent-classification step anywhere in this codebase,
+            so this is the direct value, not an invented one.
+        owner: The current user's identity, attached as LangSmith run
+            metadata (alongside `conversation_id`) for filtering traces by
+            conversation/owner in the LangSmith UI.
+
+    Returns:
+        A `(final_message, awaiting_confirmation)` pair, exactly as the
+        caller's inlined loop previously produced: `final_message` is the
+        turn's terminal `AIMessage` (`None` if the turn just paused on a
+        delete confirmation), `awaiting_confirmation` says whether it did.
+
+    Raises:
+        AgentError: Re-raised unchanged after being traced.
+        Exception: Any other failure, re-raised unchanged after being traced.
+    """
+    run_config = {
+        "configurable": {**thread_config["configurable"], "turn_id": turn_id},
+        "metadata": {"conversation_id": thread_config["configurable"]["thread_id"], "owner": owner},
+    }
+    start = time.monotonic()
+    final_message: BaseMessage | None = None
+    final_node: str | None = None
+    awaiting_confirmation = False
+    outcome: str | None = None
+    error_class: str | None = None
+
+    try:
+        for update in graph.stream(stream_input, config=run_config, stream_mode="updates"):
+            if "__interrupt__" in update:
+                print(_format_confirmation_prompt(update["__interrupt__"][0].value))
+                awaiting_confirmation = True
+                continue
+            ((node_name, _output),) = update.items()
+            progress, message = _stream_progress(update)
+            if progress:
+                print(progress)
+            if message is not None:
+                final_message, final_node = message, node_name
+    except AgentError as exc:
+        error_class = type(exc).__name__
+        outcome = "agent_error"
+        raise
+    except Exception as exc:
+        error_class = type(exc).__name__
+        outcome = "exception"
+        raise
+    finally:
+        if outcome is None:
+            outcome = "delete_pending" if awaiting_confirmation else _OUTCOME_BY_FINAL_NODE.get(final_node, "answered")
+        state_values = graph.get_state(thread_config).values
+        log_event(
+            "turn",
+            conversation_id=thread_config["configurable"]["thread_id"],
+            turn_id=turn_id,
+            intent=intent,
+            outcome=outcome,
+            latency_ms=round((time.monotonic() - start) * 1000, 1),
+            error_class=error_class,
+            self_correct_attempt=state_values.get("self_correct_attempts", 0),
+        )
+
+    return final_message, awaiting_confirmation
+
+
 def _build_graph(config):
     """Construct the BigQuery client, LLM provider, compiled graph, and
     Conversation Store.
@@ -326,6 +429,7 @@ def main() -> None:
         sys.exit(1)
 
     logging.basicConfig(level=config.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    configure_tracing(config.trace_log_destination)
 
     try:
         graph, conversation_store, owner = _build_graph(config)
@@ -361,16 +465,11 @@ def main() -> None:
 
         stream_input = _build_stream_input(user_input, awaiting_confirmation)
         awaiting_confirmation = False
-        final_message = None
+        turn_id = str(uuid.uuid4())
         try:
-            for update in graph.stream(stream_input, config=thread_config, stream_mode="updates"):
-                if "__interrupt__" in update:
-                    print(_format_confirmation_prompt(update["__interrupt__"][0].value))
-                    awaiting_confirmation = True
-                    continue
-                progress, final_message = _stream_progress(update)
-                if progress:
-                    print(progress)
+            final_message, awaiting_confirmation = _run_turn(
+                graph, stream_input, thread_config, turn_id, user_input, owner
+            )
         except AgentError as exc:
             print(f"Agent: Sorry, I couldn't complete that — {exc}")
             continue
