@@ -38,6 +38,7 @@ flowchart TB
     subgraph Data["Data & Knowledge"]
         BQ[("BigQuery\nthelook_ecommerce\n(read-only)")]
         Checkpoints[("Conversation Checkpoint Store\nMemorystore for Redis (prod)\nInMemorySaver (prototype)")]
+        Conversations[("Conversation Store\nPostgres — Cloud SQL (prod) /\nsame database as Reports (prototype) — coded")]
         GoldenBucket[("Golden Bucket\npgvector on Cloud SQL (prod)\nlocal JSON + cosine (design reference)")]
         Reports[("Saved Reports Store\nPostgres — Cloud SQL (prod) /\ndocker-compose (prototype) — coded")]
         Prefs[("User Preference Store\nFirestore (prod) —\ndocs-only in prototype")]
@@ -56,6 +57,7 @@ flowchart TB
     Orchestrator --> BQWrap
     BQWrap --> BQ
     Orchestrator --> Checkpoints
+    Orchestrator --> Conversations
     Orchestrator --> GoldenBucket
     Orchestrator --> Reports
     Orchestrator --> Prefs
@@ -179,7 +181,114 @@ worth keeping indefinitely, so under the same access-pattern rule used
 below for Cloud SQL vs. Firestore, they don't belong on the same
 relational instance — Memorystore is LangGraph's other officially
 supported checkpoint backend and keeps that write churn off the durable
-stores entirely.
+stores entirely. What that trade buys in write throughput it gives up in
+durability and in queryability, and neither loss is acceptable on its
+own — which is the next component's job, not the checkpointer's.
+
+**Conversation Store — coded, Postgres in both the prototype and
+production, same Cloud SQL instance/database as the Saved Reports
+Store.** The checkpoint store above is deliberately disposable; a
+manager who comes back tomorrow to keep talking about last week's Q1
+numbers is not. Those are two requirements, not one, so they get two
+stores. A checkpoint is keyed working state — one blob per thread, read
+by key at the top of a turn, rewritten at the bottom, cheap to lose. The
+Conversation Store is the durable transcript:
+`conversations(conversation_id, owner, created_at, updated_at)` and
+`messages(conversation_id, turn_index, role, content, created_at)`,
+appended after each turn completes and never updated in place. It lands
+in Cloud SQL rather than Firestore under the same rule stated below for
+the Saved Reports Store: what justifies this store is a `WHERE` clause,
+not a `GET` — "my conversations from last week about Q1," an admin
+auditing one manager's exchanges over a date range, or a join against
+`reports.conversation_id` to recover which exchange produced a given
+report (the same key requirement 3's `scope="conversation"` delete
+already leans on, §4). Same instance as Reports and the Golden Bucket's
+pgvector rather than a third managed service, because that join is real
+and the write volume is one small append per turn. `ConversationStore`
+(`conversation_store.py`) mirrors `ReportsStore` exactly: it owns its own
+`psycopg` connection directly (no ORM), reuses `REPORTS_DATABASE_URL`
+rather than a second connection string (both stores now share the same
+instance and database), and — for the same reason `ReportsStore` does
+(docs/implementation-notes.md) — skips `resilience.bounded_backoff`.
+
+Two alternatives were weighed and rejected before adding a store at all.
+**Making Redis durable** (Memorystore's persistence/HA tier) fixes only
+half the problem: it buys survival of a failover but not the access
+pattern, since listing a manager's conversations by date still needs
+secondary indexes hand-maintained in a key-value store — and it would
+make the highest-write-churn component the one thing in this design that
+can never be lost, precisely the coupling the paragraph above avoids.
+**Reading transcripts back out of Langfuse traces** (§3 Observability)
+is closer than it looks and still wrong: tracing is an ops surface with
+its own sampling and retention policy, so resuming a user-facing
+conversation from it would make product behavior a function of a
+debugging tool's retention window. Traces answer "what went wrong in
+this exchange"; this store answers "what did we say, and can we pick it
+back up."
+
+Resume therefore works by rehydration, not by trusting the cache: a
+returning `conversation_id` whose checkpoint has expired is replayed out
+of `messages` into a fresh LangGraph thread checkpointed under that same
+id, so Memorystore only ever has to hold the *active* session and can
+run a short TTL. That inverts the obvious reading of the diagram above —
+Redis is a working cache in front of the system of record, not the
+record — and it downgrades a checkpoint-store outage from "the
+conversation is gone" to "the current turn is lost." Three constraints
+carry over from elsewhere in this design. Only **post-PII-strip**
+content is ever written, the same rule already applied to the Golden
+Bucket and the structured logs/Langfuse traces — the transcript outlives
+all of them and has a broader read audience, so a raw tool result
+landing in `messages` would defeat the wrapper's output-side control
+(§6 requirement 2) permanently rather than for one turn. A paused
+`interrupt()` is checkpoint state, not transcript state: a delete
+confirmation left hanging (§4) is not replayed on rehydration, so nobody
+returns the next day to a "yes" that lands on a stale candidate list.
+And the append happens after the turn's response has already gone back
+to the user, so a store failure costs a transcript row, not the answer —
+deliberate, because failing a manager's turn on a write to a store they
+never asked about is a worse trade than a rehydrated conversation with a
+gap in it.
+
+The prototype's version of "checkpoint miss" is simpler than production's
+(no Redis, no eviction/failover): `InMemorySaver` is process-lifetime
+state, so it's empty on every fresh `retail-agent` invocation by
+construction, not just occasionally. `cli.py`'s `main()` treats every
+startup as a potential rehydration: it calls
+`conversation_store.get_messages(thread_id, owner)` once, before the REPL
+loop starts, and if that returns rows, replays them into the fresh
+checkpoint via `graph.update_state(thread_config, {"messages":
+_rehydrate_messages(prior_messages)})` — `update_state` merges through
+the same `operator.add` reducer `AgentState.messages` already uses (§2a),
+so this is the same shape a real turn would append, not a special case.
+After each turn that actually completes (never one left paused on a
+`delete_reports` `interrupt()`, per the constraint above), `main()` calls
+`append_message` twice — once for the user's message, once for the
+model's final text — after `Agent: ...` is already printed, wrapped in a
+`try`/`except ConversationStoreError` so a store hiccup logs a warning
+instead of taking down the REPL loop (the same "no path crashes the CLI"
+guarantee §5 makes for every other store).
+
+The prototype's thread id is `f"cli-session-{owner}"` (`cli.py`'s
+`_thread_config`), namespaced by `owner` rather than a bare constant —
+this replaced an earlier version that used the fixed literal
+`"cli-session"` for every OS user. That was harmless for `ReportsStore`
+(its `owner` column is independent of `conversation_id`'s uniqueness),
+but not for `ConversationStore`: `conversations.conversation_id` is that
+table's primary key, so with a shared constant, the first OS user to run
+the CLI against a given Postgres instance would permanently "own" that
+row (`ON CONFLICT (conversation_id) DO UPDATE SET updated_at = now()`
+never reassigns `owner`), and every other OS user's messages would still
+get written — into the *same* `conversation_id` — but could never be read
+back by their own `owner`-scoped `get_messages` call. No cross-user
+leak (the owner check still blocks reading someone else's history either
+way), but a silent, permanent loss of resume for everyone except whoever
+got there first. Namespacing by `owner` gives each OS user their own
+`conversation_id`, closing that. One unrelated wrinkle persists
+regardless of this fix: `reports.conversation_id` reuses the same
+per-owner thread id, so `ReportsStore`'s `scope="conversation"` delete
+still degenerates to `scope="all"` for a single owner across restarts —
+a `ReportsStore` behavior, not something the Conversation Store causes
+or fixes.
 
 **Extensibility — new tools and data sources.** New capabilities (chart
 generation, emailing reports, web search) fall out of the tool-calling
@@ -205,10 +314,12 @@ production the same CLI talks to Cloud Run over a REST endpoint (a
 single `POST /chat` taking `{conversation_id, message}` and returning
 that turn's response), reached the same way any internal Cloud Run
 service is — an IAM-authenticated service-to-service call, not a public
-API key. `conversation_id` is the thread key both the LangGraph
-checkpointer above and the (stateless, scale-to-zero) Cloud Run instance
-need: every request carries it so the right checkpoint loads regardless
-of which instance handles the request.
+API key. `conversation_id` is the thread key the LangGraph checkpointer
+above, the Conversation Store above, and the (stateless, scale-to-zero)
+Cloud Run instance all share: every request carries it so the right
+checkpoint loads regardless of which instance handles the request — or,
+on a checkpoint miss, is rehydrated from the Conversation Store under
+that same id before the turn runs.
 
 The final answer is returned whole, not token-streamed — token-by-token
 streaming would need the provider's `.generate()` to call
@@ -378,10 +489,15 @@ action items" — the base deliverable-3 ask, distinct from requirement 3 —
 is satisfied by the agent formatting its chat answer as a report and
 optionally persisting it via `save_report`.
 
-Cloud SQL vs. Firestore below follows one rule: relational/queryable
-access (arbitrary `WHERE` clauses, joins) goes in Cloud SQL; single-key
-document reads/writes go in Firestore. Reports and the Golden Bucket need
-the former; preferences and persona don't.
+Cloud SQL vs. Firestore follows one rule: relational/queryable access
+(arbitrary `WHERE` clauses, joins) goes in Cloud SQL; single-key
+document reads/writes go in Firestore. Reports, the Golden Bucket and
+the Conversation Store (above) need the former — the last of those
+because listing a manager's conversations by owner and date, or joining
+one back to the report it produced, is exactly the shape a document
+store makes awkward; preferences and persona don't, which is why they
+sit in Firestore, and the per-turn checkpoint blob (above) needs neither,
+which is why it sits in Memorystore instead.
 
 **User Preference Store (docs only).** Firestore doc per manager
 (preferred format, analysis depth, updated_at), read into the system
@@ -419,8 +535,9 @@ this exchange" deep-dive that raw metrics can't.
 ## 4. Data Flow
 
 Described here at production scope; the prototype implements the coded
-steps of both the Q&A path and the Delete path below (§9) — only Golden
-Bucket retrieval, persona config, and user preferences remain docs only.
+steps of the Q&A path, the Delete path, and the Resume path below (§9) —
+only Golden Bucket retrieval, persona config, and user preferences remain
+docs only.
 
 **Q&A / analysis path**: user message → **coded** rule-based guardrail
 check (regex/keyword denylist for prompt-injection/jailbreak intent —
@@ -434,7 +551,10 @@ treating tool output as untrusted data (never as instructions — closes
 the second-order injection path where adversarial text embedded in a row
 value could otherwise be read as a directive) and using persona config +
 user preferences (both docs only) → response returned to the client and
-logged.
+logged → the completed turn's messages appended to the Conversation
+Store (**coded**, §3), post-PII-strip (the wrapper already stripped it
+before the response was formed) and after the response has already been
+sent.
 
 **Delete path — coded.** User message → model calls `delete_reports`
 (`scope`, optional `title_contains`) → `resolve_delete` resolves the
@@ -451,6 +571,25 @@ store; anything else aborts. Both outcomes are logged
 does, keeping the added friction to one turn. This entire path depends on
 the Saved Reports Store (§3); see §2a for the `resolve_delete` node and
 §6 requirement 3 for the full safety rationale.
+
+**Resume path — coded, in a simplified single-process form; described
+here at production scope.** A `POST /chat` arriving with a
+`conversation_id` whose checkpoint isn't in Memorystore (evicted, TTL'd,
+or lost to a failover) doesn't start a blank conversation: the
+orchestrator reads that id's rows from the Conversation Store, replays
+them in `turn_index` order into a fresh thread checkpointed under the
+same id, and only then runs the incoming turn. Ownership is re-asserted
+at read time from the caller's identity, exactly as report access is
+(§3) — a `conversation_id` is a key, never an authorization. In the
+prototype there's no Memorystore to evict from and no live server to
+receive a mid-session `POST /chat` — `cli.py`'s `main()` instead runs
+this exact rehydration once, unconditionally, at process startup (see
+§3), which is the prototype's only opportunity for a "checkpoint miss"
+given `InMemorySaver`'s process-lifetime scope. Nothing
+resumes into a pending `interrupt()`: a delete confirmation that was
+still awaiting a yes/no when the checkpoint went away is not part of the
+transcript, so the rehydrated conversation starts at a clean turn
+boundary and the user would have to ask again.
 
 ## 5. Error Handling & Fallback Strategies
 
@@ -614,7 +753,9 @@ Three independent things need to be configured, and they have different
 prerequisites — Gemini is a single API key with nothing else to install;
 BigQuery needs the `gcloud` CLI and a real GCP project, even though the
 dataset being queried (`thelook_ecommerce`) is public; the Saved Reports
-Store needs a running Postgres, provided locally via `docker-compose.yml`.
+Store and the Conversation Store both need a running Postgres, provided
+locally via `docker-compose.yml` — the same instance and database, so
+this is still one thing to set up, not two.
 
 **1. Python environment**
 
@@ -640,15 +781,17 @@ Store needs a running Postgres, provided locally via `docker-compose.yml`.
   create local Application Default Credentials
 - Set `GOOGLE_CLOUD_PROJECT` in `.env` to that project's ID
 
-**4. Saved Reports Store (Postgres)**
+**4. Saved Reports Store & Conversation Store (Postgres)**
 
 - Requires Docker (or an already-running Postgres — see below)
 - `docker compose up -d postgres` starts a local Postgres (`postgres:16`)
   with two databases: `retail_agent_reports` (what the CLI uses) and
   `retail_agent_reports_test` (what the test suite uses, so running tests
-  never truncates reports saved during interactive use)
-- `ReportsStore` creates its own `reports` table on first connect (`CREATE
-  TABLE IF NOT EXISTS`) — no separate migration step
+  never truncates reports/conversations saved during interactive use)
+- `ReportsStore` and `ConversationStore` each create their own tables on
+  first connect (`CREATE TABLE IF NOT EXISTS`) — no separate migration
+  step, and no separate connection string: both point at
+  `REPORTS_DATABASE_URL`
 - No Docker? Point `REPORTS_DATABASE_URL` at any reachable Postgres
   instance instead (a local install, Cloud SQL, etc.) — the default in
   `config.py` matches the `docker-compose.yml` credentials
@@ -672,9 +815,11 @@ skipped — either the BigQuery API isn't enabled on the project named by
 `gcloud auth application-default login` was never run (or was run for a
 different account/project than the one in `.env`). Gemini-side failures
 (invalid/missing `GEMINI_API_KEY`) surface as a graceful provider error
-message rather than a crash — see §5. A reports-store connection failure
-(Postgres not running, wrong `REPORTS_DATABASE_URL`) surfaces as a
-startup error naming `docker compose up -d postgres` as the likely fix.
+message rather than a crash — see §5. A reports-store or conversation-store
+connection failure (Postgres not running, wrong `REPORTS_DATABASE_URL`)
+surfaces as a startup error naming `docker compose up -d postgres` as the
+likely fix — both stores share that same connection string, so they fail
+together.
 
 Optional env vars (defaults shown): `GEMINI_MODEL=gemini-3.6-flash`,
 `BQ_MAX_BYTES_BILLED=1000000000` (~1GB), `BQ_ROW_LIMIT=500`,
@@ -682,12 +827,14 @@ Optional env vars (defaults shown): `GEMINI_MODEL=gemini-3.6-flash`,
 `REPORTS_DATABASE_URL=postgresql://retail_agent:retail_agent@localhost:5432/retail_agent_reports`.
 
 Run the test suite: `uv run pytest`. This runs the unit tests by default,
-including `test_reports_store.py` — unlike every other unit test file,
-that one needs a real Postgres reachable at `REPORTS_DATABASE_URL` (or its
-default, matching `docker-compose.yml`'s `retail_agent_reports_test`
-database) to pass, since `ReportsStore` has no fake/mock double the way
-`BigQueryTool`/`GeminiProvider` do in `test_graph.py`/`test_cli.py` — run
-`docker compose up -d postgres` first. `tests/integration/` — live
+including `test_reports_store.py` and `test_conversation_store.py` —
+unlike every other unit test file, those two need a real Postgres
+reachable at `REPORTS_DATABASE_URL` (or its default, matching
+`docker-compose.yml`'s `retail_agent_reports_test` database) to pass,
+since neither `ReportsStore` nor `ConversationStore` has a fake/mock
+double the way `BigQueryTool`/`GeminiProvider` do in
+`test_graph.py`/`test_cli.py` — run `docker compose up -d postgres`
+first. `tests/integration/` — live
 regression checks against real BigQuery/Gemini (PII stripping holds even
 when explicitly selected, and one end-to-end smoke question) —
 deliberately requires `GOOGLE_CLOUD_PROJECT`/`GEMINI_API_KEY` as real
@@ -719,6 +866,11 @@ Golden Bucket retrieval shown in earlier drafts of this example isn't in
 the prototype — see §9.
 
 Type `exit` or `quit` to leave the REPL (Ctrl-D/Ctrl-C also work).
+Running `uv run retail-agent` again afterward resumes this same
+conversation rather than starting blank: `main()` loads it from the
+Conversation Store and prints `Resuming previous conversation (N
+message(s) loaded).` before the prompt — see §3/§4's Conversation Store
+and Resume path.
 
 **Inspecting internals (PII stripping, self-correct).** `retail-agent`
 prints only the final `Agent: ...` answer per turn — enough to use the
@@ -757,3 +909,15 @@ remaining 3 requirements (Hybrid Intelligence, Continuous Improvement,
 Agility) were never in the assignment's prototype-eligible list, so
 they're designed here in full but were never candidates for coding
 either way.
+
+This matrix tracks the eight numbered requirements only. Architecture
+components that don't map onto one of them are argued in §3 rather than
+given rows here, so the absence of a row is not itself a claim about
+whether something is coded. The Conversation Checkpoint Store and Agent
+Service compute are production design throughout, coded nowhere in this
+prototype (the prototype's `InMemorySaver` and local-process "compute"
+are incidental side effects of using LangGraph/a CLI, not deliberate
+implementations of either). The Conversation Store is the exception: it
+*is* coded (`conversation_store.py`, wired into `cli.py` — §3, §4 Resume
+path) even though it still isn't one of the eight numbered requirements
+and so still gets no row above.

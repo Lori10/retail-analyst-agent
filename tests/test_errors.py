@@ -1,6 +1,7 @@
 from retail_agent import errors
 from retail_agent.errors import (
     AgentError,
+    ConversationStoreError,
     GuardrailBlockedError,
     ProviderAuthError,
     ProviderError,
@@ -26,6 +27,7 @@ NOT_SELF_CORRECTABLE = {
     ProviderAuthError,
     GuardrailBlockedError,
     ReportsStoreError,
+    ConversationStoreError,
 }
 
 

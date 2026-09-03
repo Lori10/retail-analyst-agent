@@ -7,8 +7,10 @@ from retail_agent.cli import (
     _build_stream_input,
     _format_confirmation_prompt,
     _progress_message,
+    _rehydrate_messages,
     _response_text,
     _stream_progress,
+    _thread_config,
     _tool_result_message,
 )
 from retail_agent.errors import GuardrailBlockedError, QuerySyntaxError
@@ -310,6 +312,31 @@ def test_streaming_a_blocked_turn_shows_no_progress_before_the_decline():
     assert _response_text(final_message) == GuardrailBlockedError.graceful_message
 
 
+def test_graph_update_state_seeds_prior_messages_for_the_next_turn():
+    # Regression test for cli.py's main()'s rehydration step (docs/design.md
+    # §4 "Resume path"): graph.update_state(...) with the messages reducer
+    # is what makes a Conversation Store replay visible to call_model on the
+    # very next turn, the same way real conversation history would be.
+    captured = {}
+
+    class RecordingProvider:
+        def generate(self, messages, system_instruction):
+            captured["messages"] = list(messages)
+            return AIMessage(content="Second answer.")
+
+    graph = build_graph(RecordingProvider(), FakeBigQueryTool(), FakeReportsStore(), "test-owner", system_instruction="test")
+    thread_config = {"configurable": {"thread_id": "t-resume"}}
+
+    graph.update_state(
+        thread_config,
+        {"messages": [HumanMessage(content="first question"), AIMessage(content="first answer")]},
+    )
+    list(_stream(graph, "t-resume", "second question"))
+
+    contents = [m.content for m in captured["messages"]]
+    assert contents == ["first question", "first answer", "second question"]
+
+
 # -- _build_stream_input -------------------------------------------------------
 
 
@@ -354,6 +381,71 @@ def test_stream_progress_resolve_delete_is_final():
     progress, final = _stream_progress({"resolve_delete": {"messages": [tool_message, ai_message]}})
     assert progress is None
     assert final is ai_message
+
+
+# -- _thread_config ----------------------------------------------------------
+
+
+def test_thread_config_is_namespaced_by_owner():
+    # Regression test: this used to be a bare "cli-session" constant shared
+    # by every OS user, which silently broke ConversationStore resume for
+    # every owner but the first to ever write that conversation_id (see
+    # docs/design.md §3). Two different owners must get two different
+    # thread ids.
+    alice_id = _thread_config("alice")["configurable"]["thread_id"]
+    bob_id = _thread_config("bob")["configurable"]["thread_id"]
+    assert alice_id != bob_id
+
+
+def test_thread_config_is_deterministic_for_the_same_owner():
+    # Resume depends on the same owner getting the same thread id across
+    # separate CLI process restarts.
+    assert _thread_config("alice") == _thread_config("alice")
+
+
+# -- _rehydrate_messages ---------------------------------------------------------
+
+
+def test_rehydrate_messages_turns_stored_rows_into_langchain_messages():
+    stored = [
+        {"turn_index": 0, "role": "user", "content": "What's total revenue?"},
+        {"turn_index": 1, "role": "assistant", "content": "Total revenue is 42."},
+    ]
+
+    messages = _rehydrate_messages(stored)
+
+    assert isinstance(messages[0], HumanMessage)
+    assert messages[0].content == "What's total revenue?"
+    assert isinstance(messages[1], AIMessage)
+    assert messages[1].content == "Total revenue is 42."
+
+
+def test_rehydrate_messages_preserves_order():
+    stored = [
+        {"turn_index": 0, "role": "user", "content": "first"},
+        {"turn_index": 1, "role": "assistant", "content": "second"},
+        {"turn_index": 2, "role": "user", "content": "third"},
+    ]
+
+    messages = _rehydrate_messages(stored)
+
+    assert [m.content for m in messages] == ["first", "second", "third"]
+
+
+def test_rehydrate_messages_skips_an_unrecognized_role_instead_of_raising():
+    stored = [
+        {"turn_index": 0, "role": "user", "content": "kept"},
+        {"turn_index": 1, "role": "system", "content": "dropped"},
+    ]
+
+    messages = _rehydrate_messages(stored)
+
+    assert len(messages) == 1
+    assert messages[0].content == "kept"
+
+
+def test_rehydrate_messages_empty_input_returns_empty_list():
+    assert _rehydrate_messages([]) == []
 
 
 # -- SYSTEM_INSTRUCTION: delete confirmation is automatic -----------------------

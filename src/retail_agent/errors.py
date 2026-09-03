@@ -111,6 +111,17 @@ class ReportsStoreError(AgentError):
     graceful_message = "I couldn't reach the saved reports store right now. Please try again shortly."
 
 
+class ConversationStoreError(AgentError):
+    """Raised by `ConversationStore` when an underlying `psycopg.Error`
+    occurs (connection lost, constraint violation, etc.). Never
+    self-correctable — no query rewrite fixes a storage failure. Mirrors
+    `ReportsStoreError`; kept as a separate class since the two stores are
+    independent connections and can fail independently."""
+
+    self_correctable = False
+    graceful_message = "I couldn't reach the conversation history store right now. Please try again shortly."
+
+
 class GuardrailBlockedError(AgentError):
     """Raised by `guardrail.check_user_input` when a user message matches a
     known prompt-injection/jailbreak pattern.
@@ -141,6 +152,7 @@ _ERROR_CLASSES_BY_NAME = {
         ProviderAuthError,
         GuardrailBlockedError,
         ReportsStoreError,
+        ConversationStoreError,
     )
 }
 

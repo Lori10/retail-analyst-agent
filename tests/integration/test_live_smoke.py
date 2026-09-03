@@ -25,7 +25,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_live_question_returns_a_real_answer():
-    graph = _build_graph(load_config())
+    graph, _conversation_store, _owner = _build_graph(load_config())
     message = HumanMessage(content="How many orders are in the dataset?")
 
     result = graph.invoke(

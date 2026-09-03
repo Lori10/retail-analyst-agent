@@ -10,10 +10,13 @@ from langgraph.types import Command
 
 from retail_agent.bq_tool import BigQueryTool
 from retail_agent.config import ConfigError, load_config
-from retail_agent.errors import AgentError
+from retail_agent.conversation_store import ConversationStore
+from retail_agent.errors import AgentError, ConversationStoreError
 from retail_agent.graph import build_graph
 from retail_agent.llm_provider import GeminiProvider
 from retail_agent.reports_store import ReportsStore
+
+logger = logging.getLogger(__name__)
 
 
 class StartupError(Exception):
@@ -39,7 +42,29 @@ SYSTEM_INSTRUCTION = (
     "do not ask the user to confirm yourself before or after calling it."
 )
 
-THREAD_CONFIG = {"configurable": {"thread_id": "cli-session"}}
+def _thread_config(owner: str) -> dict:
+    """Build the LangGraph thread config for one CLI session.
+
+    The thread id is namespaced by `owner` (`getpass.getuser()`) rather
+    than a bare constant — otherwise two OS users sharing one Postgres
+    instance would collide on the same `conversations.conversation_id`
+    primary key in `ConversationStore`. `ReportsStore` doesn't have this
+    problem (`owner` is its own column, independent of `conversation_id`'s
+    uniqueness), but `ConversationStore` does, since `conversation_id` is
+    that table's primary key: the first owner to write it "wins" the row,
+    and `ON CONFLICT ... DO UPDATE SET updated_at = now()` never changes
+    `owner` on a later write from a different one — so a second owner's
+    messages would be appended under a conversation their own `owner`-
+    scoped `get_messages` can never read back.
+
+    Args:
+        owner: The current user's identity, as returned by `_build_graph`.
+
+    Returns:
+        `{"configurable": {"thread_id": ...}}`, ready for
+        `graph.stream(...)`/`graph.update_state(...)`.
+    """
+    return {"configurable": {"thread_id": f"cli-session-{owner}"}}
 
 
 def _response_text(message: BaseMessage) -> str:
@@ -185,6 +210,32 @@ def _build_stream_input(user_input: str, awaiting_confirmation: bool) -> dict | 
     }
 
 
+def _rehydrate_messages(stored: list[dict]) -> list[BaseMessage]:
+    """Turn a `ConversationStore.get_messages(...)` result back into
+    LangChain messages, for seeding a fresh graph checkpoint on startup
+    (docs/design.md §3/§4 "Resume path").
+
+    Only `"user"`/`"assistant"` roles round-trip through the Conversation
+    Store (see `main()`) — anything else is skipped rather than raising,
+    so a row this code doesn't yet recognize can't block startup.
+
+    Args:
+        stored: Rows as `ConversationStore.get_messages` returns them,
+            already ordered by `turn_index` ascending.
+
+    Returns:
+        A list of `HumanMessage`/`AIMessage` objects in the same order,
+        suitable for `graph.update_state(..., {"messages": [...]})`.
+    """
+    messages: list[BaseMessage] = []
+    for row in stored:
+        if row["role"] == "user":
+            messages.append(HumanMessage(content=row["content"]))
+        elif row["role"] == "assistant":
+            messages.append(AIMessage(content=row["content"]))
+    return messages
+
+
 def _format_confirmation_prompt(interrupt_value: dict) -> str:
     """Format the delete-confirmation prompt shown when `resolve_delete`
     pauses the graph.
@@ -205,17 +256,20 @@ def _format_confirmation_prompt(interrupt_value: dict) -> str:
 
 
 def _build_graph(config):
-    """Construct the BigQuery client, LLM provider, and compiled graph.
+    """Construct the BigQuery client, LLM provider, compiled graph, and
+    Conversation Store.
 
     Args:
         config: A loaded `Config`.
 
     Returns:
-        A compiled LangGraph graph ready for `.stream(...)`.
+        A `(graph, conversation_store, owner)` tuple — `graph` is ready
+        for `.stream(...)`, `conversation_store` for rehydration/append in
+        `main()`, `owner` for scoping both.
 
     Raises:
-        StartupError: BigQuery credentials are missing/invalid, or the
-            client otherwise fails to construct.
+        StartupError: BigQuery credentials are missing/invalid, or a
+            client/store otherwise fails to construct.
     """
     try:
         client = bigquery.Client(project=config.project_id)
@@ -241,9 +295,20 @@ def _build_graph(config):
             "('docker compose up -d postgres')?"
         ) from exc
 
+    # Same Postgres instance/database as ReportsStore (docs/design.md §3
+    # "Conversation Store") — no separate connection string.
+    try:
+        conversation_store = ConversationStore(config.reports_database_url)
+    except Exception as exc:
+        raise StartupError(
+            f"Could not connect to the conversation history database: {exc}. Is Postgres running "
+            "('docker compose up -d postgres')?"
+        ) from exc
+
     provider = GeminiProvider(api_key=config.gemini_api_key, model=config.gemini_model)
     owner = getpass.getuser()
-    return build_graph(provider, bq_tool, reports_store, owner, SYSTEM_INSTRUCTION)
+    graph = build_graph(provider, bq_tool, reports_store, owner, SYSTEM_INSTRUCTION)
+    return graph, conversation_store, owner
 
 
 def main() -> None:
@@ -263,10 +328,22 @@ def main() -> None:
     logging.basicConfig(level=config.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
     try:
-        graph = _build_graph(config)
+        graph, conversation_store, owner = _build_graph(config)
     except StartupError as exc:
         print(f"Startup error: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    thread_config = _thread_config(owner)
+    thread_id = thread_config["configurable"]["thread_id"]
+    turn_index = 0
+    try:
+        prior_messages = conversation_store.get_messages(thread_id, owner)
+        if prior_messages:
+            graph.update_state(thread_config, {"messages": _rehydrate_messages(prior_messages)})
+            turn_index = prior_messages[-1]["turn_index"] + 1
+            print(f"Resuming previous conversation ({len(prior_messages)} message(s) loaded).")
+    except ConversationStoreError as exc:
+        logger.warning("conversation_rehydrate_failed", extra={"error_class": type(exc).__name__})
 
     print("Retail Data Analysis Agent. Type 'exit' to quit.")
     awaiting_confirmation = False
@@ -286,7 +363,7 @@ def main() -> None:
         awaiting_confirmation = False
         final_message = None
         try:
-            for update in graph.stream(stream_input, config=THREAD_CONFIG, stream_mode="updates"):
+            for update in graph.stream(stream_input, config=thread_config, stream_mode="updates"):
                 if "__interrupt__" in update:
                     print(_format_confirmation_prompt(update["__interrupt__"][0].value))
                     awaiting_confirmation = True
@@ -304,7 +381,27 @@ def main() -> None:
         if awaiting_confirmation:
             continue
 
-        print(f"Agent: {_response_text(final_message)}")
+        response_text = _response_text(final_message)
+        print(f"Agent: {response_text}")
+
+        # Appended after the response is already on screen, and only for a
+        # turn that actually completed (never mid-interrupt) — a store
+        # failure here costs a transcript row, not the answer just shown
+        # (docs/design.md §3 "Conversation Store").
+        try:
+            conversation_store.append_message(
+                conversation_id=thread_id, owner=owner, turn_index=turn_index, role="user", content=user_input
+            )
+            conversation_store.append_message(
+                conversation_id=thread_id,
+                owner=owner,
+                turn_index=turn_index + 1,
+                role="assistant",
+                content=response_text,
+            )
+            turn_index += 2
+        except ConversationStoreError as exc:
+            logger.warning("conversation_append_failed", extra={"error_class": type(exc).__name__})
 
 
 if __name__ == "__main__":

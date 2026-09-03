@@ -64,7 +64,7 @@ def main() -> None:
     question = " ".join(sys.argv[1:])
 
     try:
-        graph = _build_graph(load_config())
+        graph, _conversation_store, _owner = _build_graph(load_config())
     except (ConfigError, StartupError) as exc:
         print(f"Could not start the agent: {exc}", file=sys.stderr)
         sys.exit(1)
