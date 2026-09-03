@@ -412,3 +412,63 @@ reachable Postgres to pass at all, since `ReportsStore` (unlike
 it at that layer. `test_graph.py`/`test_cli.py`'s `FakeReportsStore`
 doubles keep the *graph-level* delete/save/list tests hermetic regardless
 — only the store's own CRUD/scoping tests need live Postgres.
+
+## Observability: LangSmith Instead of Self-Hosted Langfuse
+
+design.md's Observability section (§3) originally specified self-hosted
+**Langfuse** for conversation-level tracing, explicitly rejecting
+**LangSmith** by name — the stated reason was that LangSmith is
+third-party SaaS by default, and tracing should respect the same PII
+boundary the rest of this system does by staying inside this project's
+own infra rather than handing prompts/SQL/tool output to a vendor.
+
+That decision was reversed when this requirement moved from docs-only to
+actually coded. Two things changed the calculus, in order:
+
+1. **A hard constraint appeared that neither original option satisfied
+   for free**: no service requiring billing or a credit card. Self-hosted
+   Langfuse itself has no such requirement (it's just a docker-compose
+   service, like the existing Postgres setup), but *self-hosting it
+   doesn't remove the third-party-SaaS objection from the table* — it was
+   never Langfuse-the-vendor being avoided, it was the "trace data leaves
+   this project's infra" property, and self-hosting is exactly how you
+   avoid that. So self-hosted Langfuse was still the right shape under the
+   original PII-boundary reasoning.
+2. **The user explicitly said third-party data sharing is acceptable for
+   this prototype.** That single statement removes the entire premise the
+   original Langfuse-over-LangSmith argument was built on — once "must not
+   leave this project's infra" is off the table, there's no remaining
+   reason to prefer Langfuse, and a real reason to prefer LangSmith: it
+   auto-instruments every LangChain/LangGraph run via three environment
+   variables (`LANGSMITH_TRACING`, `LANGSMITH_API_KEY`,
+   `LANGSMITH_PROJECT`) with **zero application code** — no
+   `CallbackHandler` to construct, no per-call `config={"callbacks": [...]}`
+   wiring, no explicit flush-on-exit. Langfuse's LangChain integration
+   needs all three of those. LangSmith's free Developer tier also matches
+   the no-credit-card constraint (verified directly against
+   smith.langchain.com's docs: "no credit card required," 5k traces/month,
+   14-day retention, 1 seat) — so the constraint that triggered this
+   whole reconsideration is satisfied either way; LangSmith won on being
+   less code once the PII-boundary tiebreaker was removed.
+
+This is recorded as a reversal, not a silent contradiction, because the
+original reasoning wasn't wrong — it was correct for a system where
+"never hand data to a third-party SaaS" is a real constraint. It stopped
+applying here specifically because the user relaxed that constraint for
+this prototype. A production deployment run at a scale or audit posture
+where that constraint matters again should re-read design.md §3's
+Observability section, which keeps a line for exactly this: self-hosting
+a tracer instead of LangSmith remains a valid choice at that point, using
+the same env-var-free-vs-explicit-integration trade described above,
+just decided the other way.
+
+One functional consequence worth noting: because LangSmith needs no code
+in this repo, there's also no branching logic to unit test — the "is
+tracing enabled" question is answered entirely by environment variables
+that `langchain-core` reads directly, never touched by
+`retail_agent`'s own code. Verified manually (not via an automated test,
+since there's no code path to exercise) that an invalid/missing
+`LANGSMITH_API_KEY` degrades gracefully: `langsmith.client` logs its own
+warning to stderr and the turn completes normally — consistent with the
+"no third-party failure crashes the CLI" property every other external
+dependency in this system already has (§5).

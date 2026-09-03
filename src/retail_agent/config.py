@@ -24,6 +24,9 @@ class Config:
         log_level: Root log level passed to `logging.basicConfig`.
         reports_database_url: Postgres connection string for the Saved
             Reports store.
+        trace_log_destination: Where structured JSON tracing events
+            (docs/design.md §3 Observability) are written — `"stderr"`/
+            `"stdout"`, or a filesystem path. See `tracing.configure_tracing`.
     """
 
     project_id: str
@@ -34,6 +37,7 @@ class Config:
     query_timeout_seconds: float
     log_level: str
     reports_database_url: str
+    trace_log_destination: str
 
 
 def load_config() -> Config:
@@ -78,4 +82,5 @@ def load_config() -> Config:
         reports_database_url=os.environ.get(
             "REPORTS_DATABASE_URL", "postgresql://retail_agent:retail_agent@localhost:5432/retail_agent_reports"
         ),
+        trace_log_destination=os.environ.get("TRACE_LOG_DESTINATION", "stderr"),
     )

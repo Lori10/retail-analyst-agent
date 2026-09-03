@@ -1,10 +1,12 @@
 import json
 
 import pandas as pd
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from retail_agent.errors import (
     GuardrailBlockedError,
+    ProviderError,
     QueryPermissionError,
     QuerySyntaxError,
     QueryTooExpensiveError,
@@ -32,7 +34,10 @@ class FakeProvider:
 
     def generate(self, messages, system_instruction):
         self.calls += 1
-        return self._responses.pop(0)
+        item = self._responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
 
 class FakeBigQueryTool:
@@ -560,6 +565,76 @@ def test_mixed_round_delete_reports_and_another_tool_call_takes_over_whole_round
     assert provider.calls == 1
     assert len(bq_tool.queries) == 0
     assert "couldn't find" in _final_text(result).lower()
+
+
+def test_successful_turn_traces_one_llm_call_per_model_reply_and_one_tool_call(trace_events):
+    tool_call = _sql_call("call-1")
+    provider = FakeProvider(
+        [
+            _model_response(tool_call=tool_call),
+            _model_response(text="Total revenue is 42."),
+        ]
+    )
+    bq_tool = FakeBigQueryTool()
+    graph = build_graph(provider, bq_tool, FakeReportsStore(), "test-owner", system_instruction="test")
+
+    _invoke(graph, "t30", "What's total revenue?")
+
+    llm_events = [e for e in trace_events if e["message"] == "llm_call"]
+    tool_events = [e for e in trace_events if e["message"] == "tool_call"]
+    assert len(llm_events) == 2
+    assert all(e["conversation_id"] == "t30" for e in llm_events)
+    assert all(e["error_class"] is None for e in llm_events)
+    assert all(isinstance(e["latency_ms"], (int, float)) for e in llm_events)
+
+    assert len(tool_events) == 1
+    assert tool_events[0]["tool"] == "run_query"
+    assert tool_events[0]["sql"] == "SELECT 1"
+    assert tool_events[0]["rows_returned"] == 1
+    assert tool_events[0]["error_class"] is None
+
+
+def test_llm_call_trace_event_records_error_class_on_provider_failure(trace_events):
+    provider = FakeProvider([ProviderError("gemini is down")])
+    graph = build_graph(provider, FakeBigQueryTool(), FakeReportsStore(), "test-owner", system_instruction="test")
+
+    with pytest.raises(ProviderError):
+        _invoke(graph, "t31", "What's total revenue?")
+
+    (event,) = [e for e in trace_events if e["message"] == "llm_call"]
+    assert event["error_class"] == "ProviderError"
+    assert event["tokens"] is None
+
+
+def test_tool_call_trace_event_records_error_class_and_self_correct_attempt(trace_events):
+    bq_tool = FakeBigQueryTool(
+        query_script=[
+            QuerySyntaxError("bad column"),
+            {
+                "dataframe": pd.DataFrame({"id": [1], "total_revenue": [42.0]}),
+                "row_count": 1,
+                "bytes_processed": 123,
+                "redacted_columns": [],
+            },
+        ]
+    )
+    provider = FakeProvider(
+        [
+            _model_response(tool_call=_sql_call("call-1")),
+            _model_response(tool_call=_sql_call("call-2")),
+            _model_response(text="Total revenue is 42."),
+        ]
+    )
+    graph = build_graph(provider, bq_tool, FakeReportsStore(), "test-owner", system_instruction="test")
+
+    _invoke(graph, "t32", "What's total revenue?")
+
+    tool_events = [e for e in trace_events if e["message"] == "tool_call"]
+    assert len(tool_events) == 2
+    assert tool_events[0]["error_class"] == "QuerySyntaxError"
+    assert tool_events[0]["self_correct_attempt"] == 0
+    assert tool_events[1]["error_class"] is None
+    assert tool_events[1]["self_correct_attempt"] == 1
 
 
 def test_delete_reports_store_error_declines_gracefully():

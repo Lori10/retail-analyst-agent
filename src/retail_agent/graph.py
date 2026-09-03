@@ -1,6 +1,7 @@
 import json
 import logging
 import operator
+import time
 from typing import Annotated, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
@@ -14,6 +15,7 @@ from retail_agent.errors import AgentError, GuardrailBlockedError, graceful_mess
 from retail_agent.guardrail import check_user_input
 from retail_agent.llm_provider import GeminiProvider
 from retail_agent.reports_store import ReportsStore
+from retail_agent.tracing import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -189,11 +191,15 @@ def build_graph(
         """
         return {"messages": [AIMessage(content=GuardrailBlockedError.graceful_message)]}
 
-    def call_model(state: AgentState) -> dict:
+    def call_model(state: AgentState, config: RunnableConfig) -> dict:
         """Send the message history to the provider and append its reply.
 
         Args:
             state: Current graph state; only `messages` is read.
+            config: LangGraph-injected run config; `configurable.thread_id`/
+                `configurable.turn_id` (the latter set by `cli.py` per turn,
+                absent for any other caller) tag the `llm_call` trace event
+                emitted here.
 
         Returns:
             `{"messages": [...]}` — the model's reply, appended via the
@@ -202,9 +208,34 @@ def build_graph(
         Raises:
             ProviderError: Propagated unchanged from `provider.generate`;
                 not caught here — see `cli.py`'s `except AgentError` for
-                where it's ultimately handled.
+                where it's ultimately handled. Still traced (as a failed
+                `llm_call` event) before re-raising.
         """
-        response = provider.generate(messages=state["messages"], system_instruction=system_instruction)
+        trace_fields = {
+            "conversation_id": config["configurable"].get("thread_id"),
+            "turn_id": config["configurable"].get("turn_id"),
+            "self_correct_attempt": state.get("self_correct_attempts", 0),
+        }
+        start = time.monotonic()
+        try:
+            response = provider.generate(messages=state["messages"], system_instruction=system_instruction)
+        except AgentError as exc:
+            log_event(
+                "llm_call",
+                **trace_fields,
+                latency_ms=round((time.monotonic() - start) * 1000, 1),
+                tokens=None,
+                error_class=type(exc).__name__,
+            )
+            raise
+        usage = getattr(response, "usage_metadata", None) or {}
+        log_event(
+            "llm_call",
+            **trace_fields,
+            latency_ms=round((time.monotonic() - start) * 1000, 1),
+            tokens=usage.get("total_tokens"),
+            error_class=None,
+        )
         return {"messages": [response]}
 
     def call_tools(state: AgentState, config: RunnableConfig) -> dict:
@@ -232,12 +263,15 @@ def build_graph(
         """
         last: AIMessage = state["messages"][-1]
         thread_id = config["configurable"]["thread_id"]
+        turn_id = config["configurable"].get("turn_id")
         tool_messages: list[ToolMessage] = []
         self_correct_attempts = state.get("self_correct_attempts", 0)
+        attempt_at_entry = self_correct_attempts
         empty_result_checked = state.get("empty_result_sanity_checked", False)
         errors: list[dict] = []
 
         for call in last.tool_calls:
+            call_start = time.monotonic()
             try:
                 payload = _run_tool(bq_tool, reports_store, owner, thread_id, call["name"], call["args"] or {})
             except AgentError as exc:
@@ -252,6 +286,17 @@ def build_graph(
                 logger.warning("tool_call_error", extra={"tool": call["name"], "error_class": type(exc).__name__})
                 if exc.self_correctable:
                     self_correct_attempts += 1
+                log_event(
+                    "tool_call",
+                    conversation_id=thread_id,
+                    turn_id=turn_id,
+                    tool=call["name"],
+                    sql=(call["args"] or {}).get("sql") if call["name"] == "run_query" else None,
+                    rows_returned=None,
+                    latency_ms=round((time.monotonic() - call_start) * 1000, 1),
+                    error_class=type(exc).__name__,
+                    self_correct_attempt=attempt_at_entry,
+                )
             else:
                 if call["name"] == "run_query" and payload.get("row_count") == 0 and not empty_result_checked:
                     payload = {
@@ -262,6 +307,17 @@ def build_graph(
                         ),
                     }
                     empty_result_checked = True
+                log_event(
+                    "tool_call",
+                    conversation_id=thread_id,
+                    turn_id=turn_id,
+                    tool=call["name"],
+                    sql=(call["args"] or {}).get("sql") if call["name"] == "run_query" else None,
+                    rows_returned=payload.get("row_count") if call["name"] == "run_query" else None,
+                    latency_ms=round((time.monotonic() - call_start) * 1000, 1),
+                    error_class=None,
+                    self_correct_attempt=attempt_at_entry,
+                )
 
             tool_messages.append(
                 ToolMessage(content=json.dumps(payload), tool_call_id=call["id"], name=call["name"])

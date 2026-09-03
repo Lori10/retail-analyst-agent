@@ -45,10 +45,10 @@ flowchart TB
         Persona[("Persona Config\nCloud Storage/Firestore (prod)\nlocal persona.yaml (design reference)")]
     end
 
-    subgraph Obs["Observability"]
-        Logs["Structured Logs\nCloud Logging (prod) /\nJSON file (prototype)"]
-        Trace["LLM/Agent Tracing\nLangfuse (prod, self-hosted) —\nnative LangGraph callback"]
-        Dash["Dashboards & Alerts\nCloud Monitoring (prod)"]
+    subgraph Obs["Observability — coded"]
+        Logs["Structured Logs\nCloud-Logging-shaped JSON on stderr —\nsame code, prototype and prod"]
+        Trace["LLM/Agent Tracing\nLangSmith (free Developer tier) —\nenv-var auto-instrumentation, no code"]
+        Dash["Dashboards & Alerts\nCloud Monitoring (prod only)"]
     end
 
     CLI --> Orchestrator
@@ -218,7 +218,7 @@ pattern, since listing a manager's conversations by date still needs
 secondary indexes hand-maintained in a key-value store — and it would
 make the highest-write-churn component the one thing in this design that
 can never be lost, precisely the coupling the paragraph above avoids.
-**Reading transcripts back out of Langfuse traces** (§3 Observability)
+**Reading transcripts back out of LangSmith traces** (§3 Observability)
 is closer than it looks and still wrong: tracing is an ops surface with
 its own sampling and retention policy, so resuming a user-facing
 conversation from it would make product behavior a function of a
@@ -236,7 +236,7 @@ record — and it downgrades a checkpoint-store outage from "the
 conversation is gone" to "the current turn is lost." Three constraints
 carry over from elsewhere in this design. Only **post-PII-strip**
 content is ever written, the same rule already applied to the Golden
-Bucket and the structured logs/Langfuse traces — the transcript outlives
+Bucket and the structured logs/LangSmith traces — the transcript outlives
 all of them and has a broader read audience, so a raw tool result
 landing in `messages` would defeat the wrapper's output-side control
 (§6 requirement 2) permanently rather than for one turn. A paused
@@ -511,26 +511,50 @@ the eventual admin surface — a CRUD form or a re-uploaded file), editable
 with no engineering ticket, read fresh each session. This is the concrete
 mechanism for "CEO changes tone weekly, no redeploy" (requirement 8).
 
-**Observability (docs only as a coded requirement — see §9).** Target
-shape: one structured JSON log line per LLM call / tool call / turn
-(conversation_id, intent, sql, rows_returned, tokens, latency_ms,
-error_class, self_correct_attempt). The prototype has only incidental
-`logging` calls with `extra=` fields at error/retry sites, added as a
-by-product of building resilience depth (§5), not a deliberate
-implementation of this requirement — there's no per-turn structured JSON
-line and no log covers the successful path. Production ships the full
-log shape to Cloud Logging (metrics/alerting substrate) *and* adds
-cross-call conversation tracing via self-hosted **Langfuse**, chosen
-because it plugs into LangGraph as a native callback handler — no
-hand-rolled OpenTelemetry spans needed. Self-hosted over LangSmith:
-tracing must cover the same PII boundary the rest of this system respects,
-and self-hosting keeps trace data in the same infra boundary rather than
-handing prompts/SQL/tool output to a third-party SaaS by default —
-whatever tracer is used, it must trace **post-PII-strip** data only.
-Cloud Monitoring dashboards/alerts sit on top of the Cloud Logging stream
-for error rate, self-correct rate, latency, PII-block rate, and daily
-cost; Langfuse covers the conversation-level "what exactly happened in
-this exchange" deep-dive that raw metrics can't.
+**Observability — coded.** Target shape (met in full): one structured
+JSON log line per LLM call / tool call / turn (`conversation_id`,
+`turn_id`, `intent`, `sql`, `rows_returned`, `tokens`, `latency_ms`,
+`error_class`, `self_correct_attempt`). `tracing.py`'s `log_event(...)`
+writes each line to stderr (`TRACE_LOG_DESTINATION`, default `"stderr"`;
+a file path also works) in the schema Cloud Logging auto-parses from
+stdout/stderr — `severity`/`message` are its reserved keys, everything
+else becomes `jsonPayload` — so this is the *same code* in the prototype
+and in production, not a stand-in that needs rewriting later. Emitted
+from `graph.py`'s `call_model` (`llm_call`) and `call_tools` (`tool_call`,
+once per call in a round) and from `cli.py`'s new `_run_turn` helper
+(`turn`, wrapping the whole `graph.stream()` call for one turn — the
+self-correct retry loop runs *inside* that single call, so this really is
+the turn boundary). This channel is additive: every pre-existing ad hoc
+`logger.warning(...)`/`logger.info(...)` call (`bq_call_failed`,
+`tool_call_error`, `reports_deleted`, etc.) is untouched, on its own
+plain-text console channel via `logging.basicConfig`.
+
+Cross-call conversation tracing uses **LangSmith** (free Developer tier —
+no credit card, 5k traces/month, 14-day retention), auto-instrumented
+purely via environment variables (`LANGSMITH_TRACING`,
+`LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`) — no callback handler or other
+code anywhere in this repo, and tracing is simply off if those variables
+are unset (verified: an invalid/missing key logs its own warning and
+never breaks a turn, the same graceful-degradation property every other
+third-party dependency in this system has). This reverses what an earlier
+draft of this section said: self-hosted **Langfuse** was chosen instead of
+LangSmith specifically to avoid sending prompts/SQL/tool output to
+third-party SaaS by default. That reasoning no longer applies to *this*
+prototype — third-party data sharing was judged acceptable here, which
+made LangSmith the simpler choice (env vars only, and the native tool for
+this LangChain/LangGraph stack) with no meaningful downside once the PII
+objection is off the table. Production, run at a scale and audit posture
+where that objection matters more, could still choose to self-host a
+tracer instead — this is a deliberate prototype-only trade-off, not a
+claim that it's the right call at every scale. Whatever tracer is used,
+it must trace **post-PII-strip** data only: the LangChain messages
+LangSmith observes are already post-strip by the time they exist
+(`BigQueryTool` strips before `_run_tool` ever builds a `ToolMessage`).
+Cloud Monitoring dashboards/alerts on top of the Cloud Logging stream
+(error rate, self-correct rate, latency, PII-block rate, daily cost) are
+still production-only — no dashboards exist, coded or otherwise; LangSmith
+covers the conversation-level "what exactly happened in this exchange"
+deep-dive that raw metrics can't, in both the prototype and production.
 
 ## 4. Data Flow
 
@@ -724,15 +748,18 @@ questions with expected SQL shape and report themes, curated by a human
 analyst — scored by an LLM-as-judge rubric (right numbers, answers the
 actual question, no PII), periodically cross-checked against human
 grading, re-run as a regression gate before any prompt/persona/bucket
-change ships. UX would be evaluated from the same structured logs
-Observability would capture, rather than a separate survey mechanism.
+change ships. UX would be evaluated from the same structured trace
+events Observability already captures (§3), rather than a separate
+survey mechanism.
 
-**7. Observability — docs only** (eligible for the prototype,
-deliberately not coded — see §9; only the incidental `logging` calls from
-resilience work exist today). See §3. In production, every log line
-would carry `conversation_id`, so a full exchange could be reconstructed
-by filtering the JSON log; a Langfuse trace view gives the same
-reconstruction without a log grep.
+**7. Observability — coded.** See §3. Every `llm_call`/`tool_call`/`turn`
+JSON line carries `conversation_id`, so a full exchange can be
+reconstructed by filtering the CLI's stderr output (or a file, if
+`TRACE_LOG_DESTINATION` points at one) on that field; a LangSmith trace
+view gives the same reconstruction without a log grep, today, not just in
+a future production deployment. Cloud Monitoring dashboards/alerts built
+on top of the structured log stream remain production-only — no
+dashboards exist.
 
 **8. Agility / Persona Management — docs only.** See Persona Config in
 §3. A CEO-requested tone change ships by editing an external document,
@@ -824,7 +851,16 @@ together.
 Optional env vars (defaults shown): `GEMINI_MODEL=gemini-3.6-flash`,
 `BQ_MAX_BYTES_BILLED=1000000000` (~1GB), `BQ_ROW_LIMIT=500`,
 `BQ_QUERY_TIMEOUT_SECONDS=30`, `LOG_LEVEL=INFO`,
-`REPORTS_DATABASE_URL=postgresql://retail_agent:retail_agent@localhost:5432/retail_agent_reports`.
+`REPORTS_DATABASE_URL=postgresql://retail_agent:retail_agent@localhost:5432/retail_agent_reports`,
+`TRACE_LOG_DESTINATION=stderr` (§3 Observability's structured JSON events;
+also accepts `stdout` or a file path).
+
+LangSmith conversation-level tracing (§3 Observability) is optional and
+off by default — no signup needed to run the CLI at all. To turn it on,
+sign up at [smith.langchain.com](https://smith.langchain.com) (free
+Developer tier, no credit card) and set `LANGSMITH_TRACING=true`,
+`LANGSMITH_API_KEY=...`, `LANGSMITH_PROJECT=retail-agent` — LangChain's
+own tracing hooks pick these up automatically; nothing else changes.
 
 Run the test suite: `uv run pytest`. This runs the unit tests by default,
 including `test_reports_store.py` and `test_conversation_store.py` —
@@ -873,19 +909,26 @@ message(s) loaded).` before the prompt — see §3/§4's Conversation Store
 and Resume path.
 
 **Inspecting internals (PII stripping, self-correct).** `retail-agent`
-prints only the final `Agent: ...` answer per turn — enough to use the
-agent, not enough to see the coded requirements actually fire.
-`scripts/trace.py` runs one question through the same graph and prints
-every message in the resulting state (every tool call, every tool
-response — post-PII-strip — every model turn) plus the resilience
-bookkeeping (`self_correct_attempts`, `last_tool_errors`) the REPL never
-surfaces. Same credentials as the CLI; no conversation continuity (each
-run is a fresh thread), so it's for inspecting one question at a time,
-not for discussing results:
+prints only the final `Agent: ...` answer per turn on stdout — enough to
+use the agent, not enough to see the coded requirements actually fire.
+The CLI's own stderr output (§3 Observability) is the machine-readable
+window into that: one JSON line per LLM call/tool call/turn, with
+`latency_ms`, `tokens`, `rows_returned`, `sql`, `error_class`,
+`self_correct_attempt`, etc., emitted live during any normal
+`retail-agent` session (`TRACE_LOG_DESTINATION` redirects it to a file
+instead, if preferred over reading stderr directly):
 
 ```bash
-uv run python scripts/trace.py "What are the top 5 product categories by revenue?"
+uv run retail-agent 2>trace.jsonl
+# ... use the CLI normally in this terminal; tail -f trace.jsonl elsewhere ...
 ```
+
+For inspecting full message *content* rather than metrics (why a
+self-correct retry happened, exactly what a tool call returned
+post-PII-strip), a LangSmith trace (if configured, §3) gives the richest
+view; short of that, `logging.basicConfig`'s existing console output
+(`LOG_LEVEL=DEBUG`) and the ad hoc `logger.warning(...)` call sites
+(`bq_call_failed`, `tool_call_error`, etc.) are what's left to read.
 
 ## 9. Prototype vs. Production Scope Matrix
 
@@ -897,18 +940,17 @@ uv run python scripts/trace.py "What are the top 5 product categories by revenue
 | 4. Continuous Improvement | Docs only | Firestore preference store; human-gated system learning |
 | 5. Resilience & Error Handling | **Coded** — typed errors, self-correct, backoff | Same, at scale |
 | 6. Quality Assurance | Docs only — eligible for the prototype, deliberately not coded | Golden eval set + scoring script, judge-drift audits |
-| 7. Observability | Docs only — eligible for the prototype, deliberately not coded | Structured JSON logs → Cloud Logging + Monitoring dashboards/alerts + Langfuse (self-hosted) for conversation-level tracing |
+| 7. Observability | **Coded** — `tracing.py`'s `llm_call`/`tool_call`/`turn` JSON events (Cloud-Logging-shaped, stderr) + LangSmith auto-instrumentation (free Developer tier, env vars only) | Same structured logs to real Cloud Logging + Monitoring dashboards/alerts on top; LangSmith or a self-hosted tracer, depending on whether the prototype's no-third-party-SaaS trade-off still applies at that scale |
 | 8. Agility (Persona) | Docs only | Firestore/Cloud Storage config, admin surface |
 
-3 of 8 requirements are coded (all three eligible for the prototype per
-the assignment's deliverable-3 list, which allows any 2 of 5). The other 2
-eligible requirements (Quality Assurance, Observability) are a deliberate
-scope decision, not a time cutoff — the build order (see `CLAUDE.md`)
-adds High-Stakes Oversight after resilience depth, then stops. The
-remaining 3 requirements (Hybrid Intelligence, Continuous Improvement,
-Agility) were never in the assignment's prototype-eligible list, so
-they're designed here in full but were never candidates for coding
-either way.
+4 of 8 requirements are coded (all four eligible for the prototype per
+the assignment's deliverable-3 list, which allows any 2 of 5). The one
+remaining eligible requirement (Quality Assurance) is a deliberate scope
+decision, not a time cutoff — the build order (see `CLAUDE.md`) adds
+Observability after High-Stakes Oversight, then stops. The remaining 3
+requirements (Hybrid Intelligence, Continuous Improvement, Agility) were
+never in the assignment's prototype-eligible list, so they're designed
+here in full but were never candidates for coding either way.
 
 This matrix tracks the eight numbered requirements only. Architecture
 components that don't map onto one of them are argued in §3 rather than
