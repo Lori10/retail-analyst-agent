@@ -472,3 +472,115 @@ since there's no code path to exercise) that an invalid/missing
 warning to stderr and the turn completes normally — consistent with the
 "no third-party failure crashes the CLI" property every other external
 dependency in this system already has (§5).
+
+## Quality Assurance: Golden-Set Eval Harness Implementation Notes
+
+Companion detail to design.md §6/§7/§9 for the eval harness
+(`eval/golden_set.json`, `src/retail_agent/eval.py`,
+`scripts/run_eval.py`), added when this requirement moved from docs-only
+to coded.
+
+**Why this is a manual script, not a pytest-collected test.** Every golden
+case runs a real question through the real compiled graph — live Gemini
+for the agent's own generation, live Gemini again for the judge, live
+BigQuery for every `run_query`/`get_schema` call. That's the identical
+justification `tests/integration/conftest.py` already documents for why
+those tests require real *exported* environment variables rather than
+loading `.env`: `uv run pytest` must never silently make billed, live
+calls just because a developer's `.env` happens to be configured. Rather
+than fold the harness into that suite as a skipped-by-default test file,
+it's a standalone script with its own CLI (`scripts/run_eval.py`) that
+prints a human-readable report and writes a JSON file to disk — closer in
+spirit to `scripts/render_graph.py` (a tool you run and read the output
+of) than to a pass/fail assertion `pytest` collects. `--fail-under` exists
+specifically so a CI pipeline could still treat a run of this script as a
+gate later, without needing it to be a pytest test to do so.
+
+**Why the judge is a bare `ChatGoogleGenerativeAI`, not `GeminiProvider`.**
+`GeminiProvider.__init__` (`llm_provider.py`) unconditionally calls
+`.bind_tools(TOOLS)` — the same five tools (`run_query`, `get_schema`,
+`save_report`, `list_reports`, `delete_reports`) the agent itself uses.
+Reusing `GeminiProvider` for the judge would let a judge call actually
+invoke one of those tools (or at minimum return a spurious `tool_calls`
+list the JSON-parsing logic in `judge_case` never expects), which is not
+a capability a scoring pass over already-produced text should have.
+`eval.run_eval` constructs a second, separate `ChatGoogleGenerativeAI`
+directly — no tools bound, no `bounded_backoff`/retry wrapper the way
+`GeminiProvider._generate_raw` has, and no typed-error classification the
+way `llm_provider._classify_error` does. That asymmetry is deliberate, not
+an oversight: a judge-call failure degrading one case's verdict to
+`parse_error=True` (via `judge_case`'s defensive `try`/`except` around the
+JSON parse — a raised provider exception would need its own catch, added
+if this becomes a real gap in practice) is an acceptable outcome for a
+manually-run report; it doesn't need the same resilience machinery a
+live, user-facing conversation turn does.
+
+**Deterministic checks before the judge, same layering principle as
+elsewhere in this codebase.** `_check_expected_tool`/`_check_expected_tables`/
+`_check_expected_keywords`/`_check_pii_leak` all run before `judge_case` is
+ever called, mirroring the existing "cheap deterministic check first"
+shape (`guardrail.py`'s denylist, `sql_safety.py`'s keyword allowlist,
+`graph._is_affirmative`) rather than asking a single LLM-as-judge call to
+do everything. `_check_expected_tables`/`_check_expected_keywords` are
+loose OR-matches against a `list[str]`, not exact-SQL or exact-answer
+matching — an LLM's generated SQL and prose phrasing are not deterministic
+between runs even for the same question, so a stricter match would produce
+false failures unrelated to actual answer quality. `_check_pii_leak` is a
+single email-regex check, gated on `case.pii_sensitive`: it is
+belt-and-suspenders on top of the BQ wrapper's column stripping
+(`pii.strip_pii_columns`, already the hard control — see design.md §6
+requirement 2), not a new PII-detection mechanism in its own right; it
+would not catch a full name or street address leaking in prose, only an
+email-shaped string literally present in the final answer text.
+
+**Found and fixed during live testing: one case's provider failure was
+crashing the whole run.** The first live run of `scripts/run_eval.py` hit a
+real Gemini free-tier rate limit (`ProviderTransientError`, HTTP 429) on a
+single case — and because `run_eval`'s loop had no per-case error handling,
+that one exception propagated straight out of `run_eval`, aborting the
+script before any of the later cases ran or any report was written. Fixed
+by extracting `_score_case(graph, judge_model, case) -> CaseReport`, which
+wraps `run_case(...)` in a `try`/`except Exception` and reports a case-level
+`run_error` instead of letting the exception escape — the same
+"no path crashes the caller" property `cli.py`'s per-turn
+`except AgentError`/`except Exception` already gives the interactive REPL
+loop, applied here to a batch harness instead of a single turn. A case with
+`run_error` set is reported as failed (never silently skipped or counted as
+a pass) and the judge is never called for it, since there's no answer to
+judge. Covered by `test_score_case_contains_a_run_case_exception` in
+`tests/test_eval.py`.
+
+**Accepted gaps, not fixed:**
+
+- **9 cases is not a statistically meaningful sample.** It's sized to be
+  "a small eval set" per the assignment brief and this task's own scope,
+  covering each capability the brief names once, not to support a
+  confident pass-rate number. A production version (design.md §6/§9) would
+  grow this from real analyst-curated Golden Bucket trios over time, the
+  same human-in-the-loop growth path already described for the Golden
+  Bucket itself.
+- **No ground-truth query/result diffing.** The harness has no reference
+  "correct" SQL or expected row values to diff against — `plausible` in
+  `JudgeVerdict` is the judge's coherence read on the final answer, not a
+  verification against a known-correct number. This is the same
+  "expected SQL shape and report themes," not exact SQL, framing
+  design.md's Hybrid Intelligence/Golden Bucket section already uses for
+  why trios store shape, not a canonical answer to byte-match.
+- **Single run, not averaged.** Each case runs through the agent and the
+  judge exactly once per `scripts/run_eval.py` invocation. Gemini's output
+  isn't fully deterministic, so a case that fails once might pass on a
+  re-run and vice versa — there's no majority-vote-over-N-runs smoothing.
+  Diffing `--out`'s JSON across multiple manual runs is the closest this
+  harness gets to noticing that variance today.
+- **No historical trend tracking beyond the `--out` file itself.** Each
+  run overwrites (or is written to a differently-named) JSON report; there
+  is no accumulation of pass-rate-over-time the way `design.md`'s
+  production framing ("re-run as a regression gate before any
+  prompt/persona/bucket change ships") implies a mature version would
+  have — an engineer running this manually is expected to keep or diff
+  past `--out` files themselves.
+- **The judge can itself be wrong or inconsistent** — a known, general
+  limitation of LLM-as-judge approaches, which is exactly why design.md
+  §6 always specified "periodically cross-checked against human grading"
+  as part of the production design. That human cross-check is a process
+  description in this design, not something this harness automates.

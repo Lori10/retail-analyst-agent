@@ -742,15 +742,39 @@ changelog reviewed by an engineer.
 
 **5. Resilience & Graceful Error Handling — coded.** See §5.
 
-**6. Quality Assurance — docs only** (eligible for the prototype,
-deliberately not coded — see §9). Offline golden eval set — representative
-questions with expected SQL shape and report themes, curated by a human
-analyst — scored by an LLM-as-judge rubric (right numbers, answers the
-actual question, no PII), periodically cross-checked against human
-grading, re-run as a regression gate before any prompt/persona/bucket
-change ships. UX would be evaluated from the same structured trace
-events Observability already captures (§3), rather than a separate
-survey mechanism.
+**6. Quality Assurance — coded.** Offline golden eval set (`eval/golden_set.json`,
+9 hand-curated questions, one per capability the assignment brief names:
+customer behavior, product performance, time-based metrics, a schema/
+structure question, a multi-step "why" question, report-with-action-items,
+a PII-probe safety case, an off-topic decline case, and a cross-segment
+comparison echoing the brief's own example) run through the real compiled
+graph by `src/retail_agent/eval.py` and scored two ways. Cheap deterministic
+checks run first — same "cheap check before spending an LLM call" pattern
+already used by the input guardrail and the SQL safety allowlist: was the
+expected tool (`run_query`/`get_schema`/neither) called, did the SQL touch
+an expected table, does the answer mention an expected keyword, and (for the
+PII-probe case) does the answer contain an email-shaped string at all,
+belt-and-suspenders on top of the BQ wrapper's own column stripping. Only
+then does an LLM-as-judge pass run — a bare, tool-unbound
+`ChatGoogleGenerativeAI` (never `GeminiProvider`, which binds the agent's own
+five tools) scoring the three dimensions this section always named: does the
+answer address the question asked, are its numbers/claims internally
+plausible, is there any PII-shaped content in it. `scripts/run_eval.py` is
+the manual entry point (`uv run python scripts/run_eval.py`) — it prints a
+pass/fail table, writes the full structured report to a JSON file so runs
+can be diffed over time (the practical form of "regression gate before any
+prompt/persona/bucket change ships"), and supports `--fail-under` for later
+CI wiring. Never run by `uv run pytest` — like `tests/integration/`, every
+case is a real, billed Gemini + BigQuery call, so this stays an explicit,
+manual action (see docs/implementation-notes.md for the full reasoning and
+the accepted gaps: 9 cases isn't statistically meaningful, table/keyword
+checks are loose shape checks rather than exact-SQL/exact-answer matching,
+and there's no ground-truth query/result diffing — the judge scores
+plausibility, not correctness against a known answer). Periodic human
+cross-checking of judge grading, named in this section since before the
+harness was coded, remains a process description, not code. UX would be
+evaluated from the same structured trace events Observability already
+captures (§3), rather than a separate survey mechanism.
 
 **7. Observability — coded.** See §3. Every `llm_call`/`tool_call`/`turn`
 JSON line carries `conversation_id`, so a full exchange can be
@@ -767,12 +791,15 @@ not by a code deploy.
 
 ## 7. Quality Assurance / Evaluation
 
-See requirement 6 above for the full approach. In short: a curated golden
-set + LLM-as-judge scoring (spot-checked by humans) as a pre-ship
+See requirement 6 above for the full approach and the coded harness
+(`eval/golden_set.json`, `src/retail_agent/eval.py`, `scripts/run_eval.py`).
+In short: a curated golden set + LLM-as-judge scoring as a pre-ship
 regression gate, and UX measured passively from production observability
-data rather than a separate instrumentation surface. No eval script,
-golden set, or judge rubric exists in this repo — this section describes
-the intended production approach only.
+data rather than a separate instrumentation surface. What's coded here is
+the prototype's version of that production approach — the periodic
+human-cross-check-of-judge-grading half stays a process description, not
+code, and there's no CI wiring or golden-SQL/result ground-truth diffing
+(docs/implementation-notes.md has the full list of accepted gaps).
 
 ## 8. Setup Instructions & Example Run
 
@@ -939,18 +966,17 @@ view; short of that, `logging.basicConfig`'s existing console output
 | 3. High-Stakes Oversight | **Coded** — Postgres-backed Saved Reports Store (`ReportsStore`/`psycopg`) + `interrupt()`/`Command(resume=...)`-based confirm-then-delete (`resolve_delete` node) | Same store technology as the prototype (Cloud SQL for Postgres instead of local/docker Postgres); real per-manager auth resolving `owner` instead of the OS username |
 | 4. Continuous Improvement | Docs only | Firestore preference store; human-gated system learning |
 | 5. Resilience & Error Handling | **Coded** — typed errors, self-correct, backoff | Same, at scale |
-| 6. Quality Assurance | Docs only — eligible for the prototype, deliberately not coded | Golden eval set + scoring script, judge-drift audits |
+| 6. Quality Assurance | **Coded** — `eval/golden_set.json` (9 cases) + deterministic checks + LLM-as-judge harness (`eval.py`, `scripts/run_eval.py`), run manually as a regression gate | Same approach at scale, wired into CI, with judge-drift audits and ground-truth query/result diffing |
 | 7. Observability | **Coded** — `tracing.py`'s `llm_call`/`tool_call`/`turn` JSON events (Cloud-Logging-shaped, stderr) + LangSmith auto-instrumentation (free Developer tier, env vars only) | Same structured logs to real Cloud Logging + Monitoring dashboards/alerts on top; LangSmith or a self-hosted tracer, depending on whether the prototype's no-third-party-SaaS trade-off still applies at that scale |
 | 8. Agility (Persona) | Docs only | Firestore/Cloud Storage config, admin surface |
 
-4 of 8 requirements are coded (all four eligible for the prototype per
-the assignment's deliverable-3 list, which allows any 2 of 5). The one
-remaining eligible requirement (Quality Assurance) is a deliberate scope
-decision, not a time cutoff — the build order (see `CLAUDE.md`) adds
-Observability after High-Stakes Oversight, then stops. The remaining 3
-requirements (Hybrid Intelligence, Continuous Improvement, Agility) were
-never in the assignment's prototype-eligible list, so they're designed
-here in full but were never candidates for coding either way.
+5 of 8 requirements are coded — all five of the assignment's
+prototype-eligible list (deliverable 3 allows any 2 of 5), following the
+build order in `CLAUDE.md`, which adds Quality Assurance as its final slice
+after Observability. The remaining 3 requirements (Hybrid Intelligence,
+Continuous Improvement, Agility) were never in the assignment's
+prototype-eligible list, so they're designed here in full but were never
+candidates for coding either way.
 
 This matrix tracks the eight numbered requirements only. Architecture
 components that don't map onto one of them are argued in §3 rather than
