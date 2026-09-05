@@ -269,26 +269,23 @@ instead of taking down the REPL loop (the same "no path crashes the CLI"
 guarantee §5 makes for every other store).
 
 The prototype's thread id is `f"cli-session-{owner}"` (`cli.py`'s
-`_thread_config`), namespaced by `owner` rather than a bare constant —
-this replaced an earlier version that used the fixed literal
-`"cli-session"` for every OS user. That was harmless for `ReportsStore`
-(its `owner` column is independent of `conversation_id`'s uniqueness),
-but not for `ConversationStore`: `conversations.conversation_id` is that
-table's primary key, so with a shared constant, the first OS user to run
-the CLI against a given Postgres instance would permanently "own" that
-row (`ON CONFLICT (conversation_id) DO UPDATE SET updated_at = now()`
-never reassigns `owner`), and every other OS user's messages would still
-get written — into the *same* `conversation_id` — but could never be read
-back by their own `owner`-scoped `get_messages` call. No cross-user
-leak (the owner check still blocks reading someone else's history either
-way), but a silent, permanent loss of resume for everyone except whoever
-got there first. Namespacing by `owner` gives each OS user their own
-`conversation_id`, closing that. One unrelated wrinkle persists
-regardless of this fix: `reports.conversation_id` reuses the same
-per-owner thread id, so `ReportsStore`'s `scope="conversation"` delete
-still degenerates to `scope="all"` for a single owner across restarts —
-a `ReportsStore` behavior, not something the Conversation Store causes
-or fixes.
+`_thread_config`), namespaced by `owner` rather than a bare constant. A
+bare constant would break specifically because of how `ConversationStore`
+is keyed: `conversations.conversation_id` is that table's primary key, so
+with a shared constant, the first OS user to run the CLI against a given
+Postgres instance would permanently "own" that row
+(`ON CONFLICT (conversation_id) DO UPDATE SET updated_at = now()` never
+reassigns `owner`), and every other OS user's messages would still get
+written — into the *same* `conversation_id` — but could never be read back
+by their own `owner`-scoped `get_messages` call. No cross-user leak (the
+owner check still blocks reading someone else's history either way), but a
+silent, permanent loss of resume for everyone except whoever got there
+first. Namespacing by `owner` gives each OS user their own
+`conversation_id`, avoiding this. One separate wrinkle remains:
+`reports.conversation_id` reuses the same per-owner thread id, so
+`ReportsStore`'s `scope="conversation"` delete still degenerates to
+`scope="all"` for a single owner across restarts — a `ReportsStore`
+behavior, not something the Conversation Store causes or fixes.
 
 **Extensibility — new tools and data sources.** New capabilities (chart
 generation, emailing reports, web search) fall out of the tool-calling
@@ -356,37 +353,22 @@ Gemini is the only provider and the tool set never changes mid-conversation.
 `max_retries=1` (not `0`!) disables the SDK's own retry loop — a documented
 quirk of the underlying Google SDK where `max_retries=0` is interpreted as
 "use the Google default" (5 retries) rather than "no retries" — so the
-`bounded_backoff` wrapper (§5) stays the single source of retry behavior,
-same principle the earlier `OpenRouterProvider`'s `max_retries=0` (for the
-`openai` SDK, where `0` genuinely means "no retries") once documented.
+`bounded_backoff` wrapper (§5) stays the single source of retry behavior.
 There is no circuit breaker and no fallback provider: with Gemini as the
 only provider, there's nowhere to fail over to, so a Gemini failure that
 survives backoff surfaces directly as a graceful error message (§5) instead
 of being routed anywhere else.
 
-This reverses an earlier decision recorded in
-[implementation-notes.md](implementation-notes.md#llm-provider-raw-sdks-vs-langchain-chat-model-wrappers)
-to talk to the Gemini/OpenRouter SDKs directly rather than through
-LangChain's chat model wrappers. That decision was made when a second
-provider (OpenRouter) existed and needed its own hand-rolled message/
-tool-schema translation module — LangChain's chat model interface would
-have made that translation unnecessary, at the cost of a direct request-
-shape control this project wanted to keep at the time. With OpenRouter
-removed, that trade-off no longer applies: there's no second provider's
-translation cost to avoid paying, and `langchain-google-genai`'s
-`ChatGoogleGenerativeAI` now classifies every provider failure into
-`langchain_core.exceptions`' own unified `ModelError` taxonomy
-(`ModelAuthenticationError`, `ModelRateLimitError`, `ModelAPIError`, etc.,
-each carrying an `is_retryable` flag) — a real provider-agnostic exception
-surface that didn't exist when the original raw-SDK decision was made, so
-the "exception classification is a wash" argument from that decision no
-longer holds either. See
-[implementation-notes.md](implementation-notes.md#llm-provider-raw-sdks-vs-langchain-chat-model-wrappers)
-for the full account of what changed. This also means adding or swapping a
-provider later is materially cheaper than it was: every LangChain chat
-model returns the same `AIMessage`/`ToolMessage` shapes, so `graph.py`,
-`tools.py`, and `cli.py` — which now speak that shape natively, not a
-Gemini-specific one — would need no changes; only `llm_provider.py`'s
+`langchain-google-genai`'s `ChatGoogleGenerativeAI` classifies every
+provider failure into `langchain_core.exceptions`' own unified `ModelError`
+taxonomy (`ModelAuthenticationError`, `ModelRateLimitError`,
+`ModelAPIError`, etc., each carrying an `is_retryable` flag) — a real,
+provider-agnostic exception surface that `llm_provider.py`'s
+`_classify_error`/`_is_transient_error` key off directly. Talking to Gemini
+through LangChain's chat model interface, rather than the raw SDK, also
+keeps adding or swapping a provider later cheap: every LangChain chat model
+returns the same `AIMessage`/`ToolMessage` shapes, so `graph.py`,
+`tools.py`, and `cli.py` need no changes; only `llm_provider.py`'s
 constructor and its exception-classification buckets would.
 
 **BigQuery tool wrapper.** `src/provided/bq_runner.py` was supplied by the
@@ -534,20 +516,17 @@ no credit card, 5k traces/month, 14-day retention), auto-instrumented
 purely via environment variables (`LANGSMITH_TRACING`,
 `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`) — no callback handler or other
 code anywhere in this repo, and tracing is simply off if those variables
-are unset (verified: an invalid/missing key logs its own warning and
-never breaks a turn, the same graceful-degradation property every other
-third-party dependency in this system has). This reverses what an earlier
-draft of this section said: self-hosted **Langfuse** was chosen instead of
-LangSmith specifically to avoid sending prompts/SQL/tool output to
-third-party SaaS by default. That reasoning no longer applies to *this*
-prototype — third-party data sharing was judged acceptable here, which
-made LangSmith the simpler choice (env vars only, and the native tool for
-this LangChain/LangGraph stack) with no meaningful downside once the PII
-objection is off the table. Production, run at a scale and audit posture
-where that objection matters more, could still choose to self-host a
-tracer instead — this is a deliberate prototype-only trade-off, not a
-claim that it's the right call at every scale. Whatever tracer is used,
-it must trace **post-PII-strip** data only: the LangChain messages
+are unset (an invalid/missing key logs its own warning and never breaks a
+turn, the same graceful-degradation property every other third-party
+dependency in this system has). This is a deliberate prototype-scope
+trade-off: sending prompts/SQL/tool output to a third-party SaaS is
+judged acceptable here, which makes LangSmith's env-var-only
+auto-instrumentation (and being the native tool for this LangChain/
+LangGraph stack) the simplest choice. A production deployment run at a
+scale or audit posture where third-party data sharing isn't acceptable
+should self-host a tracer instead (e.g. Langfuse) — same LangChain/
+LangGraph integration shape, different data-residency trade-off. Whatever
+tracer is used, it must trace **post-PII-strip** data only: the LangChain messages
 LangSmith observes are already post-strip by the time they exist
 (`BigQueryTool` strips before `_run_tool` ever builds a `ToolMessage`).
 Cloud Monitoring dashboards/alerts on top of the Cloud Logging stream
@@ -771,8 +750,8 @@ the accepted gaps: 9 cases isn't statistically meaningful, table/keyword
 checks are loose shape checks rather than exact-SQL/exact-answer matching,
 and there's no ground-truth query/result diffing — the judge scores
 plausibility, not correctness against a known answer). Periodic human
-cross-checking of judge grading, named in this section since before the
-harness was coded, remains a process description, not code. UX would be
+cross-checking of judge grading remains a process description, not code.
+UX would be
 evaluated from the same structured trace events Observability already
 captures (§3), rather than a separate survey mechanism.
 
@@ -924,9 +903,6 @@ Type 'yes' to confirm deletion, or anything else to cancel.
 > yes
 Agent: Deleted 1 report(s).
 ```
-
-Golden Bucket retrieval shown in earlier drafts of this example isn't in
-the prototype — see §9.
 
 Type `exit` or `quit` to leave the REPL (Ctrl-D/Ctrl-C also work).
 Running `uv run retail-agent` again afterward resumes this same

@@ -15,14 +15,13 @@ a regression-gate eval harness, not just a happy-path demo.
   ([docs/design.md](docs/design.md)) covering all 8 requirements in the
   brief, with the prototype implementing the 5 that are actually
   code-gradeable — every coded piece traces back to a documented design
-  decision, including two recorded reversals made when new information
-  changed the trade-off (see [Notable engineering decisions](#notable-engineering-decisions)).
+  decision.
 - **Safety & PII masking** — an input-side guardrail against prompt
   injection, an instruction to treat all tool output as untrusted data, and
-  schema-verified PII column stripping in the BigQuery wrapper (the
-  registry was checked against the *live* `users` schema, which is how two
-  PII columns absent from the original brief got caught before they could
-  leak).
+  schema-verified PII column stripping in the BigQuery wrapper: the
+  registry is checked against the *live* `users` schema rather than just
+  the brief's PII list, and covers two additional columns (`postal_code`,
+  `user_geom`) a brief-only list would miss.
 - **Resilience** — typed, self-correcting error handling: syntax errors get
   fed back to the model to retry with a different query (bounded, never
   unbounded), permission/transient errors go straight to a graceful
@@ -193,28 +192,6 @@ accepted gaps (sample size, no ground-truth SQL diffing, single-run
 variance):
 [docs/design.md §7](docs/design.md#7-quality-assurance--evaluation),
 [docs/implementation-notes.md](docs/implementation-notes.md#quality-assurance-golden-set-eval-harness-implementation-notes).
-
-## Notable engineering decisions
-
-A few trade-offs worth reading if you want to see the reasoning, not just
-the result — each one changed once new information came in, and the docs
-record why:
-
-- [Raw Gemini/OpenRouter SDKs → LangChain chat model wrappers](docs/implementation-notes.md#llm-provider-raw-sdks-vs-langchain-chat-model-wrappers) —
-  reversed once `langchain-google-genai` started classifying provider
-  failures into a real, unified exception taxonomy, removing the original
-  reason to avoid it.
-- [Self-hosted Langfuse → LangSmith](docs/implementation-notes.md#observability-langsmith-instead-of-self-hosted-langfuse) —
-  reversed once third-party data sharing was judged acceptable for this
-  prototype, which removed the reason a self-hosted tracer was preferred.
-- [SQLite → Postgres for the Saved Reports Store](docs/implementation-notes.md#high-stakes-oversight-delete-confirmation-implementation-notes) —
-  built against SQLite first for zero-dependency simplicity, then migrated
-  once real deployment plans came up, matching what the production design
-  always named as the target store.
-- [A live rate-limit crash caught by the eval harness's own first run](docs/implementation-notes.md#quality-assurance-golden-set-eval-harness-implementation-notes) —
-  one case's Gemini 429 was aborting the entire harness before every other
-  case ran; fixed to contain a live failure to the one case it happened in,
-  the same graceful-degradation property the rest of the system already has.
 
 ## Testing
 

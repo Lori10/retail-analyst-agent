@@ -58,9 +58,8 @@ def _classify_error(exc: Exception) -> ProviderError:
 class GeminiProvider:
     """Gemini LLM provider, backed by `langchain-google-genai`'s
     `ChatGoogleGenerativeAI` rather than a raw `google-genai` SDK call —
-    the sole provider (no OpenRouter fallback, no circuit breaker; see
-    docs/design.md §3 for why that tradeoff changed once Gemini was the
-    only provider left)."""
+    the sole provider, with no fallback provider and no circuit breaker
+    (see docs/design.md §3 for why)."""
 
     def __init__(self, api_key: str, model: str) -> None:
         """Build the bound chat model.
@@ -72,9 +71,7 @@ class GeminiProvider:
         # max_retries=1 (not 0!) disables the SDK's own retry loop — a
         # documented quirk of the underlying Google SDK where 0 means "use
         # the Google default" (5 retries) rather than "no retries". Keeping
-        # `bounded_backoff` below as the single source of retry behavior,
-        # same principle the old OpenRouterProvider's `max_retries=0` (for
-        # the `openai` SDK, where 0 does mean "no retries") documented.
+        # `bounded_backoff` below as the single source of retry behavior.
         self._model = ChatGoogleGenerativeAI(model=model, api_key=api_key, max_retries=1).bind_tools(TOOLS)
 
     @bounded_backoff(retry=tenacity.retry_if_exception(_is_transient_error), attempts=2, logger=logger)

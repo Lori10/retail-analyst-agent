@@ -300,9 +300,8 @@ def _run_turn(
             conversation/owner in the LangSmith UI.
 
     Returns:
-        A `(final_message, awaiting_confirmation)` pair, exactly as the
-        caller's inlined loop previously produced: `final_message` is the
-        turn's terminal `AIMessage` (`None` if the turn just paused on a
+        A `(final_message, awaiting_confirmation)` pair: `final_message` is
+        the turn's terminal `AIMessage` (`None` if the turn just paused on a
         delete confirmation), `awaiting_confirmation` says whether it did.
 
     Raises:

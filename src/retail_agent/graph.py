@@ -170,8 +170,7 @@ def build_graph(
 
         Returns:
             `{"blocked": True/False}` — `route_after_guardrail` decides
-            where to go next; a pass-through turn appends no message here,
-            so it looks exactly as it did before this node existed.
+            where to go next; a pass-through turn appends no message here.
         """
         text = state["messages"][-1].content
         try:
