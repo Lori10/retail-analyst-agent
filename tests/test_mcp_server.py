@@ -5,7 +5,8 @@ import pandas as pd
 from mcp import Client
 
 from retail_agent.errors import QueryPermissionError, QuerySyntaxError
-from retail_agent.mcp_server import build_server
+from retail_agent.mcp_server import LazyResource, build_server
+from retail_agent.startup import StartupError
 from test_graph import FakeBigQueryTool, FakeReportsStore
 
 OWNER = "alice"
@@ -279,3 +280,62 @@ def test_each_tool_call_emits_a_tool_call_trace_event(trace_events):
     ]
     assert tool_events[1]["sql"] == "SELECT x"
     assert all("latency_ms" in e for e in tool_events)
+
+
+# --- Lazy startup -----------------------------------------------------------------
+
+
+def test_lazy_resource_builds_nothing_until_first_use_then_builds_once():
+    builds = []
+
+    def factory():
+        builds.append(1)
+        return FakeReportsStore()
+
+    store = LazyResource(factory)
+    server = _server(reports_store=store)
+    assert builds == []  # building the server connects to nothing
+
+    _call(server, "list_reports")
+    _call(server, "list_reports")
+
+    assert builds == [1]
+
+
+def test_lazy_resource_startup_error_reaches_client_and_is_retried_next_call():
+    attempts = []
+
+    def factory():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise StartupError("Could not connect to the saved reports database. Is Postgres running?")
+        return FakeReportsStore()
+
+    server = _server(reports_store=LazyResource(factory))
+
+    is_error, message = _call(server, "list_reports")
+    assert is_error
+    assert "Is Postgres running?" in message  # readable, not the SDK's generic failure
+
+    is_error, payload = _call(server, "list_reports")
+    assert not is_error
+    assert payload == {"reports": []}
+    assert len(attempts) == 2
+
+
+def test_importing_the_server_loads_no_heavy_dependencies():
+    """The stdio handshake must finish inside a client's connect timeout, so
+    `retail_agent.mcp_server` may not import BigQuery, pandas, psycopg or
+    LangChain/LangGraph at module level. Checked in a fresh interpreter, since
+    this test process has already imported all of them."""
+    import subprocess
+    import sys
+
+    heavy = ["pandas", "google.cloud.bigquery", "psycopg", "langchain_core", "langgraph"]
+    code = (
+        "import sys, retail_agent.mcp_server; "
+        f"print([m for m in {heavy!r} if m in sys.modules])"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
+
+    assert out.strip() == "[]"

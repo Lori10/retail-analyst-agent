@@ -1,21 +1,30 @@
+from __future__ import annotations
+
 import getpass
 import logging
 import secrets
 import sys
 import time
 from contextlib import contextmanager
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from retail_agent.bq_tool import BigQueryTool, query_payload
-from retail_agent.cli import StartupError, build_bq_tool, build_reports_store
 from retail_agent.config import ConfigError, load_config
 from retail_agent.errors import AgentError
-from retail_agent.reports_store import ReportsStore
+from retail_agent.startup import StartupError, build_bq_tool, build_reports_store
 from retail_agent.tools import DELETE_REPORTS, GET_SCHEMA, LIST_REPORTS, RUN_QUERY, SAVE_REPORT
 from retail_agent.tracing import configure_tracing, log_event
+
+if TYPE_CHECKING:
+    from retail_agent.bq_tool import BigQueryTool
+    from retail_agent.reports_store import ReportsStore
+
+# Nothing that imports BigQuery, pandas or psycopg may be imported at module
+# level here: the stdio handshake has to complete inside the client's connect
+# timeout (Claude Code: 30s), and on a cold start those imports alone cost
+# several seconds each. They load on the first tool call instead.
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +56,26 @@ CONFIRM_DELETE_DESCRIPTION = (
     "the preview_delete candidates and explicitly confirmed. Deletes exactly the "
     "previewed reports — nothing added since. Tokens are single-use and expire."
 )
+
+
+class LazyResource:
+    """Proxy that builds the wrapped object on first attribute access.
+
+    Lets `main()` hand `build_server` a BigQuery wrapper and reports store
+    without connecting to either before the handshake. A failed build is not
+    cached: the `StartupError` surfaces from that tool call (as a readable
+    tool error, see `traced`), and the next call tries again — so starting
+    Postgres after the client connected fixes things without a restart.
+    """
+
+    def __init__(self, factory) -> None:
+        self._factory = factory
+        self._instance = None
+
+    def __getattr__(self, name: str):
+        if self._instance is None:
+            self._instance = self._factory()
+        return getattr(self._instance, name)
 
 
 def build_server(
@@ -93,7 +122,9 @@ def build_server(
 
         `AgentError` becomes a `ToolError` carrying its message, so the client
         model can read it and self-correct (e.g. fix a column name) — the same
-        information the graph puts in a `ToolMessage`. Any other exception is
+        information the graph puts in a `ToolMessage`. So does `StartupError`
+        from a `LazyResource`'s first build, so "is Postgres running?" reaches
+        the user instead of a generic failure. Any other exception is
         re-raised for the SDK, which hides its message from the client and
         logs the traceback server-side.
 
@@ -105,7 +136,7 @@ def build_server(
         error_class = None
         try:
             yield result_fields
-        except AgentError as exc:
+        except (AgentError, StartupError) as exc:
             error_class = type(exc).__name__
             raise ToolError(str(exc)) from exc
         except ToolError:
@@ -133,6 +164,8 @@ def build_server(
 
     @server.tool(description=RUN_QUERY["description"])
     def run_query(sql: str) -> dict:
+        from retail_agent.bq_tool import query_payload
+
         with traced("run_query", sql=sql) as trace:
             payload = query_payload(bq_tool.run_query(sql))
             trace["rows_returned"] = payload["row_count"]
@@ -197,6 +230,10 @@ def main() -> None:
 
     stdout carries the MCP protocol itself under the stdio transport, so
     everything else — logs and trace events — is forced onto stderr.
+    BigQuery and Postgres are wrapped in `LazyResource` so neither is
+    connected until the first tool call that needs it; startup does only
+    config loading and the cheap imports above, keeping the handshake well
+    inside a client's connect timeout.
     """
     try:
         config = load_config(require_gemini=False)
@@ -213,11 +250,6 @@ def main() -> None:
         trace_destination = "stderr"
     configure_tracing(trace_destination)
 
-    try:
-        bq_tool = build_bq_tool(config)
-        reports_store = build_reports_store(config)
-    except StartupError as exc:
-        print(f"Startup error: {exc}", file=sys.stderr)
-        sys.exit(1)
-
+    bq_tool = LazyResource(lambda: build_bq_tool(config))
+    reports_store = LazyResource(lambda: build_reports_store(config))
     build_server(bq_tool, reports_store, getpass.getuser()).run()

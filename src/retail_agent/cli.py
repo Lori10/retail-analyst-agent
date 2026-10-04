@@ -6,18 +6,15 @@ import sys
 import time
 import uuid
 
-from google.auth.exceptions import DefaultCredentialsError
-from google.cloud import bigquery
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.types import Command
 
-from retail_agent.bq_tool import BigQueryTool
 from retail_agent.config import ConfigError, load_config
 from retail_agent.conversation_store import ConversationStore
 from retail_agent.errors import AgentError, ConversationStoreError
 from retail_agent.graph import build_graph
 from retail_agent.llm_provider import GeminiProvider
-from retail_agent.reports_store import ReportsStore
+from retail_agent.startup import StartupError, build_bq_tool, build_reports_store
 from retail_agent.tracing import configure_tracing, log_event
 
 logger = logging.getLogger(__name__)
@@ -39,11 +36,6 @@ def _color(text: str, name: str) -> str:
         return text
     return f"\033[{_ANSI[name]}m{text}\033[0m"
 
-
-class StartupError(Exception):
-    """Raised when the agent can't be built at all (bad credentials, no
-    network, etc.) — distinct from AgentError, which covers failures during
-    a conversation turn after the agent is already running."""
 
 SYSTEM_INSTRUCTION = (
     "You are a data analysis assistant for retail Store and Regional Managers. "
@@ -378,62 +370,6 @@ def _run_turn(
         )
 
     return final_message, awaiting_confirmation, outcome
-
-
-def build_bq_tool(config) -> BigQueryTool:
-    """Construct an authenticated `BigQueryTool` from config.
-
-    Shared by the CLI and the MCP server (`mcp_server.py`).
-
-    Args:
-        config: A loaded `Config`.
-
-    Returns:
-        A ready `BigQueryTool`.
-
-    Raises:
-        StartupError: BigQuery credentials are missing/invalid, or the
-            client otherwise fails to construct.
-    """
-    try:
-        client = bigquery.Client(project=config.project_id)
-    except DefaultCredentialsError as exc:
-        raise StartupError(
-            "No Google Cloud credentials found. Run "
-            "'gcloud auth application-default login' and try again."
-        ) from exc
-    except Exception as exc:
-        raise StartupError(f"Could not connect to BigQuery: {exc}") from exc
-
-    return BigQueryTool(
-        client=client,
-        max_bytes_billed=config.max_bytes_billed,
-        row_limit=config.row_limit,
-        timeout_seconds=config.query_timeout_seconds,
-    )
-
-
-def build_reports_store(config) -> ReportsStore:
-    """Connect to the Saved Reports Store.
-
-    Shared by the CLI and the MCP server (`mcp_server.py`).
-
-    Args:
-        config: A loaded `Config`.
-
-    Returns:
-        A connected `ReportsStore`.
-
-    Raises:
-        StartupError: Postgres is unreachable or the connection fails.
-    """
-    try:
-        return ReportsStore(config.reports_database_url)
-    except Exception as exc:
-        raise StartupError(
-            f"Could not connect to the saved reports database: {exc}. Is Postgres running "
-            "('docker compose up -d postgres')?"
-        ) from exc
 
 
 def _build_graph(config):

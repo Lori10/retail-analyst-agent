@@ -359,7 +359,11 @@ generic "Error executing tool" and logged server-side, so internals never
 leak and no exception stops the server. Every call emits the same
 `tool_call` trace event as the graph (§3 Observability), tagged
 `transport: "mcp"`. Because stdout carries the protocol itself under
-stdio, logs and traces are forced onto stderr.
+stdio, logs and traces are forced onto stderr. Startup is deliberately
+thin — config and cheap imports only, with BigQuery and Postgres built
+lazily on the first tool call — so the stdio handshake finishes in ~2s,
+well inside a client's connect timeout (Claude Code's is 30s; an earlier
+eager version missed it on a cold start).
 
 Production shape: the same server over the Streamable HTTP transport on
 Cloud Run, with `owner` resolved from the client's OAuth identity

@@ -637,5 +637,27 @@ through.
 
 **`load_config(require_gemini=False)`.** The server never calls Gemini,
 so it shouldn't refuse to start without `GEMINI_API_KEY`. Setup shared
-with the CLI (`build_bq_tool`, `build_reports_store`) lives in `cli.py`
-and is imported, not copied.
+with the CLI (`build_bq_tool`, `build_reports_store`, `StartupError`)
+lives in `startup.py` and is imported by both, not copied.
+
+**Found during live testing: Claude Code's 30s connect timeout.** The
+first Claude Code session after `.mcp.json` was added reported
+`retail-analyst (CONNECT_TIMEOUT)`. The server answered its stdio
+handshake only after ~7s warm, and much later cold, because everything
+ran before the handshake: `retail_agent/__init__.py` imported `cli`
+eagerly (so *any* `retail_agent.*` import — even `errors` — loaded
+LangChain/LangGraph, measured at 7–20s on a busy machine), the shared
+builders lived in `cli.py`, `mcp_server.py` imported `bq_tool` (BigQuery,
+pandas) at module level, and `main()` connected to BigQuery and Postgres
+before calling `.run()`. Fixed on all four fronts: the package `main` now
+imports `cli` on call; the builders moved to `startup.py` with their
+heavy imports inside the functions; `mcp_server.py` keeps those imports
+out of module scope (pinned by
+`test_importing_the_server_loads_no_heavy_dependencies`, which checks a
+fresh interpreter's `sys.modules`); and `main()` wraps both resources in
+`LazyResource`, which builds on first attribute access. Result: handshake
+in ~2s, almost all of it the `mcp` SDK's own import; the first tool call
+pays the deferred cost instead (~8–10s for the first `run_query`), where
+no connect timeout applies. A failed lazy build is not cached and its
+`StartupError` reaches the client as a readable tool error ("Is Postgres
+running?"), so fixing the cause mid-session works without reconnecting.
