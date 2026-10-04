@@ -362,11 +362,12 @@ def test_run_turn_traces_answered_outcome_on_a_normal_turn(trace_events):
     thread_config = _thread_config("test-owner")
     stream_input = _build_stream_input("What's total revenue?", awaiting_confirmation=False)
 
-    final_message, awaiting_confirmation = _run_turn(
+    final_message, awaiting_confirmation, outcome = _run_turn(
         graph, stream_input, thread_config, "turn-1", "What's total revenue?", "test-owner"
     )
 
     assert awaiting_confirmation is False
+    assert outcome == "answered"
     assert _response_text(final_message) == "Total revenue is 42."
     (event,) = _turn_events(trace_events)
     assert event["outcome"] == "answered"
