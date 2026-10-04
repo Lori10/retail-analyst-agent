@@ -584,3 +584,80 @@ judge. Covered by `test_score_case_contains_a_run_case_exception` in
   §6 always specified "periodically cross-checked against human grading"
   as part of the production design. That human cross-check is a process
   description in this design, not something this harness automates.
+
+## MCP Server Implementation Notes
+
+Companion detail to design.md §3's MCP Server section.
+
+**Why a two-step token, not MCP elicitation.** MCP has a native way for
+a server to ask the user something mid-tool-call (elicitation), and a
+`delete_reports` tool that elicits a yes/no would look closest to the
+CLI's `interrupt()`. It was rejected because it only works in clients
+that implement elicitation; against one that doesn't, the server either
+can't delete at all or has to fall back to deleting unconfirmed. The
+`preview_delete`/`confirm_delete` split works with every client, and its
+guarantee — nothing is deleted that wasn't previewed — is enforced
+entirely server-side and covered by hermetic tests
+(`tests/test_mcp_server.py`). What it can't enforce is that a *human*
+saw the preview: a client model could call both tools back to back. The
+tool descriptions and server `instructions` forbid that, but it's
+advisory, the same way the CLI system prompt is advisory about
+off-topic questions. Elicitation, where supported, would close that gap
+and could be layered on later without removing the token check.
+
+**Why the token map is in process memory.** A stdio MCP server is one
+process per connected client, so preview and confirm always reach the
+same process; a dict with a TTL is enough. Expired tokens are swept on
+each `preview_delete`, so the map can't grow without bound. This stops
+being true the moment the server runs as more than one instance behind
+HTTP — see design.md §3's production note.
+
+**Why stdio only.** stdio is what local clients (Claude Code, Claude
+Desktop, MCP Inspector) launch, needs no auth or port, and matches the
+prototype's single-user, `getpass.getuser()` identity model. Streamable
+HTTP is a one-line `.run(...)` change in the SDK, but serving it
+honestly means real per-caller identity, which the prototype doesn't
+have anywhere.
+
+**Why the CLI agent doesn't consume its own MCP server.** Switching
+`graph.py` to load tools through `langchain-mcp-adapters` would teach the
+client side of MCP, but it adds a process boundary and a serialization
+hop under every tool call, and it would move `delete_reports` behind the
+server's token flow — breaking the graph's `resolve_delete`/`interrupt()`
+path, which is a coded requirement. In-process calls keep the CLI's
+behavior and tests unchanged; the MCP server is additive.
+
+**Errors leak a little BigQuery detail, deliberately.** `AgentError`
+messages are passed through verbatim so the client model can
+self-correct, and a BigQuery syntax error's message includes the job URL
+and GCP project number. That's the same text the CLI agent already
+hands Gemini, and a project number isn't a credential, so it's accepted.
+Messages from unexpected (non-`AgentError`) exceptions are never passed
+through.
+
+**`load_config(require_gemini=False)`.** The server never calls Gemini,
+so it shouldn't refuse to start without `GEMINI_API_KEY`. Setup shared
+with the CLI (`build_bq_tool`, `build_reports_store`, `StartupError`)
+lives in `startup.py` and is imported by both, not copied.
+
+**Found during live testing: Claude Code's 30s connect timeout.** The
+first Claude Code session after `.mcp.json` was added reported
+`retail-analyst (CONNECT_TIMEOUT)`. The server answered its stdio
+handshake only after ~7s warm, and much later cold, because everything
+ran before the handshake: `retail_agent/__init__.py` imported `cli`
+eagerly (so *any* `retail_agent.*` import — even `errors` — loaded
+LangChain/LangGraph, measured at 7–20s on a busy machine), the shared
+builders lived in `cli.py`, `mcp_server.py` imported `bq_tool` (BigQuery,
+pandas) at module level, and `main()` connected to BigQuery and Postgres
+before calling `.run()`. Fixed on all four fronts: the package `main` now
+imports `cli` on call; the builders moved to `startup.py` with their
+heavy imports inside the functions; `mcp_server.py` keeps those imports
+out of module scope (pinned by
+`test_importing_the_server_loads_no_heavy_dependencies`, which checks a
+fresh interpreter's `sys.modules`); and `main()` wraps both resources in
+`LazyResource`, which builds on first attribute access. Result: handshake
+in ~2s, almost all of it the `mcp` SDK's own import; the first tool call
+pays the deferred cost instead (~8–10s for the first `run_query`), where
+no connect timeout applies. A failed lazy build is not cached and its
+`StartupError` reaches the client as a readable tool error ("Is Postgres
+running?"), so fixing the cause mid-session works without reconnecting.

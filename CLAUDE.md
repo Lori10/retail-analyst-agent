@@ -1,6 +1,6 @@
 # Retail Data Analysis Agent
 
-Take-home assignment. Full brief: @docs/assignment.md — read it before doing anything.
+Take-home assignment. The brief's eight requirements are restated, with how each is handled, in @docs/design.md §6 — read it before doing anything.
 Design decisions and HLD live in @docs/design.md (source of truth; update it when a decision changes). Implementation-level detail, rejected alternatives, and gaps found during testing live in @docs/implementation-notes.md — kept separate so design.md stays a fast read.
 
 ## Constraints
@@ -35,6 +35,13 @@ for deliverable 3. Docs only, and never eligible for the prototype in the
 first place: Hybrid Intelligence/Golden Bucket, Continuous Improvement,
 Agility/Persona Management.
 
+Also coded, beyond the eight requirements: an MCP server
+(`mcp_server.py`, `uv run retail-mcp`, stdio, official `mcp` SDK v2
+`MCPServer`) exposing the same tools to external MCP clients, with
+deletion split into `preview_delete`/`confirm_delete` (single-use,
+expiring, owner-bound token) since an MCP client never passes through
+the graph's `interrupt()`.
+
 ## Workflow
 - Design before code. Don't write source until docs/design.md is agreed.
 - Work in small vertical slices; each slice runnable end to end.
@@ -50,7 +57,10 @@ Agility/Persona Management.
   (6) Quality Assurance — golden-set eval harness (`eval/golden_set.json`,
   `eval.py`, `scripts/run_eval.py`): deterministic shape checks + an
   LLM-as-judge rubric, run manually against live Gemini/BigQuery, never
-  part of `uv run pytest`'s default run.
+  part of `uv run pytest`'s default run;
+  (7) MCP server — the same tools over stdio for external MCP clients,
+  every guarantee (PII strip, owner scope, delete confirmation) enforced
+  server-side; the CLI agent keeps calling the tools in-process.
 - Write tests for PII filtering and delete confirmation first.
 - Ask before adding a dependency.
 

@@ -2,7 +2,7 @@
 
 Source of truth for architecture and design decisions. Update this file
 whenever a decision changes. See `CLAUDE.md` for build constraints and
-current prototype scope, `docs/assignment.md` for the brief, and
+current prototype scope, and
 `docs/implementation-notes.md` for implementation-level detail, rejected
 alternatives, and gaps found during testing — kept separate so this
 document stays a fast read on a first pass.
@@ -23,12 +23,14 @@ of whether it's coded.
 flowchart TB
     subgraph Client["Client"]
         CLI["CLI Chat Interface\n(prototype)"]
+        MCPClient["External MCP client\n(Claude Code, Claude Desktop,\nMCP Inspector)"]
     end
 
     subgraph Agent["Agent Service\n(Cloud Run in prod / local process in prototype)"]
         Orchestrator["Orchestrator\nLangGraph: tool-calling loop +\ninterrupt()-based confirm-before-delete"]
         Provider["LLM Provider\nlangchain-google-genai\nChatGoogleGenerativeAI"]
         BQWrap["BigQuery Tool Wrapper\nread-only check, dry-run cap,\ntimeout, row limit, PII strip"]
+        MCPServer["MCP Server (stdio) — coded\nsame tools, same wrappers,\ntwo-step token delete"]
     end
 
     subgraph LLMs["LLM Provider"]
@@ -52,6 +54,9 @@ flowchart TB
     end
 
     CLI --> Orchestrator
+    MCPClient --> MCPServer
+    MCPServer --> BQWrap
+    MCPServer --> Reports
     Orchestrator --> Provider
     Provider --> Gemini
     Orchestrator --> BQWrap
@@ -297,6 +302,74 @@ wrapper pattern as `BigQueryTool`: its own safety check appropriate to
 that source, its own cost/row/timeout caps, and its own PII-stripping
 pass before results reach the LLM, rather than a bespoke integration
 path per source.
+
+The same tools are also published outward over the Model Context
+Protocol (MCP) (**MCP Server**, below), so other agents and assistants
+can use this system's data layer without going through this agent's
+LangGraph loop. Going the other way — this agent loading tools from
+*other* MCP servers (a web-search or email server, say) via
+`langchain-mcp-adapters` — is the natural path for third-party
+capabilities, but isn't coded: see
+[implementation-notes.md](implementation-notes.md#mcp-server-implementation-notes).
+
+**MCP Server — coded (`mcp_server.py`, `retail-mcp`).** Exposes the data
+and reports tools to any MCP client (Claude Code, Claude Desktop, MCP
+Inspector) over the stdio transport, using the official `mcp` Python SDK
+(`MCPServer`). It is a second entry point beside the CLI, not a layer
+under it: the CLI agent still calls `BigQueryTool`/`ReportsStore`
+directly. Six tools — `get_schema`, `run_query`, `save_report`,
+`list_reports`, `preview_delete`, `confirm_delete` — whose descriptions
+and allowed values (table names, delete scopes) come from the same
+`tools.py` schemas the LangGraph agent binds.
+
+The design point is the **trust boundary**: an MCP client brings its own
+model, its own system prompt, and its own idea of when to ask the user
+anything, so no guarantee can depend on the client behaving. Every
+guarantee therefore sits under the tool, server-side:
+
+- **PII** — `run_query`/`get_schema` call the same `BigQueryTool`, so
+  read-only checks, the dry-run cost cap, the row limit and PII column
+  stripping apply to every client (verified live: `SELECT email, country`
+  returns `country` only, with `redacted_columns: ["email"]`).
+- **Owner scoping** — every reports call is scoped to the server
+  process's `owner` (`getpass.getuser()`, same as the CLI, so reports
+  are shared between the two). Saved reports carry
+  `conversation_id = "mcp-session-<owner>"`, so `scope="conversation"`
+  means "saved through MCP".
+- **Delete confirmation** — the CLI's confirmation is a graph
+  `interrupt()`, which an MCP client never passes through. A single
+  `delete_reports` tool would let any client delete with no human in the
+  loop, so deletion is split in two. `preview_delete` deletes nothing and
+  returns the exact candidates plus a random `confirmation_token`;
+  `confirm_delete(token)` deletes exactly those ids. The token is
+  single-use (consumed even on rejection), owner-bound, and expires after
+  5 minutes. The tool descriptions tell the client model to show the
+  preview and get an explicit yes, but that is advisory; the hard
+  guarantee is that nothing can be deleted that wasn't previewed first.
+  Deleting by previewed id (rather than re-running the filter, as the
+  CLI's resume does) also means a report added between preview and
+  confirm is never swept up.
+
+Errors: a typed `AgentError` becomes an MCP tool error carrying its
+message (`is_error=True`), so the client's model can read a BigQuery
+"Unrecognized name" and retry with corrected SQL — the MCP equivalent of
+the graph's error `ToolMessage` and self-correct loop, except the retry
+budget is the client's. Any other exception is hidden behind the SDK's
+generic "Error executing tool" and logged server-side, so internals never
+leak and no exception stops the server. Every call emits the same
+`tool_call` trace event as the graph (§3 Observability), tagged
+`transport: "mcp"`. Because stdout carries the protocol itself under
+stdio, logs and traces are forced onto stderr. Startup is deliberately
+thin — config and cheap imports only, with BigQuery and Postgres built
+lazily on the first tool call — so the stdio handshake finishes in ~2s,
+well inside a client's connect timeout (Claude Code's is 30s; an earlier
+eager version missed it on a cold start).
+
+Production shape: the same server over the Streamable HTTP transport on
+Cloud Run, with `owner` resolved from the client's OAuth identity
+(MCP's authorization spec) instead of the OS user, and the pending-delete
+token map moved from process memory into Memorystore so preview and
+confirm can land on different instances.
 
 **Agent Service compute — Cloud Run.** Fits a synchronous,
 intermittently-used chat workload better than GKE (cluster overhead
@@ -911,6 +984,17 @@ Conversation Store and prints `Resuming previous conversation (N
 message(s) loaded).` before the prompt — see §3/§4's Conversation Store
 and Resume path.
 
+**Using the MCP server.** Needs the same BigQuery and Postgres setup as
+above, but not `GEMINI_API_KEY` — the connecting client's own model does
+the reasoning. The repo's `.mcp.json` registers it for Claude Code
+automatically (open the repo in Claude Code and approve the
+`retail-analyst` server); any other client runs the same command:
+
+```bash
+uv run retail-mcp                                         # stdio server
+npx @modelcontextprotocol/inspector uv run retail-mcp     # browse/call tools in a web UI
+```
+
 **Inspecting internals (PII stripping, self-correct).** `retail-agent`
 prints only the final `Agent: ...` answer per turn on stdout — enough to
 use the agent, not enough to see the coded requirements actually fire.
@@ -964,4 +1048,8 @@ are incidental side effects of using LangGraph/a CLI, not deliberate
 implementations of either). The Conversation Store is the exception: it
 *is* coded (`conversation_store.py`, wired into `cli.py` — §3, §4 Resume
 path) even though it still isn't one of the eight numbered requirements
-and so still gets no row above.
+and so still gets no row above. The MCP Server is the same kind of
+exception — coded (`mcp_server.py`, §3), no row — and reinforces three
+rows that do exist: Safety (PII stripped server-side for any client),
+High-Stakes Oversight (the token delete flow), and Observability
+(`tool_call` events with `transport: "mcp"`).
