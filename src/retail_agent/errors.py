@@ -103,9 +103,9 @@ class ProviderAuthError(ProviderError):
 
 
 class ReportsStoreError(AgentError):
-    """Raised by `ReportsStore` when an underlying `sqlite3.Error` occurs
-    (disk error, locked database, etc.). Never self-correctable — no query
-    rewrite fixes a storage failure."""
+    """Raised by `ReportsStore` when an underlying `psycopg.Error` occurs
+    (connection lost, constraint violation, etc.). Never self-correctable —
+    no query rewrite fixes a storage failure."""
 
     self_correctable = False
     graceful_message = "I couldn't reach the saved reports store right now. Please try again shortly."

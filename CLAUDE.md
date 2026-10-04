@@ -27,12 +27,13 @@ Design decisions and HLD live in @docs/design.md (source of truth; update it whe
 Coded: Safety & PII Masking, Resilience & Graceful Error Handling,
 High-Stakes Oversight (Saved Reports Store + interrupt-based
 confirm-then-delete), Observability (structured JSON tracing +
-LangSmith) — four of the assignment's five prototype-eligible
-requirements, exceeding the "at least 2 of 5" minimum for deliverable 3.
-Docs only: Quality Assurance (golden-set eval harness) — eligible for the
-prototype but deliberately left as design only. Also docs only, and never
-eligible for the prototype in the first place: Hybrid Intelligence/Golden
-Bucket, Continuous Improvement, Agility/Persona Management.
+LangSmith), Quality Assurance (golden-set eval harness —
+`eval/golden_set.json` + `eval.py` + `scripts/run_eval.py`, deterministic
+checks + LLM-as-judge, run manually) — five of five of the assignment's
+prototype-eligible requirements, exceeding the "at least 2 of 5" minimum
+for deliverable 3. Docs only, and never eligible for the prototype in the
+first place: Hybrid Intelligence/Golden Bucket, Continuous Improvement,
+Agility/Persona Management.
 
 ## Workflow
 - Design before code. Don't write source until docs/design.md is agreed.
@@ -45,9 +46,11 @@ Bucket, Continuous Improvement, Agility/Persona Management.
   (4) Observability — structured JSON tracing (`tracing.py`, one line per
   LLM call/tool call/turn to stderr in Cloud-Logging-compatible shape) plus
   LangSmith auto-instrumentation (env vars only, off by default);
-  (5) polish — docs, clean-machine setup test.
-  A QA/eval harness is designed in docs/design.md but deliberately not
-  coded.
+  (5) polish — docs, clean-machine setup test;
+  (6) Quality Assurance — golden-set eval harness (`eval/golden_set.json`,
+  `eval.py`, `scripts/run_eval.py`): deterministic shape checks + an
+  LLM-as-judge rubric, run manually against live Gemini/BigQuery, never
+  part of `uv run pytest`'s default run.
 - Write tests for PII filtering and delete confirmation first.
 - Ask before adding a dependency.
 

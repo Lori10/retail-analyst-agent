@@ -269,26 +269,23 @@ instead of taking down the REPL loop (the same "no path crashes the CLI"
 guarantee §5 makes for every other store).
 
 The prototype's thread id is `f"cli-session-{owner}"` (`cli.py`'s
-`_thread_config`), namespaced by `owner` rather than a bare constant —
-this replaced an earlier version that used the fixed literal
-`"cli-session"` for every OS user. That was harmless for `ReportsStore`
-(its `owner` column is independent of `conversation_id`'s uniqueness),
-but not for `ConversationStore`: `conversations.conversation_id` is that
-table's primary key, so with a shared constant, the first OS user to run
-the CLI against a given Postgres instance would permanently "own" that
-row (`ON CONFLICT (conversation_id) DO UPDATE SET updated_at = now()`
-never reassigns `owner`), and every other OS user's messages would still
-get written — into the *same* `conversation_id` — but could never be read
-back by their own `owner`-scoped `get_messages` call. No cross-user
-leak (the owner check still blocks reading someone else's history either
-way), but a silent, permanent loss of resume for everyone except whoever
-got there first. Namespacing by `owner` gives each OS user their own
-`conversation_id`, closing that. One unrelated wrinkle persists
-regardless of this fix: `reports.conversation_id` reuses the same
-per-owner thread id, so `ReportsStore`'s `scope="conversation"` delete
-still degenerates to `scope="all"` for a single owner across restarts —
-a `ReportsStore` behavior, not something the Conversation Store causes
-or fixes.
+`_thread_config`), namespaced by `owner` rather than a bare constant. A
+bare constant would break specifically because of how `ConversationStore`
+is keyed: `conversations.conversation_id` is that table's primary key, so
+with a shared constant, the first OS user to run the CLI against a given
+Postgres instance would permanently "own" that row
+(`ON CONFLICT (conversation_id) DO UPDATE SET updated_at = now()` never
+reassigns `owner`), and every other OS user's messages would still get
+written — into the *same* `conversation_id` — but could never be read back
+by their own `owner`-scoped `get_messages` call. No cross-user leak (the
+owner check still blocks reading someone else's history either way), but a
+silent, permanent loss of resume for everyone except whoever got there
+first. Namespacing by `owner` gives each OS user their own
+`conversation_id`, avoiding this. One separate wrinkle remains:
+`reports.conversation_id` reuses the same per-owner thread id, so
+`ReportsStore`'s `scope="conversation"` delete still degenerates to
+`scope="all"` for a single owner across restarts — a `ReportsStore`
+behavior, not something the Conversation Store causes or fixes.
 
 **Extensibility — new tools and data sources.** New capabilities (chart
 generation, emailing reports, web search) fall out of the tool-calling
@@ -356,37 +353,22 @@ Gemini is the only provider and the tool set never changes mid-conversation.
 `max_retries=1` (not `0`!) disables the SDK's own retry loop — a documented
 quirk of the underlying Google SDK where `max_retries=0` is interpreted as
 "use the Google default" (5 retries) rather than "no retries" — so the
-`bounded_backoff` wrapper (§5) stays the single source of retry behavior,
-same principle the earlier `OpenRouterProvider`'s `max_retries=0` (for the
-`openai` SDK, where `0` genuinely means "no retries") once documented.
+`bounded_backoff` wrapper (§5) stays the single source of retry behavior.
 There is no circuit breaker and no fallback provider: with Gemini as the
 only provider, there's nowhere to fail over to, so a Gemini failure that
 survives backoff surfaces directly as a graceful error message (§5) instead
 of being routed anywhere else.
 
-This reverses an earlier decision recorded in
-[implementation-notes.md](implementation-notes.md#llm-provider-raw-sdks-vs-langchain-chat-model-wrappers)
-to talk to the Gemini/OpenRouter SDKs directly rather than through
-LangChain's chat model wrappers. That decision was made when a second
-provider (OpenRouter) existed and needed its own hand-rolled message/
-tool-schema translation module — LangChain's chat model interface would
-have made that translation unnecessary, at the cost of a direct request-
-shape control this project wanted to keep at the time. With OpenRouter
-removed, that trade-off no longer applies: there's no second provider's
-translation cost to avoid paying, and `langchain-google-genai`'s
-`ChatGoogleGenerativeAI` now classifies every provider failure into
-`langchain_core.exceptions`' own unified `ModelError` taxonomy
-(`ModelAuthenticationError`, `ModelRateLimitError`, `ModelAPIError`, etc.,
-each carrying an `is_retryable` flag) — a real provider-agnostic exception
-surface that didn't exist when the original raw-SDK decision was made, so
-the "exception classification is a wash" argument from that decision no
-longer holds either. See
-[implementation-notes.md](implementation-notes.md#llm-provider-raw-sdks-vs-langchain-chat-model-wrappers)
-for the full account of what changed. This also means adding or swapping a
-provider later is materially cheaper than it was: every LangChain chat
-model returns the same `AIMessage`/`ToolMessage` shapes, so `graph.py`,
-`tools.py`, and `cli.py` — which now speak that shape natively, not a
-Gemini-specific one — would need no changes; only `llm_provider.py`'s
+`langchain-google-genai`'s `ChatGoogleGenerativeAI` classifies every
+provider failure into `langchain_core.exceptions`' own unified `ModelError`
+taxonomy (`ModelAuthenticationError`, `ModelRateLimitError`,
+`ModelAPIError`, etc., each carrying an `is_retryable` flag) — a real,
+provider-agnostic exception surface that `llm_provider.py`'s
+`_classify_error`/`_is_transient_error` key off directly. Talking to Gemini
+through LangChain's chat model interface, rather than the raw SDK, also
+keeps adding or swapping a provider later cheap: every LangChain chat model
+returns the same `AIMessage`/`ToolMessage` shapes, so `graph.py`,
+`tools.py`, and `cli.py` need no changes; only `llm_provider.py`'s
 constructor and its exception-classification buckets would.
 
 **BigQuery tool wrapper.** `src/provided/bq_runner.py` was supplied by the
@@ -534,20 +516,17 @@ no credit card, 5k traces/month, 14-day retention), auto-instrumented
 purely via environment variables (`LANGSMITH_TRACING`,
 `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`) — no callback handler or other
 code anywhere in this repo, and tracing is simply off if those variables
-are unset (verified: an invalid/missing key logs its own warning and
-never breaks a turn, the same graceful-degradation property every other
-third-party dependency in this system has). This reverses what an earlier
-draft of this section said: self-hosted **Langfuse** was chosen instead of
-LangSmith specifically to avoid sending prompts/SQL/tool output to
-third-party SaaS by default. That reasoning no longer applies to *this*
-prototype — third-party data sharing was judged acceptable here, which
-made LangSmith the simpler choice (env vars only, and the native tool for
-this LangChain/LangGraph stack) with no meaningful downside once the PII
-objection is off the table. Production, run at a scale and audit posture
-where that objection matters more, could still choose to self-host a
-tracer instead — this is a deliberate prototype-only trade-off, not a
-claim that it's the right call at every scale. Whatever tracer is used,
-it must trace **post-PII-strip** data only: the LangChain messages
+are unset (an invalid/missing key logs its own warning and never breaks a
+turn, the same graceful-degradation property every other third-party
+dependency in this system has). This is a deliberate prototype-scope
+trade-off: sending prompts/SQL/tool output to a third-party SaaS is
+judged acceptable here, which makes LangSmith's env-var-only
+auto-instrumentation (and being the native tool for this LangChain/
+LangGraph stack) the simplest choice. A production deployment run at a
+scale or audit posture where third-party data sharing isn't acceptable
+should self-host a tracer instead (e.g. Langfuse) — same LangChain/
+LangGraph integration shape, different data-residency trade-off. Whatever
+tracer is used, it must trace **post-PII-strip** data only: the LangChain messages
 LangSmith observes are already post-strip by the time they exist
 (`BigQueryTool` strips before `_run_tool` ever builds a `ToolMessage`).
 Cloud Monitoring dashboards/alerts on top of the Cloud Logging stream
@@ -742,15 +721,39 @@ changelog reviewed by an engineer.
 
 **5. Resilience & Graceful Error Handling — coded.** See §5.
 
-**6. Quality Assurance — docs only** (eligible for the prototype,
-deliberately not coded — see §9). Offline golden eval set — representative
-questions with expected SQL shape and report themes, curated by a human
-analyst — scored by an LLM-as-judge rubric (right numbers, answers the
-actual question, no PII), periodically cross-checked against human
-grading, re-run as a regression gate before any prompt/persona/bucket
-change ships. UX would be evaluated from the same structured trace
-events Observability already captures (§3), rather than a separate
-survey mechanism.
+**6. Quality Assurance — coded.** Offline golden eval set (`eval/golden_set.json`,
+9 hand-curated questions, one per capability the assignment brief names:
+customer behavior, product performance, time-based metrics, a schema/
+structure question, a multi-step "why" question, report-with-action-items,
+a PII-probe safety case, an off-topic decline case, and a cross-segment
+comparison echoing the brief's own example) run through the real compiled
+graph by `src/retail_agent/eval.py` and scored two ways. Cheap deterministic
+checks run first — same "cheap check before spending an LLM call" pattern
+already used by the input guardrail and the SQL safety allowlist: was the
+expected tool (`run_query`/`get_schema`/neither) called, did the SQL touch
+an expected table, does the answer mention an expected keyword, and (for the
+PII-probe case) does the answer contain an email-shaped string at all,
+belt-and-suspenders on top of the BQ wrapper's own column stripping. Only
+then does an LLM-as-judge pass run — a bare, tool-unbound
+`ChatGoogleGenerativeAI` (never `GeminiProvider`, which binds the agent's own
+five tools) scoring the three dimensions this section always named: does the
+answer address the question asked, are its numbers/claims internally
+plausible, is there any PII-shaped content in it. `scripts/run_eval.py` is
+the manual entry point (`uv run python scripts/run_eval.py`) — it prints a
+pass/fail table, writes the full structured report to a JSON file so runs
+can be diffed over time (the practical form of "regression gate before any
+prompt/persona/bucket change ships"), and supports `--fail-under` for later
+CI wiring. Never run by `uv run pytest` — like `tests/integration/`, every
+case is a real, billed Gemini + BigQuery call, so this stays an explicit,
+manual action (see docs/implementation-notes.md for the full reasoning and
+the accepted gaps: 9 cases isn't statistically meaningful, table/keyword
+checks are loose shape checks rather than exact-SQL/exact-answer matching,
+and there's no ground-truth query/result diffing — the judge scores
+plausibility, not correctness against a known answer). Periodic human
+cross-checking of judge grading remains a process description, not code.
+UX would be
+evaluated from the same structured trace events Observability already
+captures (§3), rather than a separate survey mechanism.
 
 **7. Observability — coded.** See §3. Every `llm_call`/`tool_call`/`turn`
 JSON line carries `conversation_id`, so a full exchange can be
@@ -767,12 +770,15 @@ not by a code deploy.
 
 ## 7. Quality Assurance / Evaluation
 
-See requirement 6 above for the full approach. In short: a curated golden
-set + LLM-as-judge scoring (spot-checked by humans) as a pre-ship
+See requirement 6 above for the full approach and the coded harness
+(`eval/golden_set.json`, `src/retail_agent/eval.py`, `scripts/run_eval.py`).
+In short: a curated golden set + LLM-as-judge scoring as a pre-ship
 regression gate, and UX measured passively from production observability
-data rather than a separate instrumentation surface. No eval script,
-golden set, or judge rubric exists in this repo — this section describes
-the intended production approach only.
+data rather than a separate instrumentation surface. What's coded here is
+the prototype's version of that production approach — the periodic
+human-cross-check-of-judge-grading half stays a process description, not
+code, and there's no CI wiring or golden-SQL/result ground-truth diffing
+(docs/implementation-notes.md has the full list of accepted gaps).
 
 ## 8. Setup Instructions & Example Run
 
@@ -898,9 +904,6 @@ Type 'yes' to confirm deletion, or anything else to cancel.
 Agent: Deleted 1 report(s).
 ```
 
-Golden Bucket retrieval shown in earlier drafts of this example isn't in
-the prototype — see §9.
-
 Type `exit` or `quit` to leave the REPL (Ctrl-D/Ctrl-C also work).
 Running `uv run retail-agent` again afterward resumes this same
 conversation rather than starting blank: `main()` loads it from the
@@ -939,18 +942,17 @@ view; short of that, `logging.basicConfig`'s existing console output
 | 3. High-Stakes Oversight | **Coded** — Postgres-backed Saved Reports Store (`ReportsStore`/`psycopg`) + `interrupt()`/`Command(resume=...)`-based confirm-then-delete (`resolve_delete` node) | Same store technology as the prototype (Cloud SQL for Postgres instead of local/docker Postgres); real per-manager auth resolving `owner` instead of the OS username |
 | 4. Continuous Improvement | Docs only | Firestore preference store; human-gated system learning |
 | 5. Resilience & Error Handling | **Coded** — typed errors, self-correct, backoff | Same, at scale |
-| 6. Quality Assurance | Docs only — eligible for the prototype, deliberately not coded | Golden eval set + scoring script, judge-drift audits |
+| 6. Quality Assurance | **Coded** — `eval/golden_set.json` (9 cases) + deterministic checks + LLM-as-judge harness (`eval.py`, `scripts/run_eval.py`), run manually as a regression gate | Same approach at scale, wired into CI, with judge-drift audits and ground-truth query/result diffing |
 | 7. Observability | **Coded** — `tracing.py`'s `llm_call`/`tool_call`/`turn` JSON events (Cloud-Logging-shaped, stderr) + LangSmith auto-instrumentation (free Developer tier, env vars only) | Same structured logs to real Cloud Logging + Monitoring dashboards/alerts on top; LangSmith or a self-hosted tracer, depending on whether the prototype's no-third-party-SaaS trade-off still applies at that scale |
 | 8. Agility (Persona) | Docs only | Firestore/Cloud Storage config, admin surface |
 
-4 of 8 requirements are coded (all four eligible for the prototype per
-the assignment's deliverable-3 list, which allows any 2 of 5). The one
-remaining eligible requirement (Quality Assurance) is a deliberate scope
-decision, not a time cutoff — the build order (see `CLAUDE.md`) adds
-Observability after High-Stakes Oversight, then stops. The remaining 3
-requirements (Hybrid Intelligence, Continuous Improvement, Agility) were
-never in the assignment's prototype-eligible list, so they're designed
-here in full but were never candidates for coding either way.
+5 of 8 requirements are coded — all five of the assignment's
+prototype-eligible list (deliverable 3 allows any 2 of 5), following the
+build order in `CLAUDE.md`, which adds Quality Assurance as its final slice
+after Observability. The remaining 3 requirements (Hybrid Intelligence,
+Continuous Improvement, Agility) were never in the assignment's
+prototype-eligible list, so they're designed here in full but were never
+candidates for coding either way.
 
 This matrix tracks the eight numbered requirements only. Architecture
 components that don't map onto one of them are argued in §3 rather than

@@ -1,6 +1,7 @@
 import getpass
 import json
 import logging
+import os
 import sys
 import time
 import uuid
@@ -20,6 +21,23 @@ from retail_agent.reports_store import ReportsStore
 from retail_agent.tracing import configure_tracing, log_event
 
 logger = logging.getLogger(__name__)
+
+# Cosmetic only — never gates behavior, just how the same text is displayed.
+# Respects NO_COLOR (https://no-color.org) and disables itself when stdout
+# isn't a terminal (piped to a file, redirected for the eval harness, etc.).
+_COLOR_ENABLED = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+# "gray" is SGR 90 (bright black), not SGR 2 (faint) — faint support/contrast
+# is inconsistent across terminals and can render progress lines unreadably
+# low-contrast; 90 is a real, well-supported foreground color instead.
+_ANSI = {"gray": "90", "yellow": "33", "cyan": "36", "red": "31"}
+
+
+def _color(text: str, name: str) -> str:
+    """Wrap `text` in an ANSI color code, or return it unchanged if color is
+    disabled (`NO_COLOR` set, or stdout isn't a terminal)."""
+    if not _COLOR_ENABLED:
+        return text
+    return f"\033[{_ANSI[name]}m{text}\033[0m"
 
 
 class StartupError(Exception):
@@ -300,10 +318,14 @@ def _run_turn(
             conversation/owner in the LangSmith UI.
 
     Returns:
-        A `(final_message, awaiting_confirmation)` pair, exactly as the
-        caller's inlined loop previously produced: `final_message` is the
-        turn's terminal `AIMessage` (`None` if the turn just paused on a
-        delete confirmation), `awaiting_confirmation` says whether it did.
+        A `(final_message, awaiting_confirmation, outcome)` triple:
+        `final_message` is the turn's terminal `AIMessage` (`None` if the
+        turn just paused on a delete confirmation), `awaiting_confirmation`
+        says whether it did, and `outcome` is the same value logged in the
+        `turn` trace event (`"answered"`, `"blocked"`, `"give_up"`,
+        `"resolve_delete"`, or `"delete_pending"`) — `main()` uses it to
+        decide whether the response prints as a normal answer or a
+        rejection/error.
 
     Raises:
         AgentError: Re-raised unchanged after being traced.
@@ -323,13 +345,13 @@ def _run_turn(
     try:
         for update in graph.stream(stream_input, config=run_config, stream_mode="updates"):
             if "__interrupt__" in update:
-                print(_format_confirmation_prompt(update["__interrupt__"][0].value))
+                print(_color(_format_confirmation_prompt(update["__interrupt__"][0].value), "yellow"), flush=True)
                 awaiting_confirmation = True
                 continue
             ((node_name, _output),) = update.items()
             progress, message = _stream_progress(update)
             if progress:
-                print(progress)
+                print(_color(progress, "gray"), flush=True)
             if message is not None:
                 final_message, final_node = message, node_name
     except AgentError as exc:
@@ -355,7 +377,7 @@ def _run_turn(
             self_correct_attempt=state_values.get("self_correct_attempts", 0),
         )
 
-    return final_message, awaiting_confirmation
+    return final_message, awaiting_confirmation, outcome
 
 
 def _build_graph(config):
@@ -467,21 +489,25 @@ def main() -> None:
         awaiting_confirmation = False
         turn_id = str(uuid.uuid4())
         try:
-            final_message, awaiting_confirmation = _run_turn(
+            final_message, awaiting_confirmation, outcome = _run_turn(
                 graph, stream_input, thread_config, turn_id, user_input, owner
             )
         except AgentError as exc:
-            print(f"Agent: Sorry, I couldn't complete that — {exc}")
+            print(_color(f"Agent: Sorry, I couldn't complete that — {exc}", "red"), flush=True)
             continue
         except Exception as exc:
-            print(f"Agent: Something went wrong on my end ({type(exc).__name__}). Please try again.")
+            print(
+                _color(f"Agent: Something went wrong on my end ({type(exc).__name__}). Please try again.", "red"),
+                flush=True,
+            )
             continue
 
         if awaiting_confirmation:
             continue
 
         response_text = _response_text(final_message)
-        print(f"Agent: {response_text}")
+        color = "red" if outcome in ("blocked", "give_up") else "cyan"
+        print(_color(f"Agent: {response_text}", color), flush=True)
 
         # Appended after the response is already on screen, and only for a
         # turn that actually completed (never mid-interrupt) — a store
