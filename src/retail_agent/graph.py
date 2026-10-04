@@ -14,6 +14,7 @@ from retail_agent.bq_tool import BigQueryTool, query_payload
 from retail_agent.errors import AgentError, GuardrailBlockedError, graceful_message_for
 from retail_agent.guardrail import check_user_input
 from retail_agent.llm_provider import GeminiProvider
+from retail_agent.mcp_client import McpToolHub
 from retail_agent.reports_store import ReportsStore
 from retail_agent.tracing import log_event
 
@@ -72,9 +73,16 @@ class AgentState(TypedDict):
 
 
 def _run_tool(
-    bq_tool: BigQueryTool, reports_store: ReportsStore, owner: str, conversation_id: str, name: str, args: dict
+    bq_tool: BigQueryTool,
+    reports_store: ReportsStore,
+    owner: str,
+    conversation_id: str,
+    name: str,
+    args: dict,
+    mcp_hub: McpToolHub | None = None,
 ) -> dict:
-    """Dispatch one model-requested tool call to `BigQueryTool` or `ReportsStore`.
+    """Dispatch one model-requested tool call to `BigQueryTool`,
+    `ReportsStore`, or an external MCP server via `mcp_hub`.
 
     `delete_reports` is deliberately not handled here — it's unreachable by
     construction, since `route_after_model` diverts any round containing it
@@ -87,6 +95,7 @@ def _run_tool(
         conversation_id: The LangGraph thread id, recorded on saved reports.
         name: Tool name.
         args: The model-supplied arguments for that tool.
+        mcp_hub: External MCP tools, if any were configured.
 
     Returns:
         A JSON-safe payload suitable for a `ToolMessage`.
@@ -110,6 +119,8 @@ def _run_tool(
         return {"saved": True, "id": report["id"], "title": report["title"]}
     if name == "list_reports":
         return {"reports": reports_store.list_reports(owner)}
+    if mcp_hub is not None and mcp_hub.has_tool(name):
+        return mcp_hub.call(name, args)
     return {"error": f"Unknown tool: {name}"}
 
 
@@ -119,6 +130,7 @@ def build_graph(
     reports_store: ReportsStore,
     owner: str,
     system_instruction: str,
+    mcp_hub: McpToolHub | None = None,
 ):
     """Compile the agent's LangGraph tool-calling loop.
 
@@ -131,6 +143,9 @@ def build_graph(
             call (never cross-user).
         system_instruction: The system prompt sent on every `call_model`
             invocation.
+        mcp_hub: External MCP tools dispatched by the `tools` node; `None`
+            (the default) means built-in tools only. The provider must have
+            been built with the same hub's `tool_specs()`.
 
     Returns:
         A compiled `StateGraph` with in-memory checkpointing, ready for
@@ -251,8 +266,13 @@ def build_graph(
 
         for call in last.tool_calls:
             call_start = time.monotonic()
+            # Tagged like the MCP server's own events, so external calls can
+            # be filtered out of the trace stream.
+            transport = {"transport": "mcp"} if mcp_hub is not None and mcp_hub.has_tool(call["name"]) else {}
             try:
-                payload = _run_tool(bq_tool, reports_store, owner, thread_id, call["name"], call["args"] or {})
+                payload = _run_tool(
+                    bq_tool, reports_store, owner, thread_id, call["name"], call["args"] or {}, mcp_hub
+                )
             except AgentError as exc:
                 payload = {"error": str(exc), "error_class": type(exc).__name__}
                 errors.append(
@@ -267,6 +287,7 @@ def build_graph(
                     self_correct_attempts += 1
                 log_event(
                     "tool_call",
+                    **transport,
                     conversation_id=thread_id,
                     turn_id=turn_id,
                     tool=call["name"],
@@ -288,6 +309,7 @@ def build_graph(
                     empty_result_checked = True
                 log_event(
                     "tool_call",
+                    **transport,
                     conversation_id=thread_id,
                     turn_id=turn_id,
                     tool=call["name"],

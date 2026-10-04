@@ -122,6 +122,25 @@ class ConversationStoreError(AgentError):
     graceful_message = "I couldn't reach the conversation history store right now. Please try again shortly."
 
 
+class ExternalToolError(AgentError):
+    """Raised by `McpToolHub.call` when an external MCP server reports a tool
+    error (`CallToolResult.is_error`). Self-correctable: as with a BigQuery
+    syntax error, the message usually names the bad argument, and the model
+    can retry with different arguments."""
+
+    self_correctable = True
+    graceful_message = "An external tool kept rejecting the request, so I couldn't finish answering."
+
+
+class ExternalToolUnavailableError(AgentError):
+    """Raised by `McpToolHub.call` when an external MCP server can't be
+    reached at all — its session has died or the call timed out. Not
+    self-correctable: different arguments won't bring the server back."""
+
+    self_correctable = False
+    graceful_message = "That external tool isn't available right now. Please try again shortly."
+
+
 class GuardrailBlockedError(AgentError):
     """Raised by `guardrail.check_user_input` when a user message matches a
     known prompt-injection/jailbreak pattern.
@@ -153,6 +172,8 @@ _ERROR_CLASSES_BY_NAME = {
         GuardrailBlockedError,
         ReportsStoreError,
         ConversationStoreError,
+        ExternalToolError,
+        ExternalToolUnavailableError,
     )
 }
 

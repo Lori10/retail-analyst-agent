@@ -2,6 +2,8 @@ from retail_agent import errors
 from retail_agent.errors import (
     AgentError,
     ConversationStoreError,
+    ExternalToolError,
+    ExternalToolUnavailableError,
     GuardrailBlockedError,
     ProviderAuthError,
     ProviderError,
@@ -16,7 +18,7 @@ from retail_agent.errors import (
     graceful_message_for,
 )
 
-SELF_CORRECTABLE = {SQLSafetyError, QueryTooExpensiveError, QuerySyntaxError}
+SELF_CORRECTABLE = {SQLSafetyError, QueryTooExpensiveError, QuerySyntaxError, ExternalToolError}
 NOT_SELF_CORRECTABLE = {
     AgentError,
     QueryExecutionError,
@@ -28,6 +30,7 @@ NOT_SELF_CORRECTABLE = {
     GuardrailBlockedError,
     ReportsStoreError,
     ConversationStoreError,
+    ExternalToolUnavailableError,
 }
 
 

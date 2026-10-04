@@ -661,3 +661,70 @@ pays the deferred cost instead (~8–10s for the first `run_query`), where
 no connect timeout applies. A failed lazy build is not cached and its
 `StartupError` reaches the client as a readable tool error ("Is Postgres
 running?"), so fixing the cause mid-session works without reconnecting.
+
+## MCP Client Implementation Notes
+
+Companion detail to design.md §3's MCP Client section.
+
+**Why not `langchain-mcp-adapters`.** It's the standard way to load MCP
+tools into LangChain/LangGraph, but every published release (latest
+0.3.2) requires `mcp<2.0.0`, and this repo is on `mcp` v2 for the server
+side. Downgrading would have meant rewriting `mcp_server.py` against the
+v1 SDK. `mcp_client.py` instead uses the v2 SDK's own `mcp.Client`, which
+already accepts a `StdioServerParameters`, a URL, or (in tests) an
+in-process `MCPServer`, so no dependency was added. What the adapter
+would have provided is small here: tool schemas become the same plain
+dicts `tools.py` already binds, and dispatch is one extra branch in
+`graph._run_tool`. Worth revisiting if the adapter ships `mcp` v2
+support.
+
+**Sync graph, async client: one background loop.** The graph and
+`GeminiProvider` are synchronous; `mcp.Client` is async. `McpToolHub`
+runs one asyncio loop on a daemon thread and bridges each call with
+`asyncio.run_coroutine_threadsafe(...).result(timeout)`. Each server's
+session is held open by its own long-running task, because the client's
+context manager is anyio-based and has to be entered and exited in the
+same task. A stdio server is a long-lived subprocess, so this also avoids
+paying its startup on every call (`uvx mcp-server-time` takes seconds
+cold). The hub is closed via `atexit`, which ends the sessions and the
+subprocesses with them.
+
+**Per-tool schema check.** Gemini's function declarations accept a subset
+of JSON Schema. An unresolved `$ref`, for example, makes
+`langchain-google-genai`'s conversion raise. Since `bind_tools` converts
+every tool at once, one bad external schema would break the built-in
+tools too. Each external spec is therefore converted on its own at
+startup and skipped (logged as `mcp_tool_skipped`) if it fails.
+
+**Destructive-tool filter uses explicit `destructiveHint: true` only.**
+The MCP spec's default for `destructiveHint` is `true` whenever a tool
+isn't marked read-only. Applying that default literally would skip
+nearly every unannotated tool, which is most of them in practice. The
+filter therefore skips only tools that *declare* themselves destructive,
+and the per-server `"tools"` allowlist is the real control: it's what
+the example config uses, and it's what anyone wiring in a server they
+don't fully trust should use.
+
+**External server stderr is hidden by default.** A stdio server inherits
+the CLI's terminal for stderr. Some servers log there freely; the
+reference time server, for instance, logs a long pydantic validation
+warning when the v2 client sends its `server/discover` probe before
+falling back to `initialize`. That output would interleave with the
+chat, so it goes to `/dev/null` unless `LOG_LEVEL=DEBUG`.
+
+**Accepted gaps, not fixed:**
+
+- **No reconnect.** A session that dies mid-process stays dead; calls to
+  its tools raise `ExternalToolUnavailableError` until the CLI is
+  restarted. Fine for a local CLI; a long-running service would need
+  reconnect with backoff.
+- **Tool list is fixed at startup.** `notifications/tools/list_changed`
+  is ignored, because Gemini's tools are bound once in
+  `GeminiProvider.__init__`.
+- **Text and structured content only.** Image/audio/resource blocks in a
+  tool result are replaced by a placeholder (`[image content omitted]`).
+- **No elicitation or sampling.** A server that asks the client to
+  elicit user input or to sample the model gets the SDK's default
+  refusal; the CLI has no path to answer either mid-tool-call.
+- **The eval harness doesn't load external tools.** `eval.py` builds the
+  graph without a hub, so the golden set measures the built-in agent only.
