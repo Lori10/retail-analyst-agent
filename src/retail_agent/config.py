@@ -16,7 +16,9 @@ class Config:
 
     Attributes:
         project_id: GCP project ID/number BigQuery queries run against.
-        gemini_api_key: Gemini (AI Studio) API key.
+        gemini_api_key: Gemini (AI Studio) API key. `None` only when
+            loaded with `require_gemini=False` (the MCP server, which never
+            calls Gemini).
         gemini_model: Gemini model name.
         max_bytes_billed: BigQuery dry-run byte cap.
         row_limit: Maximum rows fetched per query.
@@ -30,7 +32,7 @@ class Config:
     """
 
     project_id: str
-    gemini_api_key: str
+    gemini_api_key: str | None
     gemini_model: str
     max_bytes_billed: int
     row_limit: int
@@ -40,13 +42,18 @@ class Config:
     trace_log_destination: str
 
 
-def load_config() -> Config:
+def load_config(require_gemini: bool = True) -> Config:
     """Load and validate agent configuration from the environment.
 
     Reads `.env` (via `python-dotenv`) first, then `os.environ` — real
     environment variables always take precedence over `.env`. Every
     optional variable has a default; only `GOOGLE_CLOUD_PROJECT` and
     `GEMINI_API_KEY` are required.
+
+    Args:
+        require_gemini: Whether `GEMINI_API_KEY` is required. The MCP server
+            (`mcp_server.py`) passes `False` — it exposes the data tools to
+            an external client's own model and never calls Gemini itself.
 
     Returns:
         A populated `Config`.
@@ -60,14 +67,10 @@ def load_config() -> Config:
 
     project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
-    missing = [
-        name
-        for name, value in [
-            ("GOOGLE_CLOUD_PROJECT", project_id),
-            ("GEMINI_API_KEY", gemini_api_key),
-        ]
-        if not value
-    ]
+    required = [("GOOGLE_CLOUD_PROJECT", project_id)]
+    if require_gemini:
+        required.append(("GEMINI_API_KEY", gemini_api_key))
+    missing = [name for name, value in required if not value]
     if missing:
         raise ConfigError(f"Missing required environment variable(s): {', '.join(missing)}")
 

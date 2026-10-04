@@ -1,3 +1,4 @@
+import json
 import logging
 
 import tenacity
@@ -104,6 +105,28 @@ def _call_bq(fn, *, stage: str):
         typed = _classify(exc)
         logger.warning("bq_call_failed", extra={"stage": stage, "error_class": type(typed).__name__})
         raise typed from exc
+
+
+def query_payload(result: dict) -> dict:
+    """Shape a `BigQueryTool.run_query` result into a JSON-safe tool payload.
+
+    Shared by every caller that hands query results to a model — the
+    LangGraph `tools` node and the MCP server — so both return the same
+    shape. Routes rows through JSON (not `.to_dict()`) so numpy/Timestamp
+    values become plain JSON-safe types.
+
+    Args:
+        result: The dict `run_query` returns (already PII-stripped).
+
+    Returns:
+        A dict with `row_count`, `redacted_columns`, and `rows` (a list of
+        plain dicts, one per row).
+    """
+    return {
+        "row_count": result["row_count"],
+        "redacted_columns": result["redacted_columns"],
+        "rows": json.loads(result["dataframe"].to_json(orient="records", date_format="iso")),
+    }
 
 
 class BigQueryTool:

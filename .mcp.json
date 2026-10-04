@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "retail-analyst": {
+      "command": "uv",
+      "args": ["run", "retail-mcp"]
+    }
+  }
+}

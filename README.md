@@ -193,6 +193,26 @@ variance):
 [docs/design.md §7](docs/design.md#7-quality-assurance--evaluation),
 [docs/implementation-notes.md](docs/implementation-notes.md#quality-assurance-golden-set-eval-harness-implementation-notes).
 
+## MCP server
+
+The same data and reports tools are also available to any MCP client —
+Claude Code, Claude Desktop, MCP Inspector — through a stdio MCP server:
+
+```bash
+uv run retail-mcp                                         # what a client launches
+npx @modelcontextprotocol/inspector uv run retail-mcp     # try the tools in a browser
+```
+
+Opening this repo in Claude Code picks it up from `.mcp.json`. It needs
+BigQuery and Postgres as above, but no Gemini key — the client's model
+does the reasoning. Every guarantee is enforced under the tool, not left
+to the client: PII columns are stripped server-side, reports are
+owner-scoped, and deletion is two calls — `preview_delete` returns the
+exact candidates plus a short-lived token, and `confirm_delete(token)`
+deletes exactly those, once. Design and trade-offs:
+[docs/design.md §3](docs/design.md#3-component-reasoning),
+[docs/implementation-notes.md](docs/implementation-notes.md#mcp-server-implementation-notes).
+
 ## Testing
 
 ```bash
@@ -210,7 +230,6 @@ run them explicitly.
 
 ## Docs
 
-- [docs/assignment.md](docs/assignment.md) — the original brief
 - [docs/design.md](docs/design.md) — High-Level Design: architecture,
   component reasoning, data flow, error handling, requirement-by-requirement
   coverage, and full setup instructions (source of truth — start here)

@@ -10,7 +10,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
-from retail_agent.bq_tool import BigQueryTool
+from retail_agent.bq_tool import BigQueryTool, query_payload
 from retail_agent.errors import AgentError, GuardrailBlockedError, graceful_message_for
 from retail_agent.guardrail import check_user_input
 from retail_agent.llm_provider import GeminiProvider
@@ -71,21 +71,6 @@ class AgentState(TypedDict):
     blocked: bool
 
 
-def _dataframe_to_records(df) -> list[dict]:
-    """Convert a query result DataFrame into JSON-safe records.
-
-    Routes through JSON (not `.to_dict()`) so numpy/Timestamp values become
-    plain JSON-safe types before they're embedded in a `ToolMessage`.
-
-    Args:
-        df: The (already PII-stripped) query result DataFrame.
-
-    Returns:
-        A list of plain dicts, one per row.
-    """
-    return json.loads(df.to_json(orient="records", date_format="iso"))
-
-
 def _run_tool(
     bq_tool: BigQueryTool, reports_store: ReportsStore, owner: str, conversation_id: str, name: str, args: dict
 ) -> dict:
@@ -111,12 +96,7 @@ def _run_tool(
             `call_tools` is what actually catches this.
     """
     if name == "run_query":
-        result = bq_tool.run_query(args["sql"])
-        return {
-            "row_count": result["row_count"],
-            "redacted_columns": result["redacted_columns"],
-            "rows": _dataframe_to_records(result["dataframe"]),
-        }
+        return query_payload(bq_tool.run_query(args["sql"]))
     if name == "get_schema":
         return {"columns": bq_tool.get_schema(args["table_name"])}
     if name == "save_report":

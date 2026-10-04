@@ -380,6 +380,62 @@ def _run_turn(
     return final_message, awaiting_confirmation, outcome
 
 
+def build_bq_tool(config) -> BigQueryTool:
+    """Construct an authenticated `BigQueryTool` from config.
+
+    Shared by the CLI and the MCP server (`mcp_server.py`).
+
+    Args:
+        config: A loaded `Config`.
+
+    Returns:
+        A ready `BigQueryTool`.
+
+    Raises:
+        StartupError: BigQuery credentials are missing/invalid, or the
+            client otherwise fails to construct.
+    """
+    try:
+        client = bigquery.Client(project=config.project_id)
+    except DefaultCredentialsError as exc:
+        raise StartupError(
+            "No Google Cloud credentials found. Run "
+            "'gcloud auth application-default login' and try again."
+        ) from exc
+    except Exception as exc:
+        raise StartupError(f"Could not connect to BigQuery: {exc}") from exc
+
+    return BigQueryTool(
+        client=client,
+        max_bytes_billed=config.max_bytes_billed,
+        row_limit=config.row_limit,
+        timeout_seconds=config.query_timeout_seconds,
+    )
+
+
+def build_reports_store(config) -> ReportsStore:
+    """Connect to the Saved Reports Store.
+
+    Shared by the CLI and the MCP server (`mcp_server.py`).
+
+    Args:
+        config: A loaded `Config`.
+
+    Returns:
+        A connected `ReportsStore`.
+
+    Raises:
+        StartupError: Postgres is unreachable or the connection fails.
+    """
+    try:
+        return ReportsStore(config.reports_database_url)
+    except Exception as exc:
+        raise StartupError(
+            f"Could not connect to the saved reports database: {exc}. Is Postgres running "
+            "('docker compose up -d postgres')?"
+        ) from exc
+
+
 def _build_graph(config):
     """Construct the BigQuery client, LLM provider, compiled graph, and
     Conversation Store.
@@ -396,29 +452,8 @@ def _build_graph(config):
         StartupError: BigQuery credentials are missing/invalid, or a
             client/store otherwise fails to construct.
     """
-    try:
-        client = bigquery.Client(project=config.project_id)
-    except DefaultCredentialsError as exc:
-        raise StartupError(
-            "No Google Cloud credentials found. Run "
-            "'gcloud auth application-default login' and try again."
-        ) from exc
-    except Exception as exc:
-        raise StartupError(f"Could not connect to BigQuery: {exc}") from exc
-
-    bq_tool = BigQueryTool(
-        client=client,
-        max_bytes_billed=config.max_bytes_billed,
-        row_limit=config.row_limit,
-        timeout_seconds=config.query_timeout_seconds,
-    )
-    try:
-        reports_store = ReportsStore(config.reports_database_url)
-    except Exception as exc:
-        raise StartupError(
-            f"Could not connect to the saved reports database: {exc}. Is Postgres running "
-            "('docker compose up -d postgres')?"
-        ) from exc
+    bq_tool = build_bq_tool(config)
+    reports_store = build_reports_store(config)
 
     # Same Postgres instance/database as ReportsStore (docs/design.md §3
     # "Conversation Store") — no separate connection string.
