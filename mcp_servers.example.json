@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "time": {
+      "command": "uvx",
+      "args": ["mcp-server-time"],
+      "tools": ["get_current_time"]
+    }
+  }
+}

@@ -61,18 +61,20 @@ class GeminiProvider:
     the sole provider, with no fallback provider and no circuit breaker
     (see docs/design.md §3 for why)."""
 
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(self, api_key: str, model: str, extra_tools: list[dict] = ()) -> None:
         """Build the bound chat model.
 
         Args:
             api_key: Gemini (AI Studio) API key.
             model: Gemini model name.
+            extra_tools: Tool schemas bound alongside the built-in `TOOLS` —
+                external MCP tools from `McpToolHub.tool_specs()`.
         """
         # max_retries=1 (not 0!) disables the SDK's own retry loop — a
         # documented quirk of the underlying Google SDK where 0 means "use
         # the Google default" (5 retries) rather than "no retries". Keeping
         # `bounded_backoff` below as the single source of retry behavior.
-        self._model = ChatGoogleGenerativeAI(model=model, api_key=api_key, max_retries=1).bind_tools(TOOLS)
+        self._model = ChatGoogleGenerativeAI(model=model, api_key=api_key, max_retries=1).bind_tools([*TOOLS, *extra_tools])
 
     @bounded_backoff(retry=tenacity.retry_if_exception(_is_transient_error), attempts=2, logger=logger)
     def _generate_raw(self, messages: list[BaseMessage]) -> AIMessage:

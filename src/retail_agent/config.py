@@ -29,6 +29,9 @@ class Config:
         trace_log_destination: Where structured JSON tracing events
             (docs/design.md §3 Observability) are written — `"stderr"`/
             `"stdout"`, or a filesystem path. See `tracing.configure_tracing`.
+        mcp_servers_path: Path to a `.mcp.json`-shaped list of external MCP
+            servers whose tools the agent should load (`mcp_client.py`), or
+            `None` to load none.
     """
 
     project_id: str
@@ -40,6 +43,7 @@ class Config:
     log_level: str
     reports_database_url: str
     trace_log_destination: str
+    mcp_servers_path: str | None = None
 
 
 def load_config(require_gemini: bool = True) -> Config:
@@ -86,4 +90,5 @@ def load_config(require_gemini: bool = True) -> Config:
             "REPORTS_DATABASE_URL", "postgresql://retail_agent:retail_agent@localhost:5432/retail_agent_reports"
         ),
         trace_log_destination=os.environ.get("TRACE_LOG_DESTINATION", "stderr"),
+        mcp_servers_path=os.environ.get("AGENT_MCP_SERVERS") or None,
     )

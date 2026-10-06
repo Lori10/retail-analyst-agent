@@ -41,6 +41,11 @@ Also coded, beyond the eight requirements: an MCP server
 deletion split into `preview_delete`/`confirm_delete` (single-use,
 expiring, owner-bound token) since an MCP client never passes through
 the graph's `interrupt()`.
+The reverse direction is coded too: an MCP client (`mcp_client.py`,
+`McpToolHub`) that lets the CLI agent load tools from external MCP
+servers listed in `AGENT_MCP_SERVERS` (a `.mcp.json`-shaped file; see
+`mcp_servers.example.json`), built on the `mcp` v2 SDK's own `Client`
+because `langchain-mcp-adapters` pins `mcp<2`.
 
 ## Workflow
 - Design before code. Don't write source until docs/design.md is agreed.
@@ -61,6 +66,9 @@ the graph's `interrupt()`.
   (7) MCP server — the same tools over stdio for external MCP clients,
   every guarantee (PII strip, owner scope, delete confirmation) enforced
   server-side; the CLI agent keeps calling the tools in-process.
+  (8) MCP client — the agent as an MCP host: external servers' tools
+  bound next to the built-ins, namespaced `<server>__<tool>`, destructive
+  tools skipped unless allowlisted, unreachable servers skipped.
 - Write tests for PII filtering and delete confirmation first.
 - Ask before adding a dependency.
 

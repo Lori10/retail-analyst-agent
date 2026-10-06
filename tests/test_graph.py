@@ -5,6 +5,8 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from retail_agent.errors import (
+    ExternalToolError,
+    ExternalToolUnavailableError,
     GuardrailBlockedError,
     ProviderError,
     QueryPermissionError,
@@ -647,3 +649,88 @@ def test_delete_reports_store_error_declines_gracefully():
     assert provider.calls == 1
     assert "__interrupt__" not in result
     assert "couldn't reach" in _final_text(result).lower()
+
+
+# --- External MCP tools (McpToolHub) ------------------------------------------
+
+
+class FakeMcpHub:
+    """Stands in for `McpToolHub`: one external tool whose results are
+    scripted, so graph dispatch is tested without any MCP session."""
+
+    def __init__(self, script):
+        self._script = list(script)
+        self.calls = []
+
+    def has_tool(self, name):
+        return name == "time__get_current_time"
+
+    def call(self, name, args):
+        self.calls.append((name, args))
+        item = self._script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _time_call(id_, timezone="UTC"):
+    return {"name": "time__get_current_time", "args": {"timezone": timezone}, "id": id_}
+
+
+def test_external_tool_call_is_dispatched_to_the_hub():
+    hub = FakeMcpHub([{"result": "2026-10-04"}])
+    provider = FakeProvider(
+        [_model_response(tool_call=_time_call("call-1")), _model_response(text="Today is 2026-10-04.")]
+    )
+    graph = build_graph(
+        provider, FakeBigQueryTool(), FakeReportsStore(), "test-owner", system_instruction="test", mcp_hub=hub
+    )
+
+    result = _invoke(graph, "mcp1", "What's today's date?")
+
+    assert hub.calls == [("time__get_current_time", {"timezone": "UTC"})]
+    assert _function_response_payload(result, "call-1") == {"result": "2026-10-04"}
+    assert _final_text(result) == "Today is 2026-10-04."
+
+
+def test_external_tool_error_feeds_the_self_correct_loop():
+    hub = FakeMcpHub([ExternalToolError("unknown timezone 'Mars'"), {"result": "2026-10-04"}])
+    provider = FakeProvider(
+        [
+            _model_response(tool_call=_time_call("call-1", timezone="Mars")),
+            _model_response(tool_call=_time_call("call-2")),  # model fixes its argument
+            _model_response(text="Today is 2026-10-04."),
+        ]
+    )
+    graph = build_graph(
+        provider, FakeBigQueryTool(), FakeReportsStore(), "test-owner", system_instruction="test", mcp_hub=hub
+    )
+
+    result = _invoke(graph, "mcp2", "What's today's date?")
+
+    assert _function_response_payload(result, "call-1")["error_class"] == "ExternalToolError"
+    assert _final_text(result) == "Today is 2026-10-04."
+
+
+def test_unavailable_external_tool_gives_up_gracefully():
+    hub = FakeMcpHub([ExternalToolUnavailableError("session closed")])
+    provider = FakeProvider([_model_response(tool_call=_time_call("call-1"))])
+    graph = build_graph(
+        provider, FakeBigQueryTool(), FakeReportsStore(), "test-owner", system_instruction="test", mcp_hub=hub
+    )
+
+    result = _invoke(graph, "mcp3", "What's today's date?")
+
+    assert provider.calls == 1
+    assert _final_text(result) == ExternalToolUnavailableError.graceful_message
+
+
+def test_external_tool_name_without_a_hub_is_unknown():
+    provider = FakeProvider(
+        [_model_response(tool_call=_time_call("call-1")), _model_response(text="I can't check the date.")]
+    )
+    graph = build_graph(provider, FakeBigQueryTool(), FakeReportsStore(), "test-owner", system_instruction="test")
+
+    result = _invoke(graph, "mcp4", "What's today's date?")
+
+    assert "Unknown tool" in _function_response_payload(result, "call-1")["error"]
