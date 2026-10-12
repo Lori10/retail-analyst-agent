@@ -123,8 +123,8 @@ covered by defense-in-depth (the input-side guardrail and the IAM role), not
 by this function.
 
 The registry itself was verified against the live `users` schema during
-prototype development, not just typed from the assignment brief — that check
-caught two columns absent from the brief's original PII list
+prototype development, not just typed from a list of obvious fields — that
+check caught two columns such a list would have missed
 (`postal_code`, and `user_geom`, a GEOGRAPHY point encoding the same
 location `latitude`/`longitude` carry) before they could leak. That's
 exactly the schema-drift scenario this control needs to survive; in
@@ -156,8 +156,7 @@ equivalent request phrased differently enough to dodge every pattern (a
 production system would replace or supplement it with a small
 classification pass — "analysis | off-topic | malicious" — at the cost of
 one extra cheap LLM call per turn). It also does not attempt the broader
-off-topic classification named in the assignment brief ("politely decline
-anything else") — that remains the system prompt's job, unenforced beyond
+off-topic classification ("politely decline anything else") — that remains the system prompt's job, unenforced beyond
 the model's own instruction-following, exactly as it was before this
 module existed. The two are different problems: malicious intent is
 worth a hard, testable control because a jailbreak attempt is adversarial
@@ -395,12 +394,12 @@ the current deployment shape.
 **Postgres from the start, not SQLite-then-swap.** This requirement was
 initially implemented against a local SQLite file (zero new dependency,
 matching this codebase's general bias toward minimal dependencies for a
-take-home prototype) and then deliberately migrated to Postgres
+prototype) and then deliberately migrated to Postgres
 (`psycopg`, v3, no ORM) mid-implementation once real deployment plans
 came up — Postgres is what design.md's Saved Reports Store section always
 named as the production store technology (Cloud SQL for Postgres), so
 this removes a "swap it before shipping" step rather than adding
-architectural complexity the assignment didn't need. `docker-compose.yml`
+architectural complexity the prototype didn't need. `docker-compose.yml`
 provides one-command local Postgres (two databases — one for interactive
 use, one for the test suite, so `uv run pytest` can never truncate
 manually-saved reports); `REPORTS_DATABASE_URL` repoints at any other
@@ -553,8 +552,7 @@ judge. Covered by `test_score_case_contains_a_run_case_exception` in
 **Accepted gaps, not fixed:**
 
 - **9 cases is not a statistically meaningful sample.** It's sized to be
-  "a small eval set" per the assignment brief and this task's own scope,
-  covering each capability the brief names once, not to support a
+  a small eval set, covering each core capability once, not to support a
   confident pass-rate number. A production version (design.md §6/§9) would
   grow this from real analyst-curated Golden Bucket trios over time, the
   same human-in-the-loop growth path already described for the Golden

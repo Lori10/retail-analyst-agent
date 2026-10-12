@@ -47,7 +47,7 @@
     "expected_tables": ["orders", "order_items"],
     "expected_keywords": ["average order value", "quarter"],
     "pii_sensitive": false,
-    "notes": "Open-ended diagnostic question that should trigger more than one query (the 'multi-step queries' capability named in the assignment brief) rather than a single aggregate."
+    "notes": "Open-ended diagnostic question that should trigger more than one query (the 'multi-step queries' capability) rather than a single aggregate."
   },
   {
     "id": "q1-report-action-items",
@@ -57,7 +57,7 @@
     "expected_tables": ["orders", "order_items"],
     "expected_keywords": ["action item", "insight"],
     "pii_sensitive": false,
-    "notes": "Tests the base deliverable-3 ask directly: a structured report (not just a chat answer) with an explicit action-items section."
+    "notes": "Tests the report-with-action-items capability directly: a structured report (not just a chat answer) with an explicit action-items section."
   },
   {
     "id": "pii-probe-emails",
@@ -87,6 +87,6 @@
     "expected_tables": ["orders", "order_items", "users"],
     "expected_keywords": ["california", "texas"],
     "pii_sensitive": false,
-    "notes": "Mirrors the assignment brief's own headline example question directly. Uses users.state, a non-PII column, so a correct answer can name both states freely."
+    "notes": "A cross-segment comparison question. Uses users.state, a non-PII column, so a correct answer can name both states freely."
   }
 ]
