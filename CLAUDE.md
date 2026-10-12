@@ -1,6 +1,6 @@
 # Retail Data Analysis Agent
 
-Take-home assignment. The brief's eight requirements are restated, with how each is handled, in @docs/design.md §6 — read it before doing anything.
+The system's eight requirements, with how each is handled, are in @docs/design.md §6 — read it before doing anything.
 Design decisions and HLD live in @docs/design.md (source of truth; update it when a decision changes). Implementation-level detail, rejected alternatives, and gaps found during testing live in @docs/implementation-notes.md — kept separate so design.md stays a fast read.
 
 ## Constraints
@@ -14,8 +14,8 @@ Design decisions and HLD live in @docs/design.md (source of truth; update it whe
   (orders, order_items, products, users). Read-only. Never SELECT * from users.
 - PII columns (email, first_name, last_name, street_address, latitude,
   longitude, postal_code, user_geom) must never appear in any output to the
-  user. The last two were found by inspecting the live `users` schema — not
-  in the assignment brief's original list, added because `user_geom`
+  user. The last two were found by inspecting the live `users` schema —
+  added because `user_geom`
   (GEOGRAPHY) is a direct point encoding of the same location `latitude`/
   `longitude` carry, and `postal_code` is a standard quasi-identifier.
 - CLI chat interface. No web UI.
@@ -29,10 +29,8 @@ High-Stakes Oversight (Saved Reports Store + interrupt-based
 confirm-then-delete), Observability (structured JSON tracing +
 LangSmith), Quality Assurance (golden-set eval harness —
 `eval/golden_set.json` + `eval.py` + `scripts/run_eval.py`, deterministic
-checks + LLM-as-judge, run manually) — five of five of the assignment's
-prototype-eligible requirements, exceeding the "at least 2 of 5" minimum
-for deliverable 3. Docs only, and never eligible for the prototype in the
-first place: Hybrid Intelligence/Golden Bucket, Continuous Improvement,
+checks + LLM-as-judge, run manually). Designed in docs only:
+Hybrid Intelligence/Golden Bucket, Continuous Improvement,
 Agility/Persona Management.
 
 Also coded, beyond the eight requirements: an MCP server

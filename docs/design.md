@@ -13,9 +13,8 @@ An internal chat agent for non-technical Store/Regional Managers to ask
 natural-language questions over `bigquery-public-data.thelook_ecommerce`,
 discuss results conversationally, and save reports with action items. The
 design below is a production HLD; the prototype implements a subset (see
-§9) chosen to demonstrate the requirements that are actually gradeable as
-working code, while every requirement is designed in full here regardless
-of whether it's coded.
+§9), while every requirement is designed in full here regardless of
+whether it's coded.
 
 ## 2. Architecture Diagram
 
@@ -519,9 +518,9 @@ the registry was written. See
 for why that trade-off was accepted (a true allow-list would also drop
 legitimate aggregate columns like `SUM(sale_price) AS total_revenue`) and
 what covers the gap. The registry was verified against the live `users`
-schema during development, not just typed from the brief — that check
-caught two columns (`postal_code`, `user_geom`) absent from the
-assignment's original PII list before they could leak.
+schema during development, not just typed from a list of obvious
+fields — that check caught two columns (`postal_code`, `user_geom`) an
+obvious-fields list would have missed, before they could leak.
 
 **Golden Bucket (docs only).** Only the question half of each trio is
 embedded, with `text-embedding-004` — both at insert time (when a trio is
@@ -589,7 +588,7 @@ re-asserted at delete time too, not just at candidate selection — defense
 in depth), so the scoping *behavior* requirement 3 asks for is real even
 though the prototype's identity source is a placeholder for the Firestore-
 backed per-manager auth production would use. "Create a report with
-action items" — the base deliverable-3 ask, distinct from requirement 3 —
+action items" — a core capability, distinct from requirement 3 —
 is satisfied by the agent formatting its chat answer as a report and
 optionally persisting it via `save_report`.
 
@@ -795,7 +794,7 @@ three distinct threats:
   any tool is ever called. Deliberately a denylist, not a semantic
   classifier: cheap, deterministic, zero added latency/cost, and it
   targets malicious *intent* specifically — it does not attempt the
-  broader off-topic classification named in the assignment brief, which
+  broader off-topic classification, which
   remains the system-prompt instruction ("only answer analysis questions
   — politely decline anything else") it always was. A denylist also can't
   catch a paraphrased or subtler injection attempt; see
@@ -844,11 +843,11 @@ changelog reviewed by an engineer.
 **5. Resilience & Graceful Error Handling — coded.** See §5.
 
 **6. Quality Assurance — coded.** Offline golden eval set (`eval/golden_set.json`,
-9 hand-curated questions, one per capability the assignment brief names:
+9 hand-curated questions, one per core capability:
 customer behavior, product performance, time-based metrics, a schema/
 structure question, a multi-step "why" question, report-with-action-items,
 a PII-probe safety case, an off-topic decline case, and a cross-segment
-comparison echoing the brief's own example) run through the real compiled
+comparison) run through the real compiled
 graph by `src/retail_agent/eval.py` and scored two ways. Cheap deterministic
 checks run first — same "cheap check before spending an LLM call" pattern
 already used by the input guardrail and the SQL safety allowlist: was the
@@ -1094,13 +1093,10 @@ view; short of that, `logging.basicConfig`'s existing console output
 | 7. Observability | **Coded** — `tracing.py`'s `llm_call`/`tool_call`/`turn` JSON events (Cloud-Logging-shaped, stderr) + LangSmith auto-instrumentation (free Developer tier, env vars only) | Same structured logs to real Cloud Logging + Monitoring dashboards/alerts on top; LangSmith or a self-hosted tracer, depending on whether the prototype's no-third-party-SaaS trade-off still applies at that scale |
 | 8. Agility (Persona) | Docs only | Firestore/Cloud Storage config, admin surface |
 
-5 of 8 requirements are coded — all five of the assignment's
-prototype-eligible list (deliverable 3 allows any 2 of 5), following the
-build order in `CLAUDE.md`, which adds Quality Assurance as its final slice
-after Observability. The remaining 3 requirements (Hybrid Intelligence,
-Continuous Improvement, Agility) were never in the assignment's
-prototype-eligible list, so they're designed here in full but were never
-candidates for coding either way.
+5 of 8 requirements are coded, following the build order in `CLAUDE.md`,
+which adds Quality Assurance as its final slice after Observability. The
+remaining 3 requirements (Hybrid Intelligence, Continuous Improvement,
+Agility) are designed here in full but left out of the prototype.
 
 This matrix tracks the eight numbered requirements only. Architecture
 components that don't map onto one of them are argued in §3 rather than

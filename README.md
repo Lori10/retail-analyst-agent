@@ -4,24 +4,23 @@ A production-grade High-Level Design plus a working prototype for an
 internal chat agent that lets non-technical Store/Regional Managers ask
 natural-language questions over `bigquery-public-data.thelook_ecommerce`,
 discuss the results conversationally, and turn them into saved reports with
-action items. Originally scoped as a take-home technical assignment; built
-the way a real production agent would be — with typed error handling,
+action items. Built the way a real production agent would be — with typed
+error handling,
 human-in-the-loop oversight on destructive actions, structured tracing, and
 a regression-gate eval harness, not just a happy-path demo.
 
 ## What this demonstrates
 
 - **Design → build, not just build.** A full production HLD
-  ([docs/design.md](docs/design.md)) covering all 8 requirements in the
-  brief, with the prototype implementing the 5 that are actually
-  code-gradeable — every coded piece traces back to a documented design
-  decision.
+  ([docs/design.md](docs/design.md)) covering all 8 requirements, with
+  the prototype implementing 5 of them — every coded piece traces back to
+  a documented design decision.
 - **Safety & PII masking** — an input-side guardrail against prompt
   injection, an instruction to treat all tool output as untrusted data, and
   schema-verified PII column stripping in the BigQuery wrapper: the
-  registry is checked against the *live* `users` schema rather than just
-  the brief's PII list, and covers two additional columns (`postal_code`,
-  `user_geom`) a brief-only list would miss.
+  registry is checked against the *live* `users` schema rather than a
+  hand-typed list, and covers two less obvious columns (`postal_code`,
+  `user_geom`) such a list would miss.
 - **Resilience** — typed, self-correcting error handling: syntax errors get
   fed back to the model to retry with a different query (bounded, never
   unbounded), permission/transient errors go straight to a graceful
@@ -91,7 +90,7 @@ flowchart TB
 *The production architecture — everything with "coded" in its label is
 running in this prototype today; the rest (Golden Bucket, Persona Config,
 Preference Store) is designed in full in
-[docs/design.md](docs/design.md) but out of scope for a prototype grade.*
+[docs/design.md](docs/design.md) but out of scope for the prototype.*
 
 There's a second diagram worth knowing about:
 [docs/design.md §2a](docs/design.md#2a-current-graph-structure-generated-not-hand-drawn)
@@ -114,9 +113,8 @@ hand-maintained diagram can.
 | 7 | Observability | **Coded** |
 | 8 | Agility (Persona Management) | Designed only |
 
-5 of 8 requirements are coded — all 5 that were ever prototype-eligible per
-the assignment brief (2 of 5 is the stated minimum). The other 3 were never
-gradeable-in-code candidates to begin with; they're still designed in full.
+5 of 8 requirements are coded. The other 3 are designed in full but left
+out of the prototype.
 Full reasoning and trade-offs for every row:
 [docs/design.md §9](docs/design.md#9-prototype-vs-production-scope-matrix).
 
@@ -172,7 +170,7 @@ choice should flip):
 ## Quality Assurance
 
 A golden-set eval harness (`eval/golden_set.json`) runs 9 hand-curated
-questions — one per capability the assignment brief names — through the
+questions — one per capability the agent is meant to cover — through the
 real compiled graph and scores each answer two ways: cheap deterministic
 checks first (was the expected tool called, did the SQL touch an expected
 table, does the answer mention an expected keyword, no PII-shaped text),
