@@ -1,7 +1,10 @@
 # Retail Data Analysis Agent
 
-The system's eight requirements, with how each is handled, are in @docs/design.md §6 — read it before doing anything.
-Design decisions and HLD live in @docs/design.md (source of truth; update it when a decision changes). Implementation-level detail, rejected alternatives, and gaps found during testing live in @docs/implementation-notes.md — kept separate so design.md stays a fast read.
+Specs and design live in OpenSpec (`openspec/`), not in standalone docs:
+- `openspec/specs/<capability>/spec.md` — behaviour contracts (SHALL + WHEN/THEN scenarios). Source of truth for what the system must do; read the relevant spec before changing a capability.
+- `openspec/changes/archive/2026-10-13-baseline-current-system/` — the "baseline design" referred to in code comments: `design.md` holds architecture, diagrams, component reasoning, rejected alternatives and known gaps (the former HLD and implementation notes); `proposal.md` holds how each of the eight requirements is handled and the scope matrix — read it before doing anything.
+- `openspec/changes/<name>/` — open changes (designed-only requirements, production deployment). Decisions made by a change are recorded in its own `design.md`, which is archived with it.
+- `openspec/config.yaml` — project context and per-artifact rules fed into every new change.
 
 ## Constraints
 - Python 3.11, uv for deps
@@ -46,7 +49,13 @@ servers listed in `AGENT_MCP_SERVERS` (a `.mcp.json`-shaped file; see
 because `langchain-mcp-adapters` pins `mcp<2`.
 
 ## Workflow
-- Design before code. Don't write source until docs/design.md is agreed.
+- Spec before code. Every change goes through OpenSpec: `/opsx:explore`
+  (optional) → `/opsx:propose` → user reviews and approves the proposal,
+  spec deltas, design and tasks → `/opsx:apply` → `/opsx:archive` once
+  merged. Don't write source until the change's artifacts are approved.
+- Run the CLI pinned: `npx @fission-ai/openspec@1.14.1 <cmd>` (e.g.
+  `validate --all --strict`, `list --specs`). The generated `/opsx:*`
+  skills call a bare `openspec`; use the pinned npx form instead.
 - Work in small vertical slices; each slice runnable end to end.
 - Build order: (1) thin end-to-end skeleton — CLI → LangGraph tool-calling
   loop → Gemini → BQ wrapper with PII stripping and cost/timeout/row caps;
@@ -67,7 +76,8 @@ because `langchain-mcp-adapters` pins `mcp<2`.
   (8) MCP client — the agent as an MCP host: external servers' tools
   bound next to the built-ins, namespaced `<server>__<tool>`, destructive
   tools skipped unless allowlisted, unreachable servers skipped.
-- Write tests for PII filtering and delete confirmation first.
+- Tests first: write failing tests from the change's spec scenarios before
+  implementation, and never weaken an existing test unless its spec changed.
 - Ask before adding a dependency.
 
 ## Git workflow

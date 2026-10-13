@@ -1,0 +1,29 @@
+schema: spec-driven
+
+# Constraints an agent can't infer from the code. Architecture and past
+# decisions: openspec/changes/archive/*/design.md (baseline first).
+context: |
+  Retail data analysis agent: CLI chat over BigQuery bigquery-public-data.thelook_ecommerce
+  (orders, order_items, products, users) for non-technical store/regional managers.
+  - Python 3.11, uv for deps. Ask the user before adding any dependency (Python or other).
+  - LLM: Gemini only, via langchain-google-genai ChatGoogleGenerativeAI. No fallback provider.
+  - Orchestration: LangGraph, used for interrupt()/resume (delete confirmation) and checkpointing.
+  - BigQuery is read-only. Never SELECT * from users.
+  - PII columns (email, first_name, last_name, street_address, latitude, longitude, postal_code,
+    user_geom) must never appear in any output, log, trace, transcript or MCP response.
+  - CLI only, no web UI. Prefer simple and working over clever.
+  - Live BigQuery/Gemini calls (tests/integration, scripts/run_eval.py) never run under `uv run pytest`.
+  - Git: feature branch off main, simple merge, explicit user confirmation before every commit, push, merge.
+  - Baseline design and rationale: openspec/changes/archive/2026-10-13-baseline-current-system/design.md.
+
+rules:
+  proposal:
+    - Map the change to the system's eight requirements where relevant (see the baseline proposal)
+    - State any new dependency explicitly; it needs user approval
+  design:
+    - Record alternatives considered and why they were rejected
+    - Record known gaps found during testing under Risks / Trade-offs
+  tasks:
+    - First task group writes failing tests for the spec scenarios
+    - Never edit an existing test to make it pass unless the spec changed
+    - Live/billed checks (integration tests, eval harness) are a separate final task, run manually

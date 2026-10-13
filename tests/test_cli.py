@@ -319,8 +319,8 @@ def test_streaming_a_blocked_turn_shows_no_progress_before_the_decline():
 
 
 def test_graph_update_state_seeds_prior_messages_for_the_next_turn():
-    # Regression test for cli.py's main()'s rehydration step (docs/design.md
-    # §4 "Resume path"): graph.update_state(...) with the messages reducer
+    # Regression test for cli.py's main()'s rehydration step (the OpenSpec baseline design,
+    # "Resume path"): graph.update_state(...) with the messages reducer
     # is what makes a Conversation Store replay visible to call_model on the
     # very next turn, the same way real conversation history would be.
     captured = {}
@@ -476,7 +476,7 @@ def test_thread_config_is_namespaced_by_owner():
     # Regression test: this used to be a bare "cli-session" constant shared
     # by every OS user, which silently broke ConversationStore resume for
     # every owner but the first to ever write that conversation_id (see
-    # docs/design.md §3). Two different owners must get two different
+    # the OpenSpec baseline design). Two different owners must get two different
     # thread ids.
     alice_id = _thread_config("alice")["configurable"]["thread_id"]
     bob_id = _thread_config("bob")["configurable"]["thread_id"]

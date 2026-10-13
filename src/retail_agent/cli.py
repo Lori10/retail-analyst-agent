@@ -230,7 +230,7 @@ def _build_stream_input(user_input: str, awaiting_confirmation: bool) -> dict | 
 def _rehydrate_messages(stored: list[dict]) -> list[BaseMessage]:
     """Turn a `ConversationStore.get_messages(...)` result back into
     LangChain messages, for seeding a fresh graph checkpoint on startup
-    (docs/design.md §3/§4 "Resume path").
+    (the OpenSpec baseline design, "Resume path").
 
     Only `"user"`/`"assistant"` roles round-trip through the Conversation
     Store (see `main()`) — anything else is skipped rather than raising,
@@ -378,7 +378,7 @@ def _run_turn(
 
 def _build_mcp_hub(config):
     """Connect to the external MCP servers listed in `AGENT_MCP_SERVERS`,
-    if set (docs/design.md §3 "MCP Client").
+    if set (the OpenSpec baseline design, "MCP Client").
 
     A server that can't be reached is skipped with a warning; only a missing
     or malformed config file stops startup, since the user pointed at it
@@ -432,7 +432,7 @@ def _build_graph(config):
     bq_tool = build_bq_tool(config)
     reports_store = build_reports_store(config)
 
-    # Same Postgres instance/database as ReportsStore (docs/design.md §3
+    # Same Postgres instance/database as ReportsStore (the OpenSpec baseline design,
     # "Conversation Store") — no separate connection string.
     try:
         conversation_store = ConversationStore(config.reports_database_url)
@@ -526,7 +526,7 @@ def main() -> None:
         # Appended after the response is already on screen, and only for a
         # turn that actually completed (never mid-interrupt) — a store
         # failure here costs a transcript row, not the answer just shown
-        # (docs/design.md §3 "Conversation Store").
+        # (the OpenSpec baseline design, "Conversation Store").
         try:
             conversation_store.append_message(
                 conversation_id=thread_id, owner=owner, turn_index=turn_index, role="user", content=user_input
