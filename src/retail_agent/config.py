@@ -32,6 +32,13 @@ class Config:
         mcp_servers_path: Path to a `.mcp.json`-shaped list of external MCP
             servers whose tools the agent should load (`mcp_client.py`), or
             `None` to load none.
+        golden_embedding_model: Gemini embedding model for Golden Bucket
+            questions. Changing it means re-embedding stored questions;
+            search only compares vectors from this model.
+        golden_min_similarity: Minimum cosine similarity (0–1) for a
+            stored trio to be offered to the model as an example.
+        golden_table: Golden Bucket table name, on the same database as
+            the reports store. The eval harness uses its own.
     """
 
     project_id: str
@@ -44,6 +51,9 @@ class Config:
     reports_database_url: str
     trace_log_destination: str
     mcp_servers_path: str | None = None
+    golden_embedding_model: str = "gemini-embedding-2"
+    golden_min_similarity: float = 0.75
+    golden_table: str = "golden_trios"
 
 
 def load_config(require_gemini: bool = True) -> Config:
@@ -91,4 +101,7 @@ def load_config(require_gemini: bool = True) -> Config:
         ),
         trace_log_destination=os.environ.get("TRACE_LOG_DESTINATION", "stderr"),
         mcp_servers_path=os.environ.get("AGENT_MCP_SERVERS") or None,
+        golden_embedding_model=os.environ.get("GOLDEN_EMBEDDING_MODEL", "gemini-embedding-2"),
+        golden_min_similarity=float(os.environ.get("GOLDEN_MIN_SIMILARITY", 0.75)),
+        golden_table=os.environ.get("GOLDEN_BUCKET_TABLE", "golden_trios"),
     )

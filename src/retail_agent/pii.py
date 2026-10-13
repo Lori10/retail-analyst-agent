@@ -1,3 +1,5 @@
+import re
+
 PII_COLUMNS = frozenset(
     {
         "email",
@@ -13,6 +15,11 @@ PII_COLUMNS = frozenset(
         "user_geom",
     }
 )
+
+# An email-shaped string in free text. Column stripping can't see text a
+# person typed or a model wrote, so this is the belt-and-suspenders check
+# used on eval answers and on analyst-approved Golden Bucket trios.
+EMAIL_PATTERN = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
 
 def _bare_name(column: str) -> str:

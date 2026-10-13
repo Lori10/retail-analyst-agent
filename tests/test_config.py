@@ -33,3 +33,30 @@ def test_project_still_required_when_gemini_not_required(monkeypatch):
 
     with pytest.raises(ConfigError, match="GOOGLE_CLOUD_PROJECT"):
         load_config(require_gemini=False)
+
+
+def test_golden_bucket_defaults(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj")
+    monkeypatch.setenv("GEMINI_API_KEY", "key")
+    for name in ("GOLDEN_EMBEDDING_MODEL", "GOLDEN_MIN_SIMILARITY", "GOLDEN_BUCKET_TABLE"):
+        monkeypatch.delenv(name, raising=False)
+
+    config = config_module.load_config()
+
+    assert config.golden_embedding_model == "gemini-embedding-2"
+    assert config.golden_min_similarity == 0.75
+    assert config.golden_table == "golden_trios"
+
+
+def test_golden_bucket_overrides(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj")
+    monkeypatch.setenv("GEMINI_API_KEY", "key")
+    monkeypatch.setenv("GOLDEN_EMBEDDING_MODEL", "gemini-embedding-001")
+    monkeypatch.setenv("GOLDEN_MIN_SIMILARITY", "0.8")
+    monkeypatch.setenv("GOLDEN_BUCKET_TABLE", "golden_trios_eval")
+
+    config = config_module.load_config()
+
+    assert config.golden_embedding_model == "gemini-embedding-001"
+    assert config.golden_min_similarity == 0.8
+    assert config.golden_table == "golden_trios_eval"

@@ -128,3 +128,56 @@ def test_underlying_psycopg_error_is_not_a_raw_psycopg_error(store):
     with pytest.raises(ReportsStoreError) as exc_info:
         store.save_report(owner="alice", title="A", content="x", conversation_id="c1")
     assert not isinstance(exc_info.value, psycopg.Error)
+
+
+# -- source question / SQL (openspec change add-golden-bucket) ---------------
+
+
+def test_save_report_records_source_question_and_sql_for_review(store):
+    saved = store.save_report(
+        owner="alice", title="T", content="C", conversation_id="c1",
+        source_question="Revenue by category?", source_sql=["SELECT 1", "SELECT 2"],
+    )
+
+    review = store.get_report_for_review(saved["id"])
+
+    assert review["source_question"] == "Revenue by category?"
+    assert review["source_sql"] == ["SELECT 1", "SELECT 2"]
+    assert review["content"] == "C"
+
+
+def test_save_report_without_source_records_none(store):
+    saved = store.save_report(owner="alice", title="T", content="C", conversation_id="c1")
+
+    review = store.get_report_for_review(saved["id"])
+
+    assert review["source_question"] is None
+    assert review["source_sql"] is None
+
+
+def test_list_reports_output_is_unchanged_by_source_columns(store):
+    store.save_report(
+        owner="alice", title="T", content="C", conversation_id="c1",
+        source_question="Q?", source_sql=["SELECT 1"],
+    )
+
+    (listed,) = store.list_reports("alice")
+
+    assert "source_sql" not in listed
+    assert "source_question" not in listed
+
+
+def test_get_report_for_review_unknown_id_returns_none(store):
+    assert store.get_report_for_review(999999) is None
+
+
+def test_list_reports_for_review_spans_owners_and_flags_source_sql(store):
+    store.save_report(owner="alice", title="A", content="x", conversation_id="c1", source_sql=["SELECT 1"])
+    store.save_report(owner="bob", title="B", content="y", conversation_id="c2")
+
+    listed = {r["title"]: r for r in store.list_reports_for_review()}
+
+    assert set(listed) == {"A", "B"}
+    assert listed["A"]["has_source_sql"] is True
+    assert listed["B"]["has_source_sql"] is False
+    assert listed["A"]["owner"] == "alice"

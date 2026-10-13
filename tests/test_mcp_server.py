@@ -263,6 +263,15 @@ def test_save_report_then_list_reports_scoped_to_owner():
     assert listed["reports"][0]["conversation_id"] == "mcp-session-alice"
 
 
+def test_report_saved_over_mcp_carries_no_source_question_or_sql():
+    store = FakeReportsStore()
+    server = _server(reports_store=store)
+
+    _, saved = _call(server, "save_report", {"title": "Q1", "content": "Revenue up."})
+
+    assert store.sources[saved["id"]] == {"source_question": None, "source_sql": None}
+
+
 # --- Observability --------------------------------------------------------------
 
 

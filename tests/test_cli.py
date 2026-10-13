@@ -16,7 +16,13 @@ from retail_agent.cli import (
     _thread_config,
     _tool_result_message,
 )
-from retail_agent.errors import GuardrailBlockedError, ProviderError, QueryPermissionError, QuerySyntaxError
+from retail_agent.errors import (
+    GoldenBucketError,
+    GuardrailBlockedError,
+    ProviderError,
+    QueryPermissionError,
+    QuerySyntaxError,
+)
 from retail_agent.graph import build_graph
 
 INITIAL_STATE_EXTRAS = {
@@ -49,7 +55,9 @@ class FakeReportsStore:
         self._reports = []
         self._next_id = 1
 
-    def save_report(self, *, owner, title, content, conversation_id, tags=None):
+    def save_report(
+        self, *, owner, title, content, conversation_id, tags=None, source_question=None, source_sql=None
+    ):
         report = {
             "id": self._next_id,
             "owner": owner,
@@ -540,3 +548,79 @@ def test_rehydrate_messages_empty_input_returns_empty_list():
 def test_system_instruction_mentions_delete_confirmation_is_automatic():
     assert "delete_reports" in SYSTEM_INSTRUCTION
     assert "confirm" in SYSTEM_INSTRUCTION.lower()
+
+
+# -- Golden Bucket retrieval (openspec change add-golden-bucket) --------------
+
+
+class _FakeRetriever:
+    def __init__(self, trios=None, *, error=None):
+        self.trios = trios or []
+        self.error = error
+
+    def retrieve(self, question):
+        if self.error is not None:
+            raise self.error
+        return list(self.trios)
+
+
+_TRIOS = [
+    {"question": "Secret question text", "sql": ["SELECT secret_sql"], "report": "Secret report text", "similarity": 0.93},
+    {"question": "Other question", "sql": ["SELECT 2"], "report": "Other report", "similarity": 0.81},
+]
+
+
+def test_stream_progress_ignores_the_retrieve_examples_node():
+    assert _stream_progress({"retrieve_examples": {"golden_examples": [], "golden_error_class": None}}) == (None, None)
+
+
+def test_build_stream_input_resets_golden_fields_each_turn():
+    stream_input = _build_stream_input("What's total revenue?", awaiting_confirmation=False)
+    assert stream_input["golden_examples"] == []
+    assert stream_input["golden_error_class"] is None
+
+
+def test_run_turn_traces_example_count_and_top_similarity_without_trio_text(trace_events):
+    provider = FakeProvider([_model_response(text="Total revenue is 42.")])
+    graph = build_graph(
+        provider, FakeBigQueryTool(), FakeReportsStore(), "test-owner", system_instruction="test",
+        golden_retriever=_FakeRetriever(_TRIOS),
+    )
+    stream_input = _build_stream_input("What's total revenue?", awaiting_confirmation=False)
+
+    _run_turn(graph, stream_input, _thread_config("test-owner"), "turn-gb1", "What's total revenue?", "test-owner")
+
+    (event,) = _turn_events(trace_events)
+    assert event["golden_examples"] == 2
+    assert event["golden_top_similarity"] == pytest.approx(0.93)
+    assert event["golden_error_class"] is None
+    raw = str(trace_events)
+    assert "Secret question text" not in raw
+    assert "SELECT secret_sql" not in raw
+    assert "Secret report text" not in raw
+
+
+def test_run_turn_traces_retrieval_failure_without_failing_the_turn(trace_events):
+    provider = FakeProvider([_model_response(text="Total revenue is 42.")])
+    graph = build_graph(
+        provider, FakeBigQueryTool(), FakeReportsStore(), "test-owner", system_instruction="test",
+        golden_retriever=_FakeRetriever(error=GoldenBucketError("down")),
+    )
+    stream_input = _build_stream_input("What's total revenue?", awaiting_confirmation=False)
+
+    final_message, _, outcome = _run_turn(
+        graph, stream_input, _thread_config("test-owner"), "turn-gb2", "What's total revenue?", "test-owner"
+    )
+
+    assert outcome == "answered"
+    assert _response_text(final_message) == "Total revenue is 42."
+    (event,) = _turn_events(trace_events)
+    assert event["golden_examples"] == 0
+    assert event["golden_top_similarity"] is None
+    assert event["golden_error_class"] == "GoldenBucketError"
+    # The turn itself succeeded, so the turn-level error_class stays empty.
+    assert event["error_class"] is None
+
+
+def test_system_instruction_treats_golden_examples_as_data():
+    assert "golden_examples" in SYSTEM_INSTRUCTION

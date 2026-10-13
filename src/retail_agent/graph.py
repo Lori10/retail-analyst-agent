@@ -4,7 +4,7 @@ import operator
 import time
 from typing import Annotated, TypedDict
 
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -12,6 +12,7 @@ from langgraph.types import interrupt
 
 from retail_agent.bq_tool import BigQueryTool, query_payload
 from retail_agent.errors import AgentError, GuardrailBlockedError, graceful_message_for
+from retail_agent.golden_bucket import format_examples
 from retail_agent.guardrail import check_user_input
 from retail_agent.llm_provider import GeminiProvider
 from retail_agent.mcp_client import McpToolHub
@@ -63,6 +64,12 @@ class AgentState(TypedDict):
             (replaced, not accumulated, each time it runs).
         blocked: Whether `guardrail_check` rejected this turn's user
             message; set fresh every turn before anything else reads it.
+        golden_examples: Golden Bucket trios retrieved for this turn
+            (overwritten, never accumulated, by `retrieve_examples`). Kept
+            out of `messages`, so they never reach the checkpoint history
+            or the transcript.
+        golden_error_class: Class name of a retrieval failure this turn,
+            else `None` — traced, never shown to the user.
     """
 
     messages: Annotated[list[BaseMessage], operator.add]
@@ -70,6 +77,61 @@ class AgentState(TypedDict):
     empty_result_sanity_checked: bool
     last_tool_errors: list[dict]
     blocked: bool
+    golden_examples: list[dict]
+    golden_error_class: str | None
+
+
+def _collect_save_source(messages: list[BaseMessage]) -> tuple[str | None, list[str] | None]:
+    """Work out the question and SQL behind a report being saved now.
+
+    Read from the graph's own message history, never from the model's
+    `save_report` arguments — the point of recording source SQL (the
+    Golden Bucket change) is that it's the SQL that actually ran.
+
+    The span starts after the last successful `save_report`, so a
+    conversation that saves several reports attributes each query to one
+    report. Within it, every `run_query` whose result wasn't an error is
+    kept, in run order. The question is the last user message before the
+    first kept query, which skips greetings and other chat that came
+    before the analysis started.
+
+    Args:
+        messages: The conversation so far, including any `ToolMessage`s
+            already produced earlier in the current `call_tools` pass.
+
+    Returns:
+        A `(source_question, source_sql)` pair. `source_sql` is `None` when
+        the span ran no successful query; `source_question` is then the
+        latest user message, or `None` if there is none.
+    """
+    start = 0
+    for index, message in enumerate(messages):
+        if isinstance(message, ToolMessage) and message.name == "save_report":
+            if "saved" in json.loads(message.content):
+                start = index + 1
+
+    sql_by_call_id: dict[str, tuple[str, int]] = {}
+    source_sql: list[str] = []
+    first_query_index: int | None = None
+    for index in range(start, len(messages)):
+        message = messages[index]
+        if isinstance(message, AIMessage):
+            for call in message.tool_calls:
+                if call["name"] == "run_query":
+                    sql_by_call_id[call["id"]] = ((call["args"] or {}).get("sql"), index)
+        elif isinstance(message, ToolMessage) and message.name == "run_query":
+            if message.tool_call_id in sql_by_call_id and "error" not in json.loads(message.content):
+                sql, call_index = sql_by_call_id[message.tool_call_id]
+                source_sql.append(sql)
+                if first_query_index is None:
+                    first_query_index = call_index
+
+    search_end = first_query_index if first_query_index is not None else len(messages)
+    question = next(
+        (m.content for m in reversed(messages[:search_end]) if isinstance(m, HumanMessage)),
+        None,
+    )
+    return question, (source_sql or None)
 
 
 def _run_tool(
@@ -80,6 +142,7 @@ def _run_tool(
     name: str,
     args: dict,
     mcp_hub: McpToolHub | None = None,
+    save_source: tuple[str | None, list[str] | None] = (None, None),
 ) -> dict:
     """Dispatch one model-requested tool call to `BigQueryTool`,
     `ReportsStore`, or an external MCP server via `mcp_hub`.
@@ -96,6 +159,8 @@ def _run_tool(
         name: Tool name.
         args: The model-supplied arguments for that tool.
         mcp_hub: External MCP tools, if any were configured.
+        save_source: `(source_question, source_sql)` recorded on a saved
+            report — see `_collect_save_source`. Ignored for other tools.
 
     Returns:
         A JSON-safe payload suitable for a `ToolMessage`.
@@ -115,6 +180,8 @@ def _run_tool(
             content=args["content"],
             conversation_id=conversation_id,
             tags=args.get("tags"),
+            source_question=save_source[0],
+            source_sql=save_source[1],
         )
         return {"saved": True, "id": report["id"], "title": report["title"]}
     if name == "list_reports":
@@ -131,6 +198,7 @@ def build_graph(
     owner: str,
     system_instruction: str,
     mcp_hub: McpToolHub | None = None,
+    golden_retriever=None,
 ):
     """Compile the agent's LangGraph tool-calling loop.
 
@@ -146,6 +214,9 @@ def build_graph(
         mcp_hub: External MCP tools dispatched by the `tools` node; `None`
             (the default) means built-in tools only. The provider must have
             been built with the same hub's `tool_specs()`.
+        golden_retriever: Finds approved Golden Bucket trios similar to the
+            turn's question (`golden_bucket.GoldenRetriever`); `None` (the
+            default) means no examples are ever offered.
 
     Returns:
         A compiled `StateGraph` with in-memory checkpointing, ready for
@@ -185,11 +256,51 @@ def build_graph(
         """
         return {"messages": [AIMessage(content=GuardrailBlockedError.graceful_message)]}
 
+    def retrieve_examples(state: AgentState) -> dict:
+        """Look up Golden Bucket trios similar to the turn's question.
+
+        Runs once per turn, after the guardrail and before the first model
+        call; the examples then stay available to every `call_model` pass
+        of the turn's tool loop. A resumed delete confirmation never
+        reaches this node.
+
+        Any failure — a typed `GoldenBucketError` or anything unexpected
+        from the embeddings client — is swallowed: retrieval only improves
+        an answer, so the turn proceeds without examples and the failure
+        is recorded for the `turn` trace event.
+
+        Args:
+            state: Current graph state; reads the turn's user message.
+
+        Returns:
+            `{"golden_examples": [...], "golden_error_class": ...}`.
+        """
+        if golden_retriever is None:
+            return {"golden_examples": [], "golden_error_class": None}
+        question = state["messages"][-1].content
+        try:
+            examples = golden_retriever.retrieve(question)
+        except Exception as exc:
+            logger.warning("golden_retrieval_failed", extra={"error_class": type(exc).__name__})
+            return {"golden_examples": [], "golden_error_class": type(exc).__name__}
+        return {"golden_examples": examples, "golden_error_class": None}
+
+    def _with_examples(messages: list[BaseMessage], examples: list[dict]) -> list[BaseMessage]:
+        """Insert the examples block just before the turn's user message,
+        for this model call only — so the user's own question stays the
+        last thing they said, and the block never enters `messages`."""
+        if not examples:
+            return messages
+        turn_start = max(i for i, m in enumerate(messages) if isinstance(m, HumanMessage))
+        block = HumanMessage(content=format_examples(examples))
+        return [*messages[:turn_start], block, *messages[turn_start:]]
+
     def call_model(state: AgentState, config: RunnableConfig) -> dict:
         """Send the message history to the provider and append its reply.
 
         Args:
-            state: Current graph state; only `messages` is read.
+            state: Current graph state; reads `messages` and this turn's
+                `golden_examples`.
             config: LangGraph-injected run config; `configurable.thread_id`/
                 `configurable.turn_id` (the latter set by `cli.py` per turn,
                 absent for any other caller) tag the `llm_call` trace event
@@ -212,7 +323,8 @@ def build_graph(
         }
         start = time.monotonic()
         try:
-            response = provider.generate(messages=state["messages"], system_instruction=system_instruction)
+            messages = _with_examples(state["messages"], state.get("golden_examples") or [])
+            response = provider.generate(messages=messages, system_instruction=system_instruction)
         except AgentError as exc:
             log_event(
                 "llm_call",
@@ -269,9 +381,14 @@ def build_graph(
             # Tagged like the MCP server's own events, so external calls can
             # be filtered out of the trace stream.
             transport = {"transport": "mcp"} if mcp_hub is not None and mcp_hub.has_tool(call["name"]) else {}
+            save_source = (
+                _collect_save_source([*state["messages"], *tool_messages])
+                if call["name"] == "save_report"
+                else (None, None)
+            )
             try:
                 payload = _run_tool(
-                    bq_tool, reports_store, owner, thread_id, call["name"], call["args"] or {}, mcp_hub
+                    bq_tool, reports_store, owner, thread_id, call["name"], call["args"] or {}, mcp_hub, save_source
                 )
             except AgentError as exc:
                 payload = {"error": str(exc), "error_class": type(exc).__name__}
@@ -431,15 +548,15 @@ def build_graph(
 
     def route_after_guardrail(state: AgentState) -> str:
         """Route to `blocked` if `guardrail_check` rejected this turn, else
-        into the normal `call_model` loop.
+        to `retrieve_examples` and then the normal `call_model` loop.
 
         Args:
             state: Current graph state; reads `blocked`.
 
         Returns:
-            `"blocked"` or `"call_model"`.
+            `"blocked"` or `"retrieve_examples"`.
         """
-        return "blocked" if state["blocked"] else "call_model"
+        return "blocked" if state["blocked"] else "retrieve_examples"
 
     def route_after_model(state: AgentState) -> str:
         """Route to `resolve_delete` if the model called `delete_reports`,
@@ -489,12 +606,16 @@ def build_graph(
     graph = StateGraph(AgentState)
     graph.add_node("guardrail", guardrail_check)
     graph.add_node("blocked", blocked)
+    graph.add_node("retrieve_examples", retrieve_examples)
     graph.add_node("call_model", call_model)
     graph.add_node("tools", call_tools)
     graph.add_node("give_up", give_up)
     graph.add_node("resolve_delete", resolve_delete)
     graph.add_edge(START, "guardrail")
-    graph.add_conditional_edges("guardrail", route_after_guardrail, {"call_model": "call_model", "blocked": "blocked"})
+    graph.add_conditional_edges(
+        "guardrail", route_after_guardrail, {"retrieve_examples": "retrieve_examples", "blocked": "blocked"}
+    )
+    graph.add_edge("retrieve_examples", "call_model")
     graph.add_edge("blocked", END)
     graph.add_conditional_edges(
         "call_model", route_after_model, {"tools": "tools", "resolve_delete": "resolve_delete", END: END}
