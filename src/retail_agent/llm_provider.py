@@ -59,7 +59,7 @@ class GeminiProvider:
     """Gemini LLM provider, backed by `langchain-google-genai`'s
     `ChatGoogleGenerativeAI` rather than a raw `google-genai` SDK call —
     the sole provider, with no fallback provider and no circuit breaker
-    (see docs/design.md §3 for why)."""
+    (see the OpenSpec baseline design for why)."""
 
     def __init__(self, api_key: str, model: str, extra_tools: list[dict] = ()) -> None:
         """Build the bound chat model.

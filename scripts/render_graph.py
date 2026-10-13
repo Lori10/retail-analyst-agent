@@ -1,4 +1,5 @@
-"""Regenerate the LangGraph structure diagram used in docs/design.md.
+"""Regenerate the LangGraph structure diagram used in the OpenSpec baseline
+design (openspec/changes/archive/*-baseline-current-system/design.md).
 
 Prints Mermaid syntax derived directly from the real compiled StateGraph
 (nodes, edges, conditional routing) — never hand-maintained, so it can't

@@ -6,9 +6,9 @@ PII_COLUMNS = frozenset(
         "street_address",
         "latitude",
         "longitude",
-        # Found by inspecting the live `users` schema, not in the original
-        # brief: user_geom is a GEOGRAPHY point encoding the same location
-        # latitude/longitude carry; postal_code is a standard quasi-identifier.
+        # Found by inspecting the live `users` schema: user_geom is a GEOGRAPHY
+        # point encoding the same location latitude/longitude carry;
+        # postal_code is a standard quasi-identifier.
         "postal_code",
         "user_geom",
     }
@@ -33,7 +33,7 @@ def strip_pii_columns(df):
     Catches direct selection under the schema name or a table-qualified name
     (e.g. `users.email`). It does not catch a deliberately renamed alias
     (`first_name AS x`) — that gap is covered by the input-side guardrail and
-    IAM read-only role, not by this function; see docs/design.md §3.
+    IAM read-only role, not by this function; see the OpenSpec baseline design.
 
     Args:
         df: A query result DataFrame, columns named as BigQuery returned them.

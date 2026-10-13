@@ -5,7 +5,7 @@ the actual compiled LangGraph — live Gemini for both the agent and the judge,
 live BigQuery for every `run_query`/`get_schema` call — plus the same
 Postgres the CLI needs for the Saved Reports/Conversation stores. It is
 deliberately a manual script, never run by `uv run pytest` (see
-docs/implementation-notes.md's Quality Assurance section for why).
+the OpenSpec baseline design's eval-harness notes for why).
 
 Usage:
     uv run python scripts/run_eval.py \\

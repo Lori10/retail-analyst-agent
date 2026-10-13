@@ -21,8 +21,8 @@ CREATE TABLE IF NOT EXISTS reports (
 
 
 class ReportsStore:
-    """Postgres-backed store for the "Saved Reports" library (docs/design.md
-    §3). Owns its own `psycopg.Connection` directly, the same way
+    """Postgres-backed store for the "Saved Reports" library (the OpenSpec
+    baseline design). Owns its own `psycopg.Connection` directly, the same way
     `BigQueryTool` owns its own `bigquery.Client`. Uses `psycopg` (v3)
     directly, with no ORM — matches this codebase's existing preference for
     a thin wrapper over the driver rather than an abstraction layer on top
@@ -32,7 +32,7 @@ class ReportsStore:
     `bq_tool.py`/`llm_provider.py`: a local/managed Postgres instance in
     this deployment shape doesn't have the same "brief rate-limit or
     server hiccup, retry the same call" failure mode a third-party network
-    API does. See docs/implementation-notes.md.
+    API does. See the OpenSpec baseline design.
     """
 
     def __init__(self, database_url: str) -> None:
@@ -101,7 +101,7 @@ class ReportsStore:
             conversation_id: The LangGraph thread id this report was created in.
             tags: Optional list of tag strings. Stored as a comma-joined
                 string — a tag containing a literal comma isn't supported,
-                an accepted prototype trade-off (docs/implementation-notes.md).
+                an accepted prototype trade-off (the OpenSpec baseline design).
 
         Returns:
             The saved report as a dict, including its assigned `id` and the
@@ -182,7 +182,7 @@ class ReportsStore:
 
         Re-asserts owner scoping here too, not just at candidate selection —
         defense in depth against a bug upstream ever passing an id that
-        doesn't actually belong to `owner` (docs/implementation-notes.md).
+        doesn't actually belong to `owner` (the OpenSpec baseline design).
 
         Args:
             owner: Requesting user's identity — an id belonging to a

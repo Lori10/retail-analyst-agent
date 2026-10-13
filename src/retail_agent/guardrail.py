@@ -25,7 +25,7 @@ def check_user_input(text: str) -> None:
 
     A regex/keyword denylist, not a semantic classifier — deliberately, to
     keep this a cheap, deterministic, zero-latency check ahead of the first
-    model call (docs/design.md §3/§6). It catches the common, mechanical
+    model call (the OpenSpec baseline design). It catches the common, mechanical
     forms of "override your instructions" phrasing; it will not catch a
     subtler or paraphrased attempt. That residual risk is why tool output is
     also treated as untrusted data in the system prompt, rather than relying

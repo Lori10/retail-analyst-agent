@@ -28,7 +28,7 @@ def check_read_only(sql: str) -> None:
     """Raise SQLSafetyError unless sql is a single, safe, read-only statement.
 
     A regex/keyword allowlist, not a full SQL parser — deliberately, per
-    docs/design.md §3: the real backstop against adversarial SQL is the
+    the OpenSpec baseline design: the real backstop against adversarial SQL is the
     service account's IAM read-only role, so this only needs to catch the
     realistic case (an LLM accidentally generating DML/DDL), not defeat a
     determined attacker on its own.

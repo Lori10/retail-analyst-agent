@@ -27,7 +27,7 @@ class Config:
         reports_database_url: Postgres connection string for the Saved
             Reports store.
         trace_log_destination: Where structured JSON tracing events
-            (docs/design.md §3 Observability) are written — `"stderr"`/
+            (openspec/specs/observability) are written — `"stderr"`/
             `"stdout"`, or a filesystem path. See `tracing.configure_tracing`.
         mcp_servers_path: Path to a `.mcp.json`-shaped list of external MCP
             servers whose tools the agent should load (`mcp_client.py`), or

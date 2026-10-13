@@ -91,7 +91,7 @@ def build_server(
     The same safety wrappers the CLI agent uses sit underneath every tool —
     `BigQueryTool`'s read-only check, cost cap, row limit and PII stripping,
     and `ReportsStore`'s owner scoping — so those guarantees hold for any MCP
-    client, whatever model is driving it (docs/design.md §3 "MCP Server").
+    client, whatever model is driving it (the OpenSpec baseline design, "MCP Server").
 
     Deletion is split into `preview_delete`/`confirm_delete` rather than one
     tool: an MCP client has no equivalent of the graph's `interrupt()`, so the
@@ -113,7 +113,7 @@ def build_server(
     conversation_id = f"mcp-session-{owner}"
     # token -> (owner, report ids, expires_at). In-process is enough because a
     # stdio server is one process per client session; a multi-instance HTTP
-    # deployment would need a shared store (docs/implementation-notes.md).
+    # deployment would need a shared store (the OpenSpec baseline design).
     pending_deletes: dict[str, tuple[str, list[int], float]] = {}
 
     @contextmanager

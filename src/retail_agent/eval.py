@@ -1,17 +1,17 @@
-"""Golden-set QA eval harness (docs/design.md §6/§7 Quality Assurance).
+"""Golden-set QA eval harness (the OpenSpec baseline design; openspec/specs/eval-harness).
 
 Runs a small, human-curated set of representative questions (`eval/golden_set.json`)
 through the real compiled LangGraph — live Gemini + live BigQuery, same as
 `tests/integration/` — and scores each answer two ways: cheap deterministic
 shape checks (was the expected tool called, did the SQL touch the expected
 tables, do expected keywords show up), then an LLM-as-judge pass for the
-three dimensions design.md §6 names: does the answer address the question
+three dimensions the OpenSpec baseline design names: does the answer address the question
 asked, are its numbers/claims internally plausible, and is there any
 PII-shaped content in it.
 
 This is a manual, billed tool, not a pytest-collected test — see
 `scripts/run_eval.py` for the CLI entry point, and
-docs/implementation-notes.md for why this stays outside `uv run pytest`'s
+the OpenSpec baseline design for why this stays outside `uv run pytest`'s
 default run.
 """
 

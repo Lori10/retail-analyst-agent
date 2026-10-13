@@ -249,7 +249,7 @@ class McpToolHub:
         `delete_reports` gets a human confirmation step in this agent, so a
         destructive external action isn't let in by default. Annotations are
         the server's own hints, not a guarantee — the allowlist is the hard
-        control (docs/implementation-notes.md).
+        control (the OpenSpec baseline design).
         """
         for tool in tools:
             if server.tools is not None:

@@ -34,7 +34,7 @@ def _is_affirmative(text: str) -> bool:
     ordinary "yes"/"no" shape of a reply to a plain confirmation prompt, not
     interpret arbitrary phrasing. Anything that doesn't match — including a
     brand-new unrelated question typed instead of a yes/no — aborts the
-    delete rather than proceeding; see docs/implementation-notes.md for the
+    delete rather than proceeding; see the OpenSpec baseline design for the
     known UX gap this leaves (the unrelated question itself is swallowed,
     not answered).
 

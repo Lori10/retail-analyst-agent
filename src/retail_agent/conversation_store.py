@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS messages (
 
 class ConversationStore:
     """Postgres-backed store for the durable conversation transcript
-    (docs/design.md §3 "Conversation Store"). Owns its own
+    (the OpenSpec baseline design, "Conversation Store"). Owns its own
     `psycopg.Connection` directly, the same way `ReportsStore` and
     `BigQueryTool` own theirs — no ORM.
 
@@ -44,7 +44,7 @@ class ConversationStore:
     reason `ReportsStore` doesn't: a local/managed Postgres instance in
     this deployment shape doesn't have the "brief rate-limit or server
     hiccup, retry the same call" failure mode a third-party network API
-    does. See docs/implementation-notes.md.
+    does. See the OpenSpec baseline design.
     """
 
     def __init__(self, database_url: str) -> None:
