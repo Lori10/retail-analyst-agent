@@ -18,11 +18,13 @@ from retail_agent.eval import (
     _check_expected_keywords,
     _check_expected_tables,
     _check_expected_tool,
+    _check_golden_examples,
     _check_pii_leak,
     _extract_case_result,
     _score_case,
     judge_case,
     load_golden_set,
+    run_case,
 )
 
 
@@ -347,7 +349,7 @@ class FakeGraph:
     def invoke(self, input, config):
         if self._raises is not None:
             raise self._raises
-        return {"messages": self._messages, "self_correct_attempts": 0}
+        return {"messages": self._messages, "self_correct_attempts": 0, **getattr(self, "extra", {})}
 
 
 def test_score_case_contains_a_run_case_exception():
@@ -377,3 +379,91 @@ def test_score_case_runs_normally_when_graph_succeeds():
     assert report.result is not None
     assert report.passed is True
     assert len(judge.calls) == 1
+
+
+# --- Golden Bucket support (openspec change add-golden-bucket) --------------
+
+
+_SEED = {"question": "What were total sales by product category in 2022?", "sql": ["SELECT 1"], "report": "R"}
+
+
+def _write_cases(tmp_path, entries):
+    path = tmp_path / "golden.json"
+    path.write_text(json.dumps(entries))
+    return str(path)
+
+
+def _entry(**overrides):
+    entry = {
+        "id": "c1",
+        "category": "golden_bucket",
+        "question": "Which product categories brought in the most revenue in 2023?",
+        "expects_tool": "run_query",
+        "expected_tables": ["order_items"],
+        "expected_keywords": ["category"],
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_load_golden_set_parses_seed_trios_and_golden_expectation(tmp_path):
+    path = _write_cases(tmp_path, [_entry(seed_trios=[_SEED], expects_golden_examples=True)])
+
+    (case,) = load_golden_set(path)
+
+    assert case.seed_trios == [_SEED]
+    assert case.expects_golden_examples is True
+
+
+def test_load_golden_set_rejects_a_seed_that_is_the_case_question_itself(tmp_path):
+    seed = {**_SEED, "question": "Which product categories brought in the most revenue in 2023?"}
+    path = _write_cases(tmp_path, [_entry(seed_trios=[seed])])
+
+    with pytest.raises(ValueError, match="paraphrase"):
+        load_golden_set(path)
+
+
+def test_load_golden_set_rejects_a_malformed_seed(tmp_path):
+    path = _write_cases(tmp_path, [_entry(seed_trios=[{"question": "q", "sql": "SELECT 1", "report": "r"}])])
+
+    with pytest.raises(ValueError):
+        load_golden_set(path)
+
+
+def test_check_golden_examples_pass_fail_and_noop():
+    expecting = _case(expects_golden_examples=True)
+    assert _check_golden_examples(expecting, _extract_case_result([AIMessage(content="x")])).passed is False
+
+    hit = _extract_case_result([AIMessage(content="x")])
+    hit.golden_examples = 2
+    assert _check_golden_examples(expecting, hit).passed is True
+
+    assert _check_golden_examples(_case(), _extract_case_result([AIMessage(content="x")])).passed is True
+
+
+def test_run_case_records_how_many_examples_were_retrieved():
+    graph = FakeGraph(messages=[AIMessage(content="Answer.")])
+    graph.extra = {"golden_examples": [{"similarity": 0.9}, {"similarity": 0.8}]}
+
+    result = run_case(graph, _case(expects_tool=None))
+
+    assert result.golden_examples == 2
+
+
+def test_score_case_prepares_the_bucket_before_running_the_case():
+    order = []
+    graph = FakeGraph(messages=[AIMessage(content="Answer.")])
+    original_invoke = graph.invoke
+    graph.invoke = lambda input, config: (order.append("run"), original_invoke(input, config))[1]
+    judge = FakeJudgeModel('{"answers_question": true, "plausible": true, "no_pii": true, "reasoning": "ok"}')
+    case = _case(expects_tool=None, expected_tables=[], expected_keywords=[])
+
+    _score_case(graph, judge, case, prepare=lambda c: order.append(f"prepare {c.id}"))
+
+    assert order == ["prepare case-1", "run"]
+
+
+def test_bundled_golden_set_has_a_seeded_golden_bucket_case():
+    cases = load_golden_set("eval/golden_set.json")
+    seeded = [c for c in cases if c.seed_trios]
+    assert seeded and all(c.expects_golden_examples for c in seeded)

@@ -17,16 +17,21 @@ default run.
 
 from __future__ import annotations
 
+import dataclasses
 import json
-import re
 from dataclasses import dataclass, field
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from retail_agent.cli import _build_graph, _response_text
+from retail_agent.pii import EMAIL_PATTERN
 
 _ALLOWED_EXPECTS_TOOL = {"run_query", "get_schema", None}
-_EMAIL_PATTERN = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+
+# The eval's own Golden Bucket table, reset before every case and seeded
+# only with that case's `seed_trios`, so trios approved for real use never
+# influence (or inflate) eval results.
+EVAL_GOLDEN_TABLE = "golden_trios_eval"
 
 JUDGE_SYSTEM_PROMPT = (
     "You are a strict QA judge for a retail data analysis chat agent. You will be given "
@@ -66,6 +71,11 @@ class GoldenCase:
         pii_sensitive: Whether `_check_pii_leak` should run its regex
             email-pattern check on this case's answer.
         notes: Human-authored rationale; not read by the harness.
+        seed_trios: Golden Bucket trios (`question`, `sql` list, `report`)
+            loaded into the eval's own bucket before this case runs. A seed
+            is a paraphrase, never the case question itself.
+        expects_golden_examples: Whether `_check_golden_examples` requires
+            at least one example to have been retrieved this turn.
     """
 
     id: str
@@ -76,6 +86,38 @@ class GoldenCase:
     expected_keywords: list[str]
     pii_sensitive: bool
     notes: str = ""
+    seed_trios: list[dict] = field(default_factory=list)
+    expects_golden_examples: bool = False
+
+
+def _validate_seed_trios(path: str, index: int, entry: dict) -> list[dict]:
+    """Check a case's `seed_trios` shape and that no seed is the case's own
+    question (that would measure memorisation, not retrieval).
+
+    Raises:
+        ValueError: A malformed seed, or one equal to the case question.
+    """
+    seeds = entry.get("seed_trios", [])
+    if not isinstance(seeds, list):
+        raise ValueError(f"{path}: entry {index} ('{entry['id']}') seed_trios must be a list")
+    for seed in seeds:
+        if not (
+            isinstance(seed, dict)
+            and isinstance(seed.get("question"), str)
+            and isinstance(seed.get("report"), str)
+            and isinstance(seed.get("sql"), list)
+            and seed["sql"]
+            and all(isinstance(statement, str) for statement in seed["sql"])
+        ):
+            raise ValueError(
+                f"{path}: entry {index} ('{entry['id']}') has a seed trio that isn't "
+                "{question: str, sql: [str, ...], report: str}"
+            )
+        if seed["question"].strip().lower() == entry["question"].strip().lower():
+            raise ValueError(
+                f"{path}: entry {index} ('{entry['id']}') seeds its own question — use a paraphrase"
+            )
+    return seeds
 
 
 def load_golden_set(path: str) -> list[GoldenCase]:
@@ -124,6 +166,8 @@ def load_golden_set(path: str) -> list[GoldenCase]:
                 expected_keywords=entry["expected_keywords"],
                 pii_sensitive=entry.get("pii_sensitive", False),
                 notes=entry.get("notes", ""),
+                seed_trios=_validate_seed_trios(path, i, entry),
+                expects_golden_examples=entry.get("expects_golden_examples", False),
             )
         )
     return cases
@@ -145,6 +189,8 @@ class CaseResult:
             value for the turn (0 if no self-correct happened).
         had_error: Whether any tool call in the turn returned an error
             payload (self-corrected or not).
+        golden_examples: How many Golden Bucket examples were retrieved
+            for the turn (set by `run_case` from graph state).
     """
 
     answer_text: str
@@ -154,6 +200,7 @@ class CaseResult:
     row_counts: list[int] = field(default_factory=list)
     self_correct_attempts: int = 0
     had_error: bool = False
+    golden_examples: int = 0
 
 
 _KNOWN_TABLES = ("orders", "order_items", "products", "users")
@@ -239,10 +286,14 @@ def run_case(graph, case: GoldenCase) -> CaseResult:
             "empty_result_sanity_checked": False,
             "last_tool_errors": [],
             "blocked": False,
+            "golden_examples": [],
+            "golden_error_class": None,
         },
         config=thread_config,
     )
-    return _extract_case_result(result["messages"], result.get("self_correct_attempts", 0))
+    case_result = _extract_case_result(result["messages"], result.get("self_correct_attempts", 0))
+    case_result.golden_examples = len(result.get("golden_examples") or [])
+    return case_result
 
 
 @dataclass
@@ -344,7 +395,7 @@ def _check_pii_leak(case: GoldenCase, result: CaseResult) -> CheckOutcome:
     """
     if not case.pii_sensitive:
         return CheckOutcome("pii_leak", True, "not a PII-sensitive case")
-    match = _EMAIL_PATTERN.search(result.answer_text)
+    match = EMAIL_PATTERN.search(result.answer_text)
     passed = match is None
     detail = "no email-shaped text found" if passed else f"email-shaped text found: {match.group(0)!r}"
     return CheckOutcome("pii_leak", passed, detail)
@@ -482,6 +533,23 @@ class EvalReport:
     pass_rate: float
 
 
+def _check_golden_examples(case: GoldenCase, result: CaseResult) -> CheckOutcome:
+    """Whether a case that expects Golden Bucket examples got at least one.
+
+    Args:
+        case: The case being checked.
+        result: The run's result.
+
+    Returns:
+        A `CheckOutcome`; passes trivially when the case doesn't expect
+        examples.
+    """
+    if not case.expects_golden_examples:
+        return CheckOutcome("golden_examples", True, "not expected")
+    passed = result.golden_examples >= 1
+    return CheckOutcome("golden_examples", passed, f"{result.golden_examples} example(s) retrieved")
+
+
 def _run_deterministic_checks(case: GoldenCase, result: CaseResult) -> list[CheckOutcome]:
     """Run every deterministic check for one case.
 
@@ -497,10 +565,11 @@ def _run_deterministic_checks(case: GoldenCase, result: CaseResult) -> list[Chec
         _check_expected_tables(case, result),
         _check_expected_keywords(case, result),
         _check_pii_leak(case, result),
+        _check_golden_examples(case, result),
     ]
 
 
-def _score_case(graph, judge_model, case: GoldenCase) -> CaseReport:
+def _score_case(graph, judge_model, case: GoldenCase, prepare=None) -> CaseReport:
     """Run one case and score it, containing any failure to this one case.
 
     A live run through the real graph can fail for reasons that have
@@ -517,6 +586,9 @@ def _score_case(graph, judge_model, case: GoldenCase) -> CaseReport:
         graph: A compiled graph, as `run_case` expects.
         judge_model: A tool-unbound chat model, as `judge_case` expects.
         case: The case to run and score.
+        prepare: Optional `prepare(case)` run first — `run_eval` uses it to
+            reset and seed the eval's Golden Bucket. A failure here is
+            reported as this case's `run_error`, like a run failure.
 
     Returns:
         A `CaseReport`. `run_error` is set (and `passed` is `False`) if
@@ -524,6 +596,8 @@ def _score_case(graph, judge_model, case: GoldenCase) -> CaseReport:
         deterministic-checks-then-judge scoring applies.
     """
     try:
+        if prepare is not None:
+            prepare(case)
         result = run_case(graph, case)
     except Exception as exc:
         placeholder_verdict = JudgeVerdict(
@@ -552,7 +626,8 @@ def run_eval(config, golden_set_path: str) -> EvalReport:
     """Run the full golden set through the real agent and score every case.
 
     Builds one real graph (live Gemini + live BigQuery + the Saved
-    Reports/Conversation Postgres stores, via `cli._build_graph`) and a
+    Reports/Conversation Postgres stores, via `cli._build_graph`, with the
+    Golden Bucket pointed at the eval's own `EVAL_GOLDEN_TABLE`) and a
     single tool-unbound judge model, then runs and scores every case in
     turn via `_score_case` — one case's live failure never aborts the rest
     of the run.
@@ -566,11 +641,29 @@ def run_eval(config, golden_set_path: str) -> EvalReport:
     """
     from langchain_google_genai import ChatGoogleGenerativeAI
 
+    from retail_agent.golden_bucket import GeminiEmbedder, GoldenBucketStore
+
     cases = load_golden_set(golden_set_path)
+    config = dataclasses.replace(config, golden_table=EVAL_GOLDEN_TABLE)
     graph, _conversation_store, _owner = _build_graph(config)
+    golden_store = GoldenBucketStore(config.reports_database_url, table=EVAL_GOLDEN_TABLE)
+    embedder = GeminiEmbedder(api_key=config.gemini_api_key, model=config.golden_embedding_model)
+
+    def prepare(case: GoldenCase) -> None:
+        golden_store.clear()
+        for seed in case.seed_trios:
+            golden_store.add_trio(
+                question=seed["question"],
+                sql=seed["sql"],
+                report=seed["report"],
+                embedding=embedder.embed(seed["question"]),
+                embedding_model=config.golden_embedding_model,
+                approved_by="eval-seed",
+            )
+
     judge_model = ChatGoogleGenerativeAI(model=config.gemini_model, api_key=config.gemini_api_key, max_retries=1)
 
-    case_reports = [_score_case(graph, judge_model, case) for case in cases]
+    case_reports = [_score_case(graph, judge_model, case, prepare=prepare) for case in cases]
 
     pass_rate = sum(1 for r in case_reports if r.passed) / len(case_reports) if case_reports else 0.0
     return EvalReport(case_reports=case_reports, pass_rate=pass_rate)

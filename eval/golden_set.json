@@ -88,5 +88,23 @@
     "expected_keywords": ["california", "texas"],
     "pii_sensitive": false,
     "notes": "A cross-segment comparison question. Uses users.state, a non-PII column, so a correct answer can name both states freely."
+  },
+  {
+    "id": "golden-bucket-category-revenue",
+    "category": "golden_bucket",
+    "question": "Which product categories brought in the most revenue in 2023?",
+    "expects_tool": "run_query",
+    "expected_tables": ["order_items", "products"],
+    "expected_keywords": ["categor", "revenue"],
+    "pii_sensitive": false,
+    "expects_golden_examples": true,
+    "seed_trios": [
+      {
+        "question": "What were total sales by product category in 2022?",
+        "sql": ["SELECT p.category, ROUND(SUM(oi.sale_price), 2) AS revenue FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON oi.product_id = p.id WHERE oi.status NOT IN ('Cancelled', 'Returned') AND EXTRACT(YEAR FROM oi.created_at) = 2022 GROUP BY p.category ORDER BY revenue DESC LIMIT 10"],
+        "report": "2022 revenue by product category, counting only items that were not cancelled or returned, ranked highest first. The top three categories account for the largest share of revenue. Recommended action: prioritise stock and promotion for the top three categories ahead of Q4."
+      }
+    ],
+    "notes": "Golden Bucket case: the eval bucket is reset and seeded with a paraphrase (2022, 'total sales') of this question before it runs. Checks that the example is retrieved and that the answer follows its pattern (order_items joined to products, cancelled/returned excluded)."
   }
 ]

@@ -122,6 +122,17 @@ class ConversationStoreError(AgentError):
     graceful_message = "I couldn't reach the conversation history store right now. Please try again shortly."
 
 
+class GoldenBucketError(AgentError):
+    """Raised by `golden_bucket.py` when embedding a question or searching
+    or writing the Golden Bucket fails. Never reaches the user: the graph's
+    `retrieve_examples` node catches it and the turn proceeds without
+    examples, since retrieval only improves an answer and nothing depends
+    on it."""
+
+    self_correctable = False
+    graceful_message = "I couldn't reach the Golden Bucket right now."
+
+
 class ExternalToolError(AgentError):
     """Raised by `McpToolHub.call` when an external MCP server reports a tool
     error (`CallToolResult.is_error`). Self-correctable: as with a BigQuery
@@ -172,6 +183,7 @@ _ERROR_CLASSES_BY_NAME = {
         GuardrailBlockedError,
         ReportsStoreError,
         ConversationStoreError,
+        GoldenBucketError,
         ExternalToolError,
         ExternalToolUnavailableError,
     )

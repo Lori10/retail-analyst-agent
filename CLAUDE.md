@@ -32,9 +32,11 @@ High-Stakes Oversight (Saved Reports Store + interrupt-based
 confirm-then-delete), Observability (structured JSON tracing +
 LangSmith), Quality Assurance (golden-set eval harness —
 `eval/golden_set.json` + `eval.py` + `scripts/run_eval.py`, deterministic
-checks + LLM-as-judge, run manually). Designed in docs only:
-Hybrid Intelligence/Golden Bucket, Continuous Improvement,
-Agility/Persona Management.
+checks + LLM-as-judge, run manually), Hybrid Intelligence/Golden Bucket
+(`golden_bucket.py`: analyst-approved trios in pgvector, approved via
+`scripts/approve_trio.py`, retrieved per turn by the `retrieve_examples`
+node; change `add-golden-bucket`). Designed in docs only: Continuous
+Improvement, Agility/Persona Management.
 
 Also coded, beyond the eight requirements: an MCP server
 (`mcp_server.py`, `uv run retail-mcp`, stdio, official `mcp` SDK v2
@@ -76,6 +78,11 @@ because `langchain-mcp-adapters` pins `mcp<2`.
   (8) MCP client — the agent as an MCP host: external servers' tools
   bound next to the built-ins, namespaced `<server>__<tool>`, destructive
   tools skipped unless allowlisted, unreachable servers skipped.
+  (9) Golden Bucket — saved reports record their source question/SQL;
+  an analyst approves trios offline (`scripts/approve_trio.py`); each
+  turn retrieves up to 3 similar trios (pgvector, `gemini-embedding-2`)
+  as per-turn reference data; any retrieval failure degrades to "no
+  examples".
 - Tests first: write failing tests from the change's spec scenarios before
   implementation, and never weaken an existing test unless its spec changed.
 - Ask before adding a dependency.

@@ -1,5 +1,6 @@
-"""Regenerate the LangGraph structure diagram used in the OpenSpec baseline
-design (openspec/changes/archive/*-baseline-current-system/design.md).
+"""Regenerate the LangGraph structure diagram kept in the design.md of the
+latest OpenSpec change that altered the graph (first the baseline, then
+add-golden-bucket).
 
 Prints Mermaid syntax derived directly from the real compiled StateGraph
 (nodes, edges, conditional routing) — never hand-maintained, so it can't

@@ -2,6 +2,7 @@ import logging
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from retail_agent.errors import ReportsStoreError
 
@@ -18,6 +19,17 @@ CREATE TABLE IF NOT EXISTS reports (
     tags TEXT NOT NULL DEFAULT ''
 )
 """
+
+# Added by the Golden Bucket change: the question and SQL that produced a
+# report, recorded by the graph at save time (never supplied by the model)
+# so an analyst can later promote the report into a Golden Bucket trio.
+# Separate ALTERs so databases created before the change pick them up.
+_DDL_SOURCE_COLUMNS = (
+    "ALTER TABLE reports ADD COLUMN IF NOT EXISTS source_question TEXT",
+    "ALTER TABLE reports ADD COLUMN IF NOT EXISTS source_sql JSONB",
+)
+
+_SOURCE_COLUMNS = ("source_question", "source_sql")
 
 
 class ReportsStore:
@@ -43,7 +55,13 @@ class ReportsStore:
                 connection string.
         """
         self._conn = psycopg.connect(database_url, autocommit=True, row_factory=dict_row)
-        self._call(lambda: self._conn.execute(_DDL), stage="init")
+
+        def _init():
+            self._conn.execute(_DDL)
+            for ddl in _DDL_SOURCE_COLUMNS:
+                self._conn.execute(ddl)
+
+        self._call(_init, stage="init")
 
     def _call(self, fn, *, stage: str):
         """Run a psycopg call, classifying any `psycopg.Error` into
@@ -77,8 +95,11 @@ class ReportsStore:
             A dict with `tags` as `list[str]` (empty list for an empty
             string) and `created_at` as a plain ISO 8601 string, rather
             than the raw comma-joined column value / `datetime` object.
+            `source_question`/`source_sql` are left out — they're review
+            material for `get_report_for_review`, not part of what the
+            agent or an MCP client sees.
         """
-        data = dict(row)
+        data = {k: v for k, v in row.items() if k not in _SOURCE_COLUMNS}
         data["tags"] = data["tags"].split(",") if data["tags"] else []
         data["created_at"] = data["created_at"].isoformat()
         return data
@@ -91,6 +112,8 @@ class ReportsStore:
         content: str,
         conversation_id: str,
         tags: list[str] | None = None,
+        source_question: str | None = None,
+        source_sql: list[str] | None = None,
     ) -> dict:
         """Persist a new report.
 
@@ -102,18 +125,24 @@ class ReportsStore:
             tags: Optional list of tag strings. Stored as a comma-joined
                 string — a tag containing a literal comma isn't supported,
                 an accepted prototype trade-off (the OpenSpec baseline design).
+            source_question: The user message that led to the report, as
+                captured by the graph; `None` when unknown (MCP saves).
+            source_sql: The successful queries behind the report, in run
+                order, as captured by the graph; `None` when there were
+                none or they're unknown (MCP saves).
 
         Returns:
             The saved report as a dict, including its assigned `id` and the
             server-assigned `created_at`.
         """
         tags_str = ",".join(tags) if tags else ""
+        sql_json = Jsonb(source_sql) if source_sql else None
 
         def _insert():
             row = self._conn.execute(
-                "INSERT INTO reports (owner, title, content, conversation_id, tags) "
-                "VALUES (%s, %s, %s, %s, %s) RETURNING *",
-                (owner, title, content, conversation_id, tags_str),
+                "INSERT INTO reports (owner, title, content, conversation_id, tags, source_question, source_sql) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *",
+                (owner, title, content, conversation_id, tags_str, source_question, sql_json),
             ).fetchone()
             return self._row_to_dict(row)
 
@@ -137,6 +166,59 @@ class ReportsStore:
             return [self._row_to_dict(row) for row in rows]
 
         return self._call(_select, stage="list_reports")
+
+    def get_report_for_review(self, report_id: int) -> dict | None:
+        """Fetch one report, including its source question and SQL, for
+        analyst review before Golden Bucket approval.
+
+        Deliberately not owner-scoped: the analyst curating the Golden
+        Bucket is a different person from the manager who saved the report.
+        Only `scripts/approve_trio.py` calls this — it is never exposed as
+        an agent or MCP tool, so the owner scoping of everything a manager
+        can reach is unchanged.
+
+        Args:
+            report_id: The report's id.
+
+        Returns:
+            The report as a dict with `source_question` (str or `None`) and
+            `source_sql` (list of str or `None`) added, or `None` if no
+            report has that id.
+        """
+
+        def _select():
+            row = self._conn.execute("SELECT * FROM reports WHERE id = %s", (report_id,)).fetchone()
+            if row is None:
+                return None
+            data = self._row_to_dict(row)
+            data["source_question"] = row["source_question"]
+            data["source_sql"] = row["source_sql"]
+            return data
+
+        return self._call(_select, stage="get_report_for_review")
+
+    def list_reports_for_review(self, limit: int = 50) -> list[dict]:
+        """List recent reports across all owners for an analyst choosing
+        what to promote into the Golden Bucket. Same caveat as
+        `get_report_for_review`: never exposed to the agent or MCP.
+
+        Args:
+            limit: Maximum number of reports, most recent first.
+
+        Returns:
+            Dicts with `id`, `owner`, `title`, `created_at` and
+            `has_source_sql`.
+        """
+
+        def _select():
+            rows = self._conn.execute(
+                "SELECT id, owner, title, created_at, source_sql IS NOT NULL AS has_source_sql "
+                "FROM reports ORDER BY created_at DESC LIMIT %s",
+                (limit,),
+            ).fetchall()
+            return [{**row, "created_at": row["created_at"].isoformat()} for row in rows]
+
+        return self._call(_select, stage="list_reports_for_review")
 
     def find_candidates(
         self,

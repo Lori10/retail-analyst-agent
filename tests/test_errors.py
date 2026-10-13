@@ -4,6 +4,7 @@ from retail_agent.errors import (
     ConversationStoreError,
     ExternalToolError,
     ExternalToolUnavailableError,
+    GoldenBucketError,
     GuardrailBlockedError,
     ProviderAuthError,
     ProviderError,
@@ -31,6 +32,7 @@ NOT_SELF_CORRECTABLE = {
     ReportsStoreError,
     ConversationStoreError,
     ExternalToolUnavailableError,
+    GoldenBucketError,
 }
 
 

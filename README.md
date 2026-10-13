@@ -13,7 +13,7 @@ a regression-gate eval harness, not just a happy-path demo.
 
 - **Design → build, not just build.** A full production design
   ([baseline design](openspec/changes/archive/2026-10-13-baseline-current-system/design.md)) covering all 8 requirements, with
-  the prototype implementing 5 of them — every coded piece traces back to
+  the prototype implementing 6 of them — every coded piece traces back to
   a documented design decision and to a behaviour spec in
   [openspec/specs/](openspec/specs/).
 - **Safety & PII masking** — an input-side guardrail against prompt
@@ -34,6 +34,11 @@ a regression-gate eval harness, not just a happy-path demo.
 - **Observability** — structured JSON tracing plus LangSmith
   auto-instrumentation, so every LLM call, tool call, and turn is
   reconstructable end to end. See [Observability](#observability) below.
+- **Hybrid intelligence** — a Golden Bucket of analyst-approved
+  (question, SQL, report) examples in pgvector: each new question pulls
+  in the most similar approved ones as reference for that turn, and a
+  report only enters the bucket when an analyst approves it. See
+  [Golden Bucket](#golden-bucket) below.
 - **Quality Assurance** — a golden-set eval harness with deterministic
   checks and an LLM-as-judge rubric, run as a manual regression gate. See
   [Quality Assurance](#quality-assurance) below.
@@ -60,7 +65,7 @@ flowchart TB
         BQ[("BigQuery\nthelook_ecommerce\n(read-only)")]
         Checkpoints[("Conversation Checkpoint Store\nMemorystore for Redis (prod)\nInMemorySaver (prototype)")]
         Conversations[("Conversation Store\nPostgres — Cloud SQL (prod) /\nsame database as Reports (prototype) — coded")]
-        GoldenBucket[("Golden Bucket\npgvector on Cloud SQL (prod)\nlocal JSON + cosine (design reference)")]
+        GoldenBucket[("Golden Bucket\npgvector on Cloud SQL (prod) /\nsame database as Reports (prototype) — coded")]
         Reports[("Saved Reports Store\nPostgres — Cloud SQL (prod) /\ndocker-compose (prototype) — coded")]
         Prefs[("User Preference Store\nFirestore (prod) —\ndocs-only in prototype")]
         Persona[("Persona Config\nCloud Storage/Firestore (prod)\nlocal persona.yaml (design reference)")]
@@ -89,13 +94,14 @@ flowchart TB
 ```
 
 *The production architecture — everything with "coded" in its label is
-running in this prototype today; the rest (Golden Bucket, Persona Config,
-Preference Store) is designed in full in
+running in this prototype today; the rest (Persona Config, Preference
+Store) is designed in full in
 the [baseline design](openspec/changes/archive/2026-10-13-baseline-current-system/design.md) and tracked as open changes in
 [openspec/changes/](openspec/changes/), but out of scope for the prototype.*
 
 There's a second diagram worth knowing about:
-[the baseline design's "Current graph structure"](openspec/changes/archive/2026-10-13-baseline-current-system/design.md#current-graph-structure-generated-not-hand-drawn)
+[the graph structure in the Golden Bucket change's design](openspec/changes/add-golden-bucket/design.md#graph-structure-after-this-change-generated)
+(which supersedes the [baseline's](openspec/changes/archive/2026-10-13-baseline-current-system/design.md#current-graph-structure-generated-not-hand-drawn))
 is generated directly from the compiled LangGraph `StateGraph`
 (`graph.get_graph().draw_mermaid()`, regenerated with
 `uv run python scripts/render_graph.py`), not hand-drawn — it shows exactly
@@ -106,7 +112,7 @@ hand-maintained diagram can.
 
 | # | Requirement | Status |
 |---|---|---|
-| 1 | Hybrid Intelligence (Golden Bucket) | Designed only |
+| 1 | Hybrid Intelligence (Golden Bucket) | **Coded** |
 | 2 | Safety & PII Masking | **Coded** |
 | 3 | High-Stakes Oversight | **Coded** |
 | 4 | Continuous Improvement | Designed only |
@@ -115,8 +121,9 @@ hand-maintained diagram can.
 | 7 | Observability | **Coded** |
 | 8 | Agility (Persona Management) | Designed only |
 
-5 of 8 requirements are coded. The other 3 are designed in full but left
-out of the prototype.
+6 of 8 requirements are coded. The other 2 are designed in full but left
+out of the prototype. Hybrid Intelligence was added after the baseline by
+the [add-golden-bucket](openspec/changes/add-golden-bucket/) change.
 Full reasoning and trade-offs for every row:
 [baseline proposal](openspec/changes/archive/2026-10-13-baseline-current-system/proposal.md#prototype-vs-production-scope-matrix).
 
@@ -157,10 +164,19 @@ this is still one thing to set up, not two.
 ### 4. Saved Reports Store & Conversation Store (Postgres)
 
 - Requires Docker (or an already-running Postgres — see below)
-- `docker compose up -d postgres` starts a local Postgres (`postgres:16`)
-  with two databases: `retail_agent_reports` (what the CLI uses) and
-  `retail_agent_reports_test` (what the test suite uses, so running tests
-  never truncates reports/conversations saved during interactive use)
+- `docker compose up -d postgres` starts a local Postgres
+  (`pgvector/pgvector:pg16` — Postgres 16 with the pgvector extension the
+  Golden Bucket needs) with two databases: `retail_agent_reports` (what
+  the CLI uses) and `retail_agent_reports_test` (what the test suite uses,
+  so running tests never truncates reports/conversations saved during
+  interactive use)
+- Upgrading from the earlier `postgres:16-alpine` image: the same `pgdata`
+  volume works, but the collation changes from musl to glibc, so rebuild
+  the text indexes once —
+  `docker compose exec postgres psql -U retail_agent -d retail_agent_reports -c 'REINDEX DATABASE retail_agent_reports'`
+  (and the same for `retail_agent_reports_test`). If you don't need the
+  local reports/conversations, `docker compose down -v` and starting
+  fresh does the same.
 - `ReportsStore` and `ConversationStore` each create their own tables on
   first connect (`CREATE TABLE IF NOT EXISTS`) — no separate migration
   step, and no separate connection string: both point at
@@ -202,7 +218,9 @@ Optional env vars (defaults shown): `GEMINI_MODEL=gemini-3.6-flash`,
 `REPORTS_DATABASE_URL=postgresql://retail_agent:retail_agent@localhost:5432/retail_agent_reports`,
 `TRACE_LOG_DESTINATION=stderr` ([Observability](#observability)'s structured JSON events;
 also accepts `stdout` or a file path), `AGENT_MCP_SERVERS` (unset; a path to
-a `.mcp.json`-shaped file of external MCP servers — [baseline design](openspec/changes/archive/2026-10-13-baseline-current-system/design.md), "MCP Client").
+a `.mcp.json`-shaped file of external MCP servers — [baseline design](openspec/changes/archive/2026-10-13-baseline-current-system/design.md), "MCP Client"),
+`GOLDEN_EMBEDDING_MODEL=gemini-embedding-2`, `GOLDEN_MIN_SIMILARITY=0.75`,
+`GOLDEN_BUCKET_TABLE=golden_trios` ([Golden Bucket](#golden-bucket)).
 
 LangSmith conversation-level tracing (see [Observability](#observability)) is optional and
 off by default — no signup needed to run the CLI at all. To turn it on,
@@ -283,6 +301,34 @@ Running a query...
 
 An external server's own stderr is hidden unless `LOG_LEVEL=DEBUG`.
 
+### Golden Bucket
+
+When the agent saves a report, it records the question and the
+successful SQL that produced it (captured by the graph, never written by
+the model). An analyst then promotes good reports into the Golden Bucket:
+
+```bash
+uv run python scripts/approve_trio.py --list            # recent reports, all owners
+uv run python scripts/approve_trio.py --report-id 42    # review, confirm, store
+uv run python scripts/approve_trio.py --report-id 42 \
+    --question "Revenue by category last month?" \
+    --sql-file edited.sql --report-file edited.md       # approve with edits
+```
+
+Edited SQL must pass the same read-only check as agent queries, and the
+question and report are rejected if they contain an email-shaped string.
+Re-approving a report stores a new version and retires the old one.
+Reports saved over MCP (or saved before this feature) have no recorded
+SQL and need `--sql-file`.
+
+On each question, the agent embeds it, takes up to 3 approved trios at or
+above `GOLDEN_MIN_SIMILARITY`, and gives them to the model for that turn
+only — never stored in the conversation. If the bucket or the embeddings
+call is unavailable, the turn simply runs without examples. Each `turn`
+trace event carries `golden_examples` (count), `golden_top_similarity` and
+`golden_error_class`, but never trio text. Design and rejected
+alternatives: [add-golden-bucket design](openspec/changes/add-golden-bucket/design.md).
+
 ### Inspecting internals (PII stripping, self-correct)
 
  `retail-agent`
@@ -337,11 +383,12 @@ Instead of Self-Hosted Langfuse"); behaviour contract in
 
 ## Quality Assurance
 
-A golden-set eval harness (`eval/golden_set.json`) runs 9 hand-curated
+A golden-set eval harness (`eval/golden_set.json`) runs 10 hand-curated
 questions — one per capability the agent is meant to cover — through the
 real compiled graph and scores each answer two ways: cheap deterministic
 checks first (was the expected tool called, did the SQL touch an expected
-table, does the answer mention an expected keyword, no PII-shaped text),
+table, does the answer mention an expected keyword, no PII-shaped text,
+and for the Golden Bucket case, was a seeded example retrieved),
 then an LLM-as-judge pass scoring whether the answer addresses the question
 asked, whether its claims are internally plausible, and whether it leaks
 PII.
@@ -352,7 +399,10 @@ uv run python scripts/run_eval.py [--golden-set eval/golden_set.json] [--out eva
 
 This makes real, billed Gemini + BigQuery calls, so — like
 `tests/integration/` — it's a deliberate manual action, never run by
-`uv run pytest`. `--fail-under` exits non-zero below a pass-rate threshold,
+`uv run pytest`. It uses its own Golden Bucket table (`golden_trios_eval`),
+reset before every case and seeded only with that case's `seed_trios`, so
+trios approved for real use never influence eval results.
+`--fail-under` exits non-zero below a pass-rate threshold,
 for wiring into CI later without further code changes. Full reasoning and
 accepted gaps (sample size, no ground-truth SQL diffing, single-run
 variance):
@@ -411,9 +461,9 @@ changes:
 - [Baseline proposal](openspec/changes/archive/2026-10-13-baseline-current-system/proposal.md) —
   requirement-by-requirement coverage and the prototype vs. production
   scope matrix.
-- [openspec/changes/](openspec/changes/) — open changes: the designed-only
-  requirements (Golden Bucket, user preferences, persona config) and the
-  production deployment.
+- [openspec/changes/](openspec/changes/) — open changes: the Golden Bucket
+  (implemented, awaiting archive), the designed-only requirements (user
+  preferences, persona config) and the production deployment.
 - [openspec/config.yaml](openspec/config.yaml) — project constraints and
   per-artifact rules applied to every new change.
 - [CLAUDE.md](CLAUDE.md) — build constraints and workflow.
