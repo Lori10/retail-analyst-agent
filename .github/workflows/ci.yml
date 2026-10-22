@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      # Same image as docker-compose.yml; tests use the separate _test database.
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: retail_agent
+          POSTGRES_PASSWORD: retail_agent
+          POSTGRES_DB: retail_agent_reports_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U retail_agent -d retail_agent_reports_test"
+          --health-interval 2s --health-timeout 2s --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: uv sync --frozen
+      - name: ruff
+        run: uv run ruff check src tests scripts eval
+      - name: pytest (offline; live tests and eval are never run in CI)
+        run: uv run pytest -q
+      - name: openspec validate
+        run: npx --yes @fission-ai/openspec@1.14.1 validate --all --strict
