@@ -53,8 +53,10 @@ because `langchain-mcp-adapters` pins `mcp<2`.
 ## Workflow
 - Spec before code. Every change goes through OpenSpec: `/opsx:explore`
   (optional) → `/opsx:propose` → user reviews and approves the proposal,
-  spec deltas, design and tasks → `/opsx:apply` → `/opsx:archive` once
-  merged. Don't write source until the change's artifacts are approved.
+  spec deltas, design and tasks → `/opsx:apply` → `/opsx:archive` on the
+  feature branch, before merging (code, updated specs and archived change
+  land in one merge). Don't write source until the change's artifacts are
+  approved. Step-by-step guide with an example: `CONTRIBUTING.md`.
 - Run the CLI pinned: `npx @fission-ai/openspec@1.14.1 <cmd>` (e.g.
   `validate --all --strict`, `list --specs`). The generated `/opsx:*`
   skills call a bare `openspec`; use the pinned npx form instead.
@@ -97,6 +99,8 @@ because `langchain-mcp-adapters` pins `mcp<2`.
   `git push`, or any merge into `main`. Show what will be committed/merged
   first (diff or file list); don't bundle the confirmation into a single
   "ok to do all of this?" for unrelated steps.
+- No `Co-Authored-By: Claude` trailer on commits and no "Generated with
+  Claude Code" line on PRs (user decision, 2026-10-13).
 
 ## Provided code
 `src/provided/bq_runner.py` was supplied by the company as an example of how
