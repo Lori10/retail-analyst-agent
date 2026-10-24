@@ -9,3 +9,5 @@ __pycache__/
 retail_agent.log
 trace.jsonl
 eval_results.json
+CLAUDE.local.md
+.claude/settings.local.json

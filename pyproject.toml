@@ -31,4 +31,15 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "ruff>=0.17.1",
 ]
+
+[tool.ruff]
+target-version = "py311"
+# Company-supplied example, kept verbatim and unused (see CLAUDE.md).
+extend-exclude = ["src/provided"]
+
+[tool.ruff.lint]
+# Syntax errors + pyflakes only: catches real bugs (undefined names, unused
+# imports) without a style-churn pass over the existing code.
+select = ["E9", "F"]
