@@ -35,6 +35,24 @@ already proposed — skip steps 1–2, start at step 3 on a new branch.
 fix spec/design/tasks, re-approve, continue `/opsx:apply`. Code never drifts
 from the spec silently.
 
+## Three test layers
+
+They overlap on purpose: each one catches what the one before it can miss.
+
+| Layer | Runs | Checks | Can be skipped? |
+|---|---|---|---|
+| `stop_tests.sh` (Stop hook) | Automatically at the end of every turn that changed `src/`, `tests/` or `pyproject.toml` | Offline pytest (`-x`) | No: the harness runs it, not Claude |
+| `/verify` → `check.sh` | When asked: the last offline task in every `tasks.md`, and inside `/land-branch` | ruff, pytest, `openspec validate`, weakened-test scan, diff vs plan | Yes, an instruction can be forgotten; the next two layers cover it |
+| CI → `check.sh` | Every PR push and every push to `main` | Same gates as `check.sh`, in a clean environment | No: `main` requires a green `checks` job |
+
+- The Stop hook refuses to end a turn on a red suite, so Claude can't report "done" with failing tests
+  even in a quick fix outside the OpenSpec loop. Exception: when **only** `tests/` changed (the
+  tests-first group), it reports the failures instead of blocking, so you can review the red tests
+  before any implementation.
+- `check.sh` stamps a clean tree that passes every gate (with no test hunks left to review) in
+  `.git/verify-pass`. `check.sh --if-stale` skips the gates for that same tree, which is how
+  `/land-branch` avoids re-running a `/verify` that just passed. CI never uses the stamp.
+
 ## Long sessions
 
 - `/opsx:apply` on a big change: set a checkable finish line, e.g.
@@ -49,7 +67,8 @@ from the spec silently.
 - `.github/workflows/ci.yml` runs `.claude/skills/verify/check.sh` (the same gates as `/verify`:
   ruff, offline pytest with a pgvector Postgres service, `openspec validate --all --strict`,
   weakened-test scan) on every PR and on pushes to `main`. A branch without a PR gets no CI.
-  It makes no live GCP/Gemini calls.
+  It makes no live GCP/Gemini calls. A possibly weakened test doesn't fail the job (it's a
+  judgment call); it shows up as a warning on the PR. uv downloads are cached.
 - `main` is protected by a GitHub ruleset: changes land only through a PR whose `checks` job is
   green; no force-push, no deletion, no bypass (admins included, since Claude uses your token).
   Only merge commits are allowed, which keeps the `--no-ff` history.
@@ -90,7 +109,9 @@ reversible"). `tasks.md` starts with failing tests in
 `test_reports_store.py`, `test_graph.py`, `test_mcp_server.py` and ends with a
 manual live run.
 
-After you approve: `/opsx:apply add-report-rename` (red → green),
-`uv run pytest`, the live run, `/opsx:archive add-report-rename`,
-`/land-branch`. `main` gets one merge commit carrying the code, the updated
+After you approve: `/opsx:apply add-report-rename` (red → green, one commit
+per task group: `test: failing rename tests`, `feat: store`, `feat: agent tool`,
+`feat: MCP tool`, `docs: …`; a draft PR opens after the first group that passes
+`/verify`), the live run, `/opsx:archive add-report-rename`, `/land-branch`.
+`main` gets one merge commit carrying those commits, the updated
 `report-management` spec and the archived change with its design history.
