@@ -13,7 +13,8 @@ context: |
     user_geom) must never appear in any output, log, trace, transcript or MCP response.
   - CLI only, no web UI. Prefer simple and working over clever.
   - Live BigQuery/Gemini calls (tests/integration, scripts/run_eval.py) never run under `uv run pytest`.
-  - Git: feature branch off main, simple merge, explicit user confirmation before every commit, push, merge.
+  - Git: feature branch off main, merge commit via PR. Commits and feature-branch pushes need no
+    confirmation; every merge does.
   - Baseline design and rationale: openspec/changes/archive/2026-10-13-baseline-current-system/design.md.
 
 rules:
@@ -26,4 +27,5 @@ rules:
   tasks:
     - First task group writes failing tests for the spec scenarios
     - Never edit an existing test to make it pass unless the spec changed
+    - The last offline task group ends with a task to run `/verify` and confirm PASS
     - Live/billed checks (integration tests, eval harness) are a separate final task, run manually
