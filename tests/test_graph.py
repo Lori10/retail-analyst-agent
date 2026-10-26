@@ -81,10 +81,11 @@ class FakeReportsStore:
     logic — the delete tests need genuine mutation to assert against, unlike
     FakeBigQueryTool's canned-response scripts."""
 
-    def __init__(self, *, raise_on_find=None):
+    def __init__(self, *, raise_on_find=None, raise_on_rename=None):
         self._reports = []
         self._next_id = 1
         self._raise_on_find = raise_on_find
+        self._raise_on_rename = raise_on_rename
         self.deleted_ids = []
         self.sources = {}
 
@@ -123,6 +124,18 @@ class FakeReportsStore:
         before = len(self._reports)
         self._reports = [r for r in self._reports if not (r["owner"] == owner and r["id"] in ids)]
         return before - len(self._reports)
+
+    def rename_report(self, owner, report_id, new_title):
+        if self._raise_on_rename is not None:
+            raise self._raise_on_rename
+        title = new_title.strip()
+        if not title:
+            raise ValueError("blank title")
+        for report in self._reports:
+            if report["owner"] == owner and report["id"] == report_id:
+                old_title, report["title"] = report["title"], title
+                return {"id": report_id, "old_title": old_title, "title": title}
+        return None
 
 
 def _model_response(*, text=None, tool_call=None):
@@ -179,6 +192,10 @@ def _save_report_call(id_, title="Q1 Report", content="Revenue up."):
 
 def _list_reports_call(id_):
     return {"name": "list_reports", "args": {}, "id": id_}
+
+
+def _rename_report_call(id_, report_id, new_title):
+    return {"name": "rename_report", "args": {"report_id": report_id, "new_title": new_title}, "id": id_}
 
 
 def _delete_reports_call(id_, scope="conversation", title_contains=None):
@@ -656,6 +673,97 @@ def test_delete_reports_store_error_declines_gracefully():
     assert provider.calls == 1
     assert "__interrupt__" not in result
     assert "couldn't reach" in _final_text(result).lower()
+
+
+# --- Rename (npx @fission-ai/openspec@1.14.1 change add-report-rename) ---------------------------------
+
+
+def test_rename_report_goes_through_normal_tools_node_without_interrupt():
+    provider = FakeProvider(
+        [
+            _model_response(tool_call=_rename_report_call("call-1", 1, "Q3 weekly sales")),
+            _model_response(text="Renamed Weekly sales to Q3 weekly sales."),
+        ]
+    )
+    reports_store = FakeReportsStore()
+    reports_store.save_report(owner="test-owner", title="Weekly sales", content="x", conversation_id="t40")
+    graph = build_graph(provider, FakeBigQueryTool(), reports_store, "test-owner", system_instruction="test")
+
+    result = _invoke(graph, "t40", "Rename my weekly sales report to Q3 weekly sales.")
+
+    assert "__interrupt__" not in result
+    assert provider.calls == 2
+    assert _function_response_payload(result, "call-1") == {
+        "renamed": True,
+        "id": 1,
+        "old_title": "Weekly sales",
+        "title": "Q3 weekly sales",
+    }
+    assert reports_store.list_reports("test-owner")[0]["title"] == "Q3 weekly sales"
+
+
+def test_rename_report_blank_title_returns_an_error_payload_the_model_answers():
+    provider = FakeProvider(
+        [
+            _model_response(tool_call=_rename_report_call("call-1", 1, "   ")),
+            _model_response(text="What would you like to call it?"),
+        ]
+    )
+    reports_store = FakeReportsStore()
+    reports_store.save_report(owner="test-owner", title="Old", content="x", conversation_id="t41")
+    graph = build_graph(provider, FakeBigQueryTool(), reports_store, "test-owner", system_instruction="test")
+
+    result = _invoke(graph, "t41", "Rename it to nothing.")
+
+    assert _function_response_payload(result, "call-1") == {"error": "The new title can't be blank."}
+    assert _final_text(result) == "What would you like to call it?"
+    assert result["self_correct_attempts"] == 0
+    assert reports_store.list_reports("test-owner")[0]["title"] == "Old"
+
+
+def test_rename_report_of_another_owners_report_returns_not_found_payload():
+    provider = FakeProvider(
+        [
+            _model_response(tool_call=_rename_report_call("call-1", 1, "Mine now")),
+            _model_response(text="I couldn't find that report."),
+        ]
+    )
+    reports_store = FakeReportsStore()
+    reports_store.save_report(owner="someone-else", title="Theirs", content="x", conversation_id="t42")
+    graph = build_graph(provider, FakeBigQueryTool(), reports_store, "test-owner", system_instruction="test")
+
+    result = _invoke(graph, "t42", "Rename report 1 to Mine now.")
+
+    assert _function_response_payload(result, "call-1") == {"error": "Report not found."}
+    assert _final_text(result) == "I couldn't find that report."
+    assert result["self_correct_attempts"] == 0
+    assert reports_store.list_reports("someone-else")[0]["title"] == "Theirs"
+
+
+def test_rename_report_with_a_non_numeric_id_returns_not_found_payload():
+    provider = FakeProvider(
+        [
+            _model_response(tool_call=_rename_report_call("call-1", "the sales one", "New")),
+            _model_response(text="Which report do you mean?"),
+        ]
+    )
+    reports_store = FakeReportsStore()
+    graph = build_graph(provider, FakeBigQueryTool(), reports_store, "test-owner", system_instruction="test")
+
+    result = _invoke(graph, "t44", "Rename the sales one to New.")
+
+    assert _function_response_payload(result, "call-1") == {"error": "Report not found."}
+    assert _final_text(result) == "Which report do you mean?"
+
+def test_rename_report_store_error_declines_gracefully():
+    provider = FakeProvider([_model_response(tool_call=_rename_report_call("call-1", 1, "New"))])
+    reports_store = FakeReportsStore(raise_on_rename=ReportsStoreError("db locked"))
+    graph = build_graph(provider, FakeBigQueryTool(), reports_store, "test-owner", system_instruction="test")
+
+    result = _invoke(graph, "t43", "Rename report 1 to New.")
+
+    assert provider.calls == 1
+    assert _final_text(result) == "I couldn't reach the saved reports store right now. Please try again shortly."
 
 
 # --- External MCP tools (McpToolHub) ------------------------------------------

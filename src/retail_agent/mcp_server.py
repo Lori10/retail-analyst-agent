@@ -14,7 +14,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from retail_agent.config import ConfigError, load_config
 from retail_agent.errors import AgentError
 from retail_agent.startup import StartupError, build_bq_tool, build_reports_store
-from retail_agent.tools import DELETE_REPORTS, GET_SCHEMA, LIST_REPORTS, RUN_QUERY, SAVE_REPORT
+from retail_agent.tools import DELETE_REPORTS, GET_SCHEMA, LIST_REPORTS, RENAME_REPORT, RUN_QUERY, SAVE_REPORT
 from retail_agent.tracing import configure_tracing, log_event
 
 if TYPE_CHECKING:
@@ -183,6 +183,17 @@ def build_server(
     def list_reports() -> dict:
         with traced("list_reports"):
             return {"reports": reports_store.list_reports(owner)}
+
+    @server.tool(description=RENAME_REPORT["description"])
+    def rename_report(report_id: int, new_title: str) -> dict:
+        with traced("rename_report"):
+            try:
+                renamed = reports_store.rename_report(owner, report_id, new_title)
+            except ValueError:
+                raise ToolError("The new title can't be blank.") from None
+            if renamed is None:
+                raise ToolError("Report not found.")
+            return {"renamed": True, **renamed}
 
     @server.tool(description=PREVIEW_DELETE_DESCRIPTION)
     def preview_delete(scope: DeleteScope, title_contains: str | None = None) -> dict:

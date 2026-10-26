@@ -181,7 +181,7 @@ def test_no_single_step_delete_tool_is_exposed():
     names = _list_tool_names(_server())
 
     assert names == sorted(
-        ["get_schema", "run_query", "save_report", "list_reports", "preview_delete", "confirm_delete"]
+        ["get_schema", "run_query", "save_report", "list_reports", "rename_report", "preview_delete", "confirm_delete"]
     )
 
 
@@ -270,6 +270,53 @@ def test_report_saved_over_mcp_carries_no_source_question_or_sql():
     _, saved = _call(server, "save_report", {"title": "Q1", "content": "Revenue up."})
 
     assert store.sources[saved["id"]] == {"source_question": None, "source_sql": None}
+
+
+def test_rename_report_renames_an_own_report_and_returns_old_and_new_title():
+    store = FakeReportsStore()
+    (report_id,) = _seed(store, "Weekly sales")
+    server = _server(reports_store=store)
+
+    is_error, payload = _call(server, "rename_report", {"report_id": report_id, "new_title": " Q3 weekly sales "})
+
+    assert not is_error
+    assert payload == {"renamed": True, "id": report_id, "old_title": "Weekly sales", "title": "Q3 weekly sales"}
+    assert store.list_reports(OWNER)[0]["title"] == "Q3 weekly sales"
+
+
+def test_rename_report_of_another_owners_report_is_a_not_found_tool_error():
+    store = FakeReportsStore()
+    (bobs_id,) = _seed(store, "Bob's report", owner="bob")
+    server = _server(reports_store=store)
+
+    is_error, message = _call(server, "rename_report", {"report_id": bobs_id, "new_title": "Mine now"})
+
+    assert is_error
+    assert "not found" in message.lower()
+    assert store.list_reports("bob")[0]["title"] == "Bob's report"
+
+
+def test_rename_report_with_a_blank_title_is_a_tool_error_and_changes_nothing():
+    store = FakeReportsStore()
+    (report_id,) = _seed(store, "Old")
+    server = _server(reports_store=store)
+
+    is_error, message = _call(server, "rename_report", {"report_id": report_id, "new_title": "   "})
+
+    assert is_error
+    assert "blank" in message.lower()
+    assert store.list_reports(OWNER)[0]["title"] == "Old"
+
+
+def test_rename_report_emits_a_tool_call_trace_event(trace_events):
+    store = FakeReportsStore()
+    (report_id,) = _seed(store, "Old")
+    server = _server(reports_store=store)
+
+    _call(server, "rename_report", {"report_id": report_id, "new_title": "New"})
+
+    tool_events = [e for e in trace_events if e["message"] == "tool_call"]
+    assert [(e["tool"], e["transport"], e["error_class"]) for e in tool_events] == [("rename_report", "mcp", None)]
 
 
 # --- Observability --------------------------------------------------------------

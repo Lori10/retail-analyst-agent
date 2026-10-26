@@ -153,7 +153,8 @@ def _run_tool(
 
     Args:
         bq_tool: The BigQuery wrapper to call for `run_query`/`get_schema`.
-        reports_store: The reports store to call for `save_report`/`list_reports`.
+        reports_store: The reports store to call for `save_report`/
+            `list_reports`/`rename_report`.
         owner: The current user's identity, scoping all reports store calls.
         conversation_id: The LangGraph thread id, recorded on saved reports.
         name: Tool name.
@@ -186,6 +187,21 @@ def _run_tool(
         return {"saved": True, "id": report["id"], "title": report["title"]}
     if name == "list_reports":
         return {"reports": reports_store.list_reports(owner)}
+    if name == "rename_report":
+        # Blank and not-found are ordinary results for the model to relay,
+        # not `AgentError`s — those would end the turn or spend the SQL
+        # self-correct budget.
+        try:
+            report_id = int(args["report_id"])
+        except (TypeError, ValueError):
+            return {"error": "Report not found."}
+        try:
+            renamed = reports_store.rename_report(owner, report_id, args["new_title"])
+        except ValueError:
+            return {"error": "The new title can't be blank."}
+        if renamed is None:
+            return {"error": "Report not found."}
+        return {"renamed": True, **renamed}
     if mcp_hub is not None and mcp_hub.has_tool(name):
         return mcp_hub.call(name, args)
     return {"error": f"Unknown tool: {name}"}

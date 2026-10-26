@@ -220,6 +220,43 @@ class ReportsStore:
 
         return self._call(_select, stage="list_reports_for_review")
 
+    def rename_report(self, owner: str, report_id: int, new_title: str) -> dict | None:
+        """Change one report's title, scoped to `owner`.
+
+        Owner scoping is applied in the `UPDATE` itself, as in
+        `delete_reports`, so a missing id and another owner's id are the
+        same "not found" case and the caller can't tell them apart. The old
+        title comes back from the same statement, so no concurrent rename
+        can land between a read and the write.
+
+        Args:
+            owner: Requesting user's identity.
+            report_id: The report to rename.
+            new_title: The new title; leading/trailing whitespace is
+                trimmed. Duplicates of another report's title are allowed.
+
+        Returns:
+            `{"id", "old_title", "title"}`, or `None` if `owner` has no
+            report with that id.
+
+        Raises:
+            ValueError: `new_title` is blank after trimming. Raised before
+                any database call, so nothing changes.
+        """
+        title = new_title.strip()
+        if not title:
+            raise ValueError("The new title can't be blank.")
+
+        def _update():
+            return self._conn.execute(
+                "WITH old AS (SELECT id, title FROM reports WHERE owner = %s AND id = %s FOR UPDATE) "
+                "UPDATE reports r SET title = %s FROM old WHERE r.id = old.id "
+                "RETURNING r.id, old.title AS old_title, r.title",
+                (owner, report_id, title),
+            ).fetchone()
+
+        return self._call(_update, stage="rename_report")
+
     def find_candidates(
         self,
         owner: str,
