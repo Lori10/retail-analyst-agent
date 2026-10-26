@@ -48,7 +48,8 @@ from the spec silently.
 
 - `.github/workflows/ci.yml` runs `.claude/skills/verify/check.sh` (the same gates as `/verify`:
   ruff, offline pytest with a pgvector Postgres service, `openspec validate --all --strict`,
-  weakened-test scan) on every push and PR. It makes no live GCP/Gemini calls.
+  weakened-test scan) on every PR and on pushes to `main`. A branch without a PR gets no CI.
+  It makes no live GCP/Gemini calls.
 - `main` is protected by a GitHub ruleset: changes land only through a PR whose `checks` job is
   green; no force-push, no deletion, no bypass (admins included, since Claude uses your token).
   Only merge commits are allowed, which keeps the `--no-ff` history.

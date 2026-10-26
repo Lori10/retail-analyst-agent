@@ -1,7 +1,10 @@
 name: CI
 
+# PRs cover feature branches; push covers the merge commit on main. Without the
+# branch filter every PR push ran `checks` twice (push + pull_request refs differ).
 on:
   push:
+    branches: [main]
   pull_request:
 
 # Least privilege: CI only reads the repo. Actions are pinned to commit SHAs (public repo).
