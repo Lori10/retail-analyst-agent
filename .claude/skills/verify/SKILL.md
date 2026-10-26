@@ -1,6 +1,6 @@
 ---
 name: verify
-description: Verify finished work before calling it done — run every gate (ruff, offline pytest, openspec validate, weakened-test scan), read the diff against the plan, and report PASS/FAIL with evidence. Use after an /opsx:apply task group, after any code change, and before /finish-branch.
+description: Verify finished work before calling it done — run every gate (ruff, offline pytest, openspec validate, weakened-test scan), read the diff against the plan, and report PASS/FAIL with evidence. Use after an /opsx:apply task group, after any code change, and before /land-branch.
 ---
 
 # Verify
