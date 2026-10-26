@@ -17,7 +17,7 @@
       "mcp__retail-analyst__list_reports",
       "mcp__retail-analyst__run_query",
       "Bash(git add:*)", "Bash(git commit:*)", "Bash(git push:*)",
-      "Bash(gh pr create:*)", "Bash(gh pr view:*)", "Bash(gh pr checks:*)",
+      "Bash(gh pr create:*)", "Bash(gh pr view:*)", "Bash(gh pr checks:*)", "Bash(gh pr ready:*)",
       "Bash(gh run list:*)", "Bash(gh run view:*)", "Bash(gh run watch:*)"
     ],
     "ask": [
