@@ -33,7 +33,7 @@ and MCP client (`mcp_client.py`, `AGENT_MCP_SERVERS`).
 - `lint_py.sh` (after each edit) and `stop_tests.sh` (pytest before a turn ends).
 
 ## Git
-- Branch off up-to-date `main` (`feat/…`, `fix/…`, `chore/…`, `docs/…`). Commit after each task group that passes `/verify`. `main` is protected on GitHub (PR + green `checks` required, no bypass); land work with `/land-branch`. No rebase or squash unless asked.
+- Branch off up-to-date `main` (`feat/…`, `fix/…`, `chore/…`, `docs/…`). During `/opsx:apply`, make one commit per task group, the tests-first group included (it is red by design). After the first group that passes `/verify`, push and open a draft PR (`gh pr create --draft`, body links the change folder), then push after each later group. `main` is protected on GitHub (PR + green `checks` required, no bypass); land work with `/land-branch`. No rebase or squash unless asked.
 - No `Co-Authored-By: Claude` trailer on commits and no "Generated with Claude Code" line on PRs (user decision, 2026-10-13).
 
 ## Data

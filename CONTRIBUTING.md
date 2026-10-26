@@ -19,11 +19,11 @@ The rules themselves live elsewhere and are not repeated here:
 | 1 | `/opsx:explore` *(optional)* | Think the idea through against the specs and baseline design. Writes nothing unless you say so. | — |
 | 2 | `/opsx:propose <idea>` | Creates `openspec/changes/<name>/` with `proposal.md`, delta `specs/`, `design.md`, `tasks.md`. Stops before any code. | — |
 | 3 | Review | Read all four. Revise with `/opsx:update <name>` (keeps them coherent). Run `validate <name> --strict`. | **you** approve the plan and any new dependency |
-| 4 | `/opsx:apply <name>` | Task group 1 writes failing tests from the spec scenarios; later groups make them pass; tasks get ticked `- [x]`. | — |
+| 4 | `/opsx:apply <name>` | Task group 1 writes failing tests from the spec scenarios; later groups make them pass; tasks get ticked `- [x]`. One commit per task group; after the first group that passes `/verify`, push and open a draft PR so others can follow, then push after each group. | — |
 | 5 | `/verify` | ruff, offline `uv run pytest` (needs `docker compose up -d postgres`), `validate --all --strict`, weakened-test scan, diff vs plan → PASS/FAIL with evidence. For anything non-trivial also `/code-review` (or a fresh sub-agent review), `/security-review`, `/run`. | — |
 | 6 | Live checks | Last task group: integration tests / `scripts/run_eval.py` / manual CLI run against live Gemini + BigQuery. Billed, never in default pytest. | **you** run or approve |
 | 7 | `/opsx:archive <name>` | Delta specs merge into `openspec/specs/`; change moves to `openspec/changes/archive/YYYY-MM-DD-<name>/`. Done on the branch, before merging. | — |
-| 8 | `/land-branch` | Commit → push branch → `gh pr create` → `gh pr checks --watch` (red: Claude fixes and pushes again) → merge commit via `gh pr merge --merge --delete-branch` → pull `main`. | **you** approve the merge; GitHub blocks it until CI is green |
+| 8 | `/land-branch` | Commit → `check.sh --if-stale` (skips the gates if this tree already passed) → push branch → `gh pr create`, or `gh pr ready` on the draft → `gh pr checks --watch` (red: Claude fixes and pushes again) → merge commit via `gh pr merge --merge --delete-branch` → pull `main`. | **you** approve the merge; GitHub blocks it until CI is green |
 
 OpenSpec CLI is always run pinned:
 `npx @fission-ai/openspec@1.14.1 <cmd>` (e.g. `list`, `list --specs`, `validate --all --strict`).
