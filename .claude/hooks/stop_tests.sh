@@ -16,6 +16,13 @@ if ! (exec 3<>/dev/tcp/127.0.0.1/5432) 2>/dev/null; then
 fi
 
 if ! out=$(timeout 300 uv run --quiet pytest -q -x 2>&1); then
+  # Only tests/ changed: the tests-first group's expected red state. Report it, don't block,
+  # so the user can review the failing tests before any implementation.
+  if ! git status --porcelain -- src pyproject.toml | grep -q .; then
+    jq -n --arg t "$(tail -5 <<<"$out")" \
+      '{systemMessage: ("Stop hook: tests fail with only tests/ changed (tests-first red state, not blocking):\n" + $t)}'
+    exit 0
+  fi
   echo "Tests fail — fix them before finishing (never weaken a test to pass):" >&2
   tail -40 <<<"$out" >&2
   exit 2
