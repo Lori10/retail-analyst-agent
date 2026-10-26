@@ -31,8 +31,9 @@ a regression-gate eval harness, not just a happy-path demo.
   LangGraph `interrupt()`-based confirm-then-delete flow: destructive
   requests ("delete all reports mentioning Client X") pause, show the
   exact candidates, and require an explicit yes before anything is removed.
-  Renaming a report (`rename_report`) changes one title, can be undone,
-  and runs without a confirmation pause.
+  Renaming a report (`rename_report`) changes one title and runs without a
+  confirmation pause; the reply names the old title, so renaming it back
+  restores it.
 - **Observability** — structured JSON tracing plus LangSmith
   auto-instrumentation, so every LLM call, tool call, and turn is
   reconstructable end to end. See [Observability](#observability) below.

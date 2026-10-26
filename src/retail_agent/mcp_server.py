@@ -186,14 +186,13 @@ def build_server(
 
     @server.tool(description=RENAME_REPORT["description"])
     def rename_report(report_id: int, new_title: str) -> dict:
+        from retail_agent.reports_store import rename_report_payload
+
         with traced("rename_report"):
-            try:
-                renamed = reports_store.rename_report(owner, report_id, new_title)
-            except ValueError:
-                raise ToolError("The new title can't be blank.") from None
-            if renamed is None:
-                raise ToolError("Report not found.")
-            return {"renamed": True, **renamed}
+            payload = rename_report_payload(reports_store, owner, report_id, new_title)
+            if "error" in payload:
+                raise ToolError(payload["error"])
+            return payload
 
     @server.tool(description=PREVIEW_DELETE_DESCRIPTION)
     def preview_delete(scope: DeleteScope, title_contains: str | None = None) -> dict:

@@ -31,6 +31,64 @@ _DDL_SOURCE_COLUMNS = (
 
 _SOURCE_COLUMNS = ("source_question", "source_sql")
 
+# `reports.id` is SERIAL (int4); a larger id would make Postgres raise,
+# which `_call` would misreport as the store being unreachable.
+_MAX_REPORT_ID = 2**31 - 1
+
+RENAME_BLANK_TITLE = "The new title can't be blank."
+RENAME_NOT_FOUND = "Report not found."
+
+
+def _coerce_report_id(value) -> int | None:
+    """Accept only a value that unambiguously names one report id.
+
+    Model tool arguments arrive as JSON, so a whole-number float (`2.0`) or
+    a digit string (`"2"`) is accepted. Anything that would need rounding
+    or truncation (`2.7`), a bool (`True` is an `int` in Python), or an id
+    outside the column's range returns `None`, so a malformed argument can
+    never rename a report the user didn't pick.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        value = int(value) if value.is_integer() else None
+    elif isinstance(value, str):
+        value = int(value) if value.isdecimal() else None
+    if not isinstance(value, int) or not 1 <= value <= _MAX_REPORT_ID:
+        return None
+    return value
+
+
+def rename_report_payload(store: "ReportsStore", owner: str, report_id, new_title) -> dict:
+    """Run a model- or client-requested rename and describe the outcome.
+
+    Shared by the CLI graph and the MCP server so both validate arguments
+    and word their errors the same way. Blank and not-found are returned,
+    not raised: for the graph they are ordinary results the model relays,
+    and an `AgentError` would end the turn or spend the SQL self-correct
+    budget. `ReportsStoreError` still propagates.
+
+    Args:
+        store: The reports store (or a test double with `rename_report`).
+        owner: Requesting user's identity.
+        report_id: The id exactly as the tool call supplied it.
+        new_title: The title exactly as the tool call supplied it; `None`
+            or a non-string counts as blank.
+
+    Returns:
+        `{"renamed": True, "id", "old_title", "title"}`, or
+        `{"error": RENAME_BLANK_TITLE | RENAME_NOT_FOUND}`.
+    """
+    if not isinstance(new_title, str) or not new_title.strip():
+        return {"error": RENAME_BLANK_TITLE}
+    coerced_id = _coerce_report_id(report_id)
+    if coerced_id is None:
+        return {"error": RENAME_NOT_FOUND}
+    renamed = store.rename_report(owner, coerced_id, new_title)
+    if renamed is None:
+        return {"error": RENAME_NOT_FOUND}
+    return {"renamed": True, **renamed}
+
 
 class ReportsStore:
     """Postgres-backed store for the "Saved Reports" library (the OpenSpec
@@ -245,7 +303,7 @@ class ReportsStore:
         """
         title = new_title.strip()
         if not title:
-            raise ValueError("The new title can't be blank.")
+            raise ValueError(RENAME_BLANK_TITLE)
 
         def _update():
             return self._conn.execute(

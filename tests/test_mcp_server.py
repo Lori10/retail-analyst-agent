@@ -308,6 +308,14 @@ def test_rename_report_with_a_blank_title_is_a_tool_error_and_changes_nothing():
     assert store.list_reports(OWNER)[0]["title"] == "Old"
 
 
+def test_rename_report_with_an_out_of_range_id_is_a_not_found_tool_error():
+    server = _server(reports_store=FakeReportsStore())
+
+    is_error, message = _call(server, "rename_report", {"report_id": 2**31, "new_title": "New"})
+
+    assert is_error
+    assert "not found" in message.lower()
+
 def test_rename_report_emits_a_tool_call_trace_event(trace_events):
     store = FakeReportsStore()
     (report_id,) = _seed(store, "Old")

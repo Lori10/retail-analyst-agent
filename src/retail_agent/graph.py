@@ -16,7 +16,7 @@ from retail_agent.golden_bucket import format_examples
 from retail_agent.guardrail import check_user_input
 from retail_agent.llm_provider import GeminiProvider
 from retail_agent.mcp_client import McpToolHub
-from retail_agent.reports_store import ReportsStore
+from retail_agent.reports_store import ReportsStore, rename_report_payload
 from retail_agent.tracing import log_event
 
 logger = logging.getLogger(__name__)
@@ -188,20 +188,7 @@ def _run_tool(
     if name == "list_reports":
         return {"reports": reports_store.list_reports(owner)}
     if name == "rename_report":
-        # Blank and not-found are ordinary results for the model to relay,
-        # not `AgentError`s — those would end the turn or spend the SQL
-        # self-correct budget.
-        try:
-            report_id = int(args["report_id"])
-        except (TypeError, ValueError):
-            return {"error": "Report not found."}
-        try:
-            renamed = reports_store.rename_report(owner, report_id, args["new_title"])
-        except ValueError:
-            return {"error": "The new title can't be blank."}
-        if renamed is None:
-            return {"error": "Report not found."}
-        return {"renamed": True, **renamed}
+        return rename_report_payload(reports_store, owner, args.get("report_id"), args.get("new_title"))
     if mcp_hub is not None and mcp_hub.has_tool(name):
         return mcp_hub.call(name, args)
     return {"error": f"Unknown tool: {name}"}

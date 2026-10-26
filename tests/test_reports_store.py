@@ -4,7 +4,7 @@ import psycopg
 import pytest
 
 from retail_agent.errors import ReportsStoreError
-from retail_agent.reports_store import ReportsStore
+from retail_agent.reports_store import ReportsStore, rename_report_payload
 
 TEST_DATABASE_URL = os.environ.get(
     "REPORTS_DATABASE_URL", "postgresql://retail_agent:retail_agent@localhost:5432/retail_agent_reports_test"
@@ -183,7 +183,7 @@ def test_list_reports_for_review_spans_owners_and_flags_source_sql(store):
     assert listed["A"]["owner"] == "alice"
 
 
-# -- rename (npx @fission-ai/openspec@1.14.1 change add-report-rename) --------------------------------
+# -- rename (openspec change add-report-rename) --------------------------------
 
 
 def test_rename_report_changes_only_the_title_and_returns_old_and_new(store):
@@ -247,3 +247,10 @@ def test_rename_report_underlying_psycopg_error_raises_reports_store_error(store
 
     with pytest.raises(ReportsStoreError):
         store.rename_report("alice", report["id"], "New")
+
+
+def test_rename_report_payload_treats_an_out_of_range_id_as_not_found(store):
+    store.save_report(owner="alice", title="A", content="x", conversation_id="c1")
+
+    assert rename_report_payload(store, "alice", 2**31, "New") == {"error": "Report not found."}
+    assert store.list_reports("alice")[0]["title"] == "A"

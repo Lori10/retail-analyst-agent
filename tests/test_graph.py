@@ -675,7 +675,7 @@ def test_delete_reports_store_error_declines_gracefully():
     assert "couldn't reach" in _final_text(result).lower()
 
 
-# --- Rename (npx @fission-ai/openspec@1.14.1 change add-report-rename) ---------------------------------
+# --- Rename (openspec change add-report-rename) ---------------------------------
 
 
 def test_rename_report_goes_through_normal_tools_node_without_interrupt():
@@ -754,6 +754,64 @@ def test_rename_report_with_a_non_numeric_id_returns_not_found_payload():
 
     assert _function_response_payload(result, "call-1") == {"error": "Report not found."}
     assert _final_text(result) == "Which report do you mean?"
+
+
+@pytest.mark.parametrize("report_id", [2.7, True, None, "abc", -1])
+def test_rename_report_with_a_malformed_id_renames_nothing(report_id):
+    provider = FakeProvider(
+        [
+            _model_response(tool_call=_rename_report_call("call-1", report_id, "New")),
+            _model_response(text="Which report do you mean?"),
+        ]
+    )
+    reports_store = FakeReportsStore()
+    reports_store.save_report(owner="test-owner", title="One", content="x", conversation_id="t45")
+    reports_store.save_report(owner="test-owner", title="Two", content="x", conversation_id="t45")
+    graph = build_graph(provider, FakeBigQueryTool(), reports_store, "test-owner", system_instruction="test")
+
+    result = _invoke(graph, "t45", "Rename it to New.")
+
+    assert _function_response_payload(result, "call-1") == {"error": "Report not found."}
+    assert sorted(r["title"] for r in reports_store.list_reports("test-owner")) == ["One", "Two"]
+
+
+@pytest.mark.parametrize("report_id", [2.0, "2"])
+def test_rename_report_accepts_a_whole_number_id_sent_as_float_or_digits(report_id):
+    provider = FakeProvider(
+        [
+            _model_response(tool_call=_rename_report_call("call-1", report_id, "New")),
+            _model_response(text="Done."),
+        ]
+    )
+    reports_store = FakeReportsStore()
+    reports_store.save_report(owner="test-owner", title="One", content="x", conversation_id="t46")
+    reports_store.save_report(owner="test-owner", title="Two", content="x", conversation_id="t46")
+    graph = build_graph(provider, FakeBigQueryTool(), reports_store, "test-owner", system_instruction="test")
+
+    result = _invoke(graph, "t46", "Rename report 2 to New.")
+
+    assert _function_response_payload(result, "call-1")["id"] == 2
+    assert [r["title"] for r in reports_store.list_reports("test-owner")] == ["One", "New"]
+
+
+@pytest.mark.parametrize("args", [{"report_id": 1}, {"report_id": 1, "new_title": None}])
+def test_rename_report_with_a_missing_or_null_title_returns_an_error_payload(args):
+    provider = FakeProvider(
+        [
+            _model_response(tool_call={"name": "rename_report", "args": args, "id": "call-1"}),
+            _model_response(text="What would you like to call it?"),
+        ]
+    )
+    reports_store = FakeReportsStore()
+    reports_store.save_report(owner="test-owner", title="Old", content="x", conversation_id="t47")
+    graph = build_graph(provider, FakeBigQueryTool(), reports_store, "test-owner", system_instruction="test")
+
+    result = _invoke(graph, "t47", "Rename it.")
+
+    assert _function_response_payload(result, "call-1") == {"error": "The new title can't be blank."}
+    assert _final_text(result) == "What would you like to call it?"
+    assert reports_store.list_reports("test-owner")[0]["title"] == "Old"
+
 
 def test_rename_report_store_error_declines_gracefully():
     provider = FakeProvider([_model_response(tool_call=_rename_report_call("call-1", 1, "New"))])

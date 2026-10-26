@@ -117,6 +117,22 @@ MCP clients get the guidance too.
   the Postgres-backed `tests/test_reports_store.py`; the fake only has to
   produce the same three outcomes (dict, `None`, `ValueError`).
 
+### Found in code review (after archive, fixed on the same branch)
+
+- [`int()` truncated a malformed id: `2.7` became 2 and `True` became 1, so
+  the wrong report could be renamed] → `rename_report_payload` accepts only
+  an int, a whole-number float or a digit string, and rejects bools.
+- [A missing or `null` `new_title` raised `KeyError`/`AttributeError`, which
+  `call_tools` doesn't catch] → treated as a blank title.
+- [An id above the int4 range made Postgres raise, which was reported as the
+  store being unreachable] → range-checked and reported as not found.
+- [The argument checks and error texts were duplicated in `graph.py` and
+  `mcp_server.py`] → one `rename_report_payload` helper in
+  `reports_store.py`, used by both. The graph returns its payload as it is;
+  MCP turns an `error` into a `ToolError`.
+- Accepted: the "Ambiguous request" scenario still has no offline test (see
+  Risks); task 6.1 covers it.
+
 ## Migration Plan
 
 No schema change (`title` already exists). Deploy is a normal merge. Rollback is
