@@ -15,7 +15,10 @@
       "Bash(.claude/skills/verify/check.sh:*)",
       "mcp__retail-analyst__get_schema",
       "mcp__retail-analyst__list_reports",
-      "mcp__retail-analyst__run_query"
+      "mcp__retail-analyst__run_query",
+      "Bash(git add:*)", "Bash(git commit:*)", "Bash(git push:*)",
+      "Bash(gh pr create:*)", "Bash(gh pr view:*)", "Bash(gh pr checks:*)",
+      "Bash(gh run list:*)", "Bash(gh run view:*)", "Bash(gh run watch:*)"
     ],
     "ask": [
       "mcp__retail-analyst__confirm_delete"

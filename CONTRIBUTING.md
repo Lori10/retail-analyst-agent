@@ -23,7 +23,7 @@ The rules themselves live elsewhere and are not repeated here:
 | 5 | `/verify` | ruff, offline `uv run pytest` (needs `docker compose up -d postgres`), `validate --all --strict`, weakened-test scan, diff vs plan → PASS/FAIL with evidence. For anything non-trivial also `/code-review` (or a fresh sub-agent review), `/security-review`, `/run`. | — |
 | 6 | Live checks | Last task group: integration tests / `scripts/run_eval.py` / manual CLI run against live Gemini + BigQuery. Billed, never in default pytest. | **you** run or approve |
 | 7 | `/opsx:archive <name>` | Delta specs merge into `openspec/specs/`; change moves to `openspec/changes/archive/YYYY-MM-DD-<name>/`. Done on the branch, before merging. | — |
-| 8 | `/finish-branch` | Show diff → commit → push branch → `merge --no-ff` into `main` → delete branch. | **you** say yes to each of commit, push, merge separately |
+| 8 | `/finish-branch` | Commit → push branch → `gh pr create` → `gh pr checks --watch` (red: Claude fixes and pushes again) → merge commit via `gh pr merge --merge --delete-branch` → pull `main`. | **you** approve the merge; GitHub blocks it until CI is green |
 
 OpenSpec CLI is always run pinned:
 `npx @fission-ai/openspec@1.14.1 <cmd>` (e.g. `list`, `list --specs`, `validate --all --strict`).
@@ -46,8 +46,15 @@ from the spec silently.
 
 ## CI
 
-- `.github/workflows/ci.yml` runs ruff, offline pytest (with a pgvector Postgres service) and
-  `openspec validate --all --strict` on every push and PR. It makes no live GCP/Gemini calls.
+- `.github/workflows/ci.yml` runs `.claude/skills/verify/check.sh` (the same gates as `/verify`:
+  ruff, offline pytest with a pgvector Postgres service, `openspec validate --all --strict`,
+  weakened-test scan) on every push and PR. It makes no live GCP/Gemini calls.
+- `main` is protected by a GitHub ruleset: changes land only through a PR whose `checks` job is
+  green; no force-push, no deletion, no bypass (admins included, since Claude uses your token).
+  Only merge commits are allowed, which keeps the `--no-ff` history.
+- Commits and feature-branch pushes need no confirmation; the merge does. The repo is public, so a
+  push publishes: `.env` is gitignored, secret-scanning push protection is on, and `guard_git.sh`
+  asks before a push that adds secret-looking files.
 - `.github/workflows/claude.yml` answers `@claude` comments on issues and PRs (capped at 5 turns).
   One-time setup: run `/install-github-app` in Claude Code (repo admin), which sets the
   `ANTHROPIC_API_KEY` secret. This is dev tooling only; the agent itself stays Gemini-only.
