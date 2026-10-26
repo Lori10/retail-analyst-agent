@@ -16,7 +16,7 @@ from retail_agent.golden_bucket import format_examples
 from retail_agent.guardrail import check_user_input
 from retail_agent.llm_provider import GeminiProvider
 from retail_agent.mcp_client import McpToolHub
-from retail_agent.reports_store import ReportsStore
+from retail_agent.reports_store import ReportsStore, rename_report_payload
 from retail_agent.tracing import log_event
 
 logger = logging.getLogger(__name__)
@@ -153,7 +153,8 @@ def _run_tool(
 
     Args:
         bq_tool: The BigQuery wrapper to call for `run_query`/`get_schema`.
-        reports_store: The reports store to call for `save_report`/`list_reports`.
+        reports_store: The reports store to call for `save_report`/
+            `list_reports`/`rename_report`.
         owner: The current user's identity, scoping all reports store calls.
         conversation_id: The LangGraph thread id, recorded on saved reports.
         name: Tool name.
@@ -186,6 +187,8 @@ def _run_tool(
         return {"saved": True, "id": report["id"], "title": report["title"]}
     if name == "list_reports":
         return {"reports": reports_store.list_reports(owner)}
+    if name == "rename_report":
+        return rename_report_payload(reports_store, owner, args.get("report_id"), args.get("new_title"))
     if mcp_hub is not None and mcp_hub.has_tool(name):
         return mcp_hub.call(name, args)
     return {"error": f"Unknown tool: {name}"}

@@ -4,7 +4,7 @@ import psycopg
 import pytest
 
 from retail_agent.errors import ReportsStoreError
-from retail_agent.reports_store import ReportsStore
+from retail_agent.reports_store import ReportsStore, rename_report_payload
 
 TEST_DATABASE_URL = os.environ.get(
     "REPORTS_DATABASE_URL", "postgresql://retail_agent:retail_agent@localhost:5432/retail_agent_reports_test"
@@ -181,3 +181,76 @@ def test_list_reports_for_review_spans_owners_and_flags_source_sql(store):
     assert listed["A"]["has_source_sql"] is True
     assert listed["B"]["has_source_sql"] is False
     assert listed["A"]["owner"] == "alice"
+
+
+# -- rename (openspec change add-report-rename) --------------------------------
+
+
+def test_rename_report_changes_only_the_title_and_returns_old_and_new(store):
+    report = store.save_report(
+        owner="alice", title="Weekly sales", content="Revenue up.", conversation_id="c1", tags=["sales"]
+    )
+    before = store.list_reports("alice")[0]
+
+    result = store.rename_report("alice", report["id"], "Q3 weekly sales")
+
+    assert result == {"id": report["id"], "old_title": "Weekly sales", "title": "Q3 weekly sales"}
+    after = store.list_reports("alice")[0]
+    assert after == {**before, "title": "Q3 weekly sales"}
+
+
+def test_rename_report_trims_surrounding_whitespace(store):
+    report = store.save_report(owner="alice", title="Old", content="x", conversation_id="c1")
+
+    result = store.rename_report("alice", report["id"], "  Q3 churn  ")
+
+    assert result["title"] == "Q3 churn"
+    assert store.list_reports("alice")[0]["title"] == "Q3 churn"
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+def test_rename_report_rejects_a_blank_title_and_changes_nothing(store, blank):
+    report = store.save_report(owner="alice", title="Old", content="x", conversation_id="c1")
+
+    with pytest.raises(ValueError):
+        store.rename_report("alice", report["id"], blank)
+
+    assert store.list_reports("alice")[0]["title"] == "Old"
+
+
+def test_rename_report_allows_a_duplicate_title(store):
+    store.save_report(owner="alice", title="Sales", content="x", conversation_id="c1")
+    other = store.save_report(owner="alice", title="Other", content="y", conversation_id="c1")
+
+    result = store.rename_report("alice", other["id"], "Sales")
+
+    assert result["title"] == "Sales"
+    assert [r["title"] for r in store.list_reports("alice")] == ["Sales", "Sales"]
+
+
+def test_rename_report_of_another_owners_report_returns_none_and_changes_nothing(store):
+    bobs = store.save_report(owner="bob", title="Bob's", content="y", conversation_id="c2")
+
+    assert store.rename_report("alice", bobs["id"], "Mine now") is None
+    assert store.list_reports("bob")[0]["title"] == "Bob's"
+
+
+def test_rename_report_of_a_missing_id_returns_none(store):
+    report = store.save_report(owner="alice", title="A", content="x", conversation_id="c1")
+
+    assert store.rename_report("alice", report["id"] + 1000, "New") is None
+
+
+def test_rename_report_underlying_psycopg_error_raises_reports_store_error(store):
+    report = store.save_report(owner="alice", title="A", content="x", conversation_id="c1")
+    store._conn.close()
+
+    with pytest.raises(ReportsStoreError):
+        store.rename_report("alice", report["id"], "New")
+
+
+def test_rename_report_payload_treats_an_out_of_range_id_as_not_found(store):
+    store.save_report(owner="alice", title="A", content="x", conversation_id="c1")
+
+    assert rename_report_payload(store, "alice", 2**31, "New") == {"error": "Report not found."}
+    assert store.list_reports("alice")[0]["title"] == "A"

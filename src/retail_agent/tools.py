@@ -59,6 +59,23 @@ LIST_REPORTS = {
     "parameters": {"type": "object", "properties": {}},
 }
 
+RENAME_REPORT = {
+    "name": "rename_report",
+    "description": (
+        "Rename one of the user's saved reports, changing only its title. Find the report's id with "
+        "list_reports first. If two or more saved reports could be the one the user means, ask the "
+        "user which one before calling this tool — never pick one yourself."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "report_id": {"type": "integer", "description": "The id of the report, from list_reports."},
+            "new_title": {"type": "string", "description": "The report's new title. Must not be blank."},
+        },
+        "required": ["report_id", "new_title"],
+    },
+}
+
 DELETE_REPORTS = {
     "name": "delete_reports",
     "description": (
@@ -92,4 +109,4 @@ DELETE_REPORTS = {
     },
 }
 
-TOOLS = [RUN_QUERY, GET_SCHEMA, SAVE_REPORT, LIST_REPORTS, DELETE_REPORTS]
+TOOLS = [RUN_QUERY, GET_SCHEMA, SAVE_REPORT, LIST_REPORTS, RENAME_REPORT, DELETE_REPORTS]

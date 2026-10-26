@@ -31,6 +31,9 @@ a regression-gate eval harness, not just a happy-path demo.
   LangGraph `interrupt()`-based confirm-then-delete flow: destructive
   requests ("delete all reports mentioning Client X") pause, show the
   exact candidates, and require an explicit yes before anything is removed.
+  Renaming a report (`rename_report`) changes one title and runs without a
+  confirmation pause; the reply names the old title, so renaming it back
+  restores it.
 - **Observability** — structured JSON tracing plus LangSmith
   auto-instrumentation, so every LLM call, tool call, and turn is
   reconstructable end to end. See [Observability](#observability) below.
@@ -424,9 +427,9 @@ Opening this repo in Claude Code picks it up from `.mcp.json`. It needs
 BigQuery and Postgres as above, but no Gemini key — the client's model
 does the reasoning. Every guarantee is enforced under the tool, not left
 to the client: PII columns are stripped server-side, reports are
-owner-scoped, and deletion is two calls — `preview_delete` returns the
-exact candidates plus a short-lived token, and `confirm_delete(token)`
-deletes exactly those, once. Design and trade-offs:
+owner-scoped (including `rename_report`), and deletion is two calls —
+`preview_delete` returns the exact candidates plus a short-lived token,
+and `confirm_delete(token)` deletes exactly those, once. Design and trade-offs:
 [baseline design](openspec/changes/archive/2026-10-13-baseline-current-system/design.md) ("MCP Server" and "MCP Server Implementation
 Notes"); behaviour contract in
 [openspec/specs/mcp-server](openspec/specs/mcp-server/spec.md).

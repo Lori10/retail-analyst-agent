@@ -31,6 +31,64 @@ _DDL_SOURCE_COLUMNS = (
 
 _SOURCE_COLUMNS = ("source_question", "source_sql")
 
+# `reports.id` is SERIAL (int4); a larger id would make Postgres raise,
+# which `_call` would misreport as the store being unreachable.
+_MAX_REPORT_ID = 2**31 - 1
+
+RENAME_BLANK_TITLE = "The new title can't be blank."
+RENAME_NOT_FOUND = "Report not found."
+
+
+def _coerce_report_id(value) -> int | None:
+    """Accept only a value that unambiguously names one report id.
+
+    Model tool arguments arrive as JSON, so a whole-number float (`2.0`) or
+    a digit string (`"2"`) is accepted. Anything that would need rounding
+    or truncation (`2.7`), a bool (`True` is an `int` in Python), or an id
+    outside the column's range returns `None`, so a malformed argument can
+    never rename a report the user didn't pick.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        value = int(value) if value.is_integer() else None
+    elif isinstance(value, str):
+        value = int(value) if value.isdecimal() else None
+    if not isinstance(value, int) or not 1 <= value <= _MAX_REPORT_ID:
+        return None
+    return value
+
+
+def rename_report_payload(store: "ReportsStore", owner: str, report_id, new_title) -> dict:
+    """Run a model- or client-requested rename and describe the outcome.
+
+    Shared by the CLI graph and the MCP server so both validate arguments
+    and word their errors the same way. Blank and not-found are returned,
+    not raised: for the graph they are ordinary results the model relays,
+    and an `AgentError` would end the turn or spend the SQL self-correct
+    budget. `ReportsStoreError` still propagates.
+
+    Args:
+        store: The reports store (or a test double with `rename_report`).
+        owner: Requesting user's identity.
+        report_id: The id exactly as the tool call supplied it.
+        new_title: The title exactly as the tool call supplied it; `None`
+            or a non-string counts as blank.
+
+    Returns:
+        `{"renamed": True, "id", "old_title", "title"}`, or
+        `{"error": RENAME_BLANK_TITLE | RENAME_NOT_FOUND}`.
+    """
+    if not isinstance(new_title, str) or not new_title.strip():
+        return {"error": RENAME_BLANK_TITLE}
+    coerced_id = _coerce_report_id(report_id)
+    if coerced_id is None:
+        return {"error": RENAME_NOT_FOUND}
+    renamed = store.rename_report(owner, coerced_id, new_title)
+    if renamed is None:
+        return {"error": RENAME_NOT_FOUND}
+    return {"renamed": True, **renamed}
+
 
 class ReportsStore:
     """Postgres-backed store for the "Saved Reports" library (the OpenSpec
@@ -219,6 +277,43 @@ class ReportsStore:
             return [{**row, "created_at": row["created_at"].isoformat()} for row in rows]
 
         return self._call(_select, stage="list_reports_for_review")
+
+    def rename_report(self, owner: str, report_id: int, new_title: str) -> dict | None:
+        """Change one report's title, scoped to `owner`.
+
+        Owner scoping is applied in the `UPDATE` itself, as in
+        `delete_reports`, so a missing id and another owner's id are the
+        same "not found" case and the caller can't tell them apart. The old
+        title comes back from the same statement, so no concurrent rename
+        can land between a read and the write.
+
+        Args:
+            owner: Requesting user's identity.
+            report_id: The report to rename.
+            new_title: The new title; leading/trailing whitespace is
+                trimmed. Duplicates of another report's title are allowed.
+
+        Returns:
+            `{"id", "old_title", "title"}`, or `None` if `owner` has no
+            report with that id.
+
+        Raises:
+            ValueError: `new_title` is blank after trimming. Raised before
+                any database call, so nothing changes.
+        """
+        title = new_title.strip()
+        if not title:
+            raise ValueError(RENAME_BLANK_TITLE)
+
+        def _update():
+            return self._conn.execute(
+                "WITH old AS (SELECT id, title FROM reports WHERE owner = %s AND id = %s FOR UPDATE) "
+                "UPDATE reports r SET title = %s FROM old WHERE r.id = old.id "
+                "RETURNING r.id, old.title AS old_title, r.title",
+                (owner, report_id, title),
+            ).fetchone()
+
+        return self._call(_update, stage="rename_report")
 
     def find_candidates(
         self,
