@@ -21,7 +21,7 @@ and MCP client (`mcp_client.py`, `AGENT_MCP_SERVERS`).
 - `src/provided/bq_runner.py` is a company example kept verbatim and unused. `BigQueryTool` owns its own `bigquery.Client`.
 
 ## Workflow
-- Spec before code: `/opsx:propose` → user approves the artifacts → `/opsx:apply` → `/verify` → `/opsx:archive` on the branch → `/finish-branch`. Don't write source until the artifacts are approved.
+- Spec before code: `/opsx:propose` → user approves the artifacts → `/opsx:apply` → `/verify` → `/opsx:archive` on the branch → `/land-branch`. Don't write source until the artifacts are approved.
 - Tests first: write failing tests from the change's spec scenarios, then implement. Never weaken an existing test unless its spec changed (`/verify` scans for this).
 - `uv run pytest` is offline only and needs `docker compose up -d postgres`. Live checks (`tests/integration`, `scripts/run_eval.py`) are billed; the user runs or approves them.
 - Lint: `uv run ruff check` (E9 + F only).
@@ -33,7 +33,7 @@ and MCP client (`mcp_client.py`, `AGENT_MCP_SERVERS`).
 - `lint_py.sh` (after each edit) and `stop_tests.sh` (pytest before a turn ends).
 
 ## Git
-- Branch off up-to-date `main` (`feat/…`, `fix/…`, `chore/…`, `docs/…`). Commit after each task group that passes `/verify`. `main` is protected on GitHub (PR + green `checks` required, no bypass); land work with `/finish-branch`. No rebase or squash unless asked.
+- Branch off up-to-date `main` (`feat/…`, `fix/…`, `chore/…`, `docs/…`). Commit after each task group that passes `/verify`. `main` is protected on GitHub (PR + green `checks` required, no bypass); land work with `/land-branch`. No rebase or squash unless asked.
 - No `Co-Authored-By: Claude` trailer on commits and no "Generated with Claude Code" line on PRs (user decision, 2026-10-13).
 
 ## Data

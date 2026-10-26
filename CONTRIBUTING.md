@@ -23,7 +23,7 @@ The rules themselves live elsewhere and are not repeated here:
 | 5 | `/verify` | ruff, offline `uv run pytest` (needs `docker compose up -d postgres`), `validate --all --strict`, weakened-test scan, diff vs plan → PASS/FAIL with evidence. For anything non-trivial also `/code-review` (or a fresh sub-agent review), `/security-review`, `/run`. | — |
 | 6 | Live checks | Last task group: integration tests / `scripts/run_eval.py` / manual CLI run against live Gemini + BigQuery. Billed, never in default pytest. | **you** run or approve |
 | 7 | `/opsx:archive <name>` | Delta specs merge into `openspec/specs/`; change moves to `openspec/changes/archive/YYYY-MM-DD-<name>/`. Done on the branch, before merging. | — |
-| 8 | `/finish-branch` | Commit → push branch → `gh pr create` → `gh pr checks --watch` (red: Claude fixes and pushes again) → merge commit via `gh pr merge --merge --delete-branch` → pull `main`. | **you** approve the merge; GitHub blocks it until CI is green |
+| 8 | `/land-branch` | Commit → push branch → `gh pr create` → `gh pr checks --watch` (red: Claude fixes and pushes again) → merge commit via `gh pr merge --merge --delete-branch` → pull `main`. | **you** approve the merge; GitHub blocks it until CI is green |
 
 OpenSpec CLI is always run pinned:
 `npx @fission-ai/openspec@1.14.1 <cmd>` (e.g. `list`, `list --specs`, `validate --all --strict`).
@@ -92,5 +92,5 @@ manual live run.
 
 After you approve: `/opsx:apply add-report-rename` (red → green),
 `uv run pytest`, the live run, `/opsx:archive add-report-rename`,
-`/finish-branch`. `main` gets one merge commit carrying the code, the updated
+`/land-branch`. `main` gets one merge commit carrying the code, the updated
 `report-management` spec and the archived change with its design history.

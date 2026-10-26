@@ -1,9 +1,9 @@
 ---
-name: finish-branch
+name: land-branch
 description: Commit, push, open a PR, watch CI until green, and merge the current feature branch into main following this project's git workflow — merge commit only, explicit confirmation required before the merge. Use when a piece of work is ready to land on main.
 ---
 
-# Finish branch
+# Land branch
 
 Use when work on a feature branch is ready to land on `main`. `main` is protected by a
 GitHub ruleset (PR + green `checks` job required, no bypass), so the merge happens on

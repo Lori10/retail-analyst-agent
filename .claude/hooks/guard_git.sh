@@ -18,11 +18,13 @@ decide() {
 # Match git/gh subcommands anywhere in a compound command (a && git commit ...).
 git_sub() { grep -Eq "(^|[;&|(]|\s)git(\s+-C\s+\S+)?\s+$1(\s|$)" <<<"$cmd"; }
 gh_pr_merge() { grep -Eq "(^|[;&|(]|\s)gh\s+pr\s+merge(\s|$)" <<<"$cmd"; }
+# Only the push segment's own arguments, so `git push && gh pr create --base main` isn't a push to main.
+push_args() { grep -Eo "git(\s+-C\s+\S+)?\s+push[^;&|]*" <<<"$cmd" || true; }
 
 repo="${CLAUDE_PROJECT_DIR:-.}"
 branch=$(git -C "$repo" branch --show-current 2>/dev/null || true)
 
-if git_sub push && grep -Eq '(\s--force(-with-lease)?|\s-f)(\s|$)' <<<"$cmd"; then
+if git_sub push && grep -Eq '(\s--force(-with-lease)?|\s-f)(\s|$)' <<<"$(push_args)"; then
   decide deny "Force-push is not allowed in this repo (CLAUDE.md git workflow)."
 fi
 if git_sub rebase; then
@@ -34,8 +36,8 @@ fi
 if git_sub commit && [[ "$branch" == "main" ]]; then
   decide deny "Never commit on main. Create a feature branch first (/new-branch)."
 fi
-if git_sub push && { [[ "$branch" == "main" ]] || grep -Eq '(\s|:)main(\s|$)' <<<"$cmd"; }; then
-  decide deny "Never push to main. Land changes through a PR (/finish-branch)."
+if git_sub push && { [[ "$branch" == "main" ]] || grep -Eq '(\s|:)main(\s|$)' <<<"$(push_args)"; }; then
+  decide deny "Never push to main. Land changes through a PR (/land-branch)."
 fi
 if gh_pr_merge && grep -Eq '\s--admin(\s|$)' <<<"$cmd"; then
   decide deny "gh pr merge --admin bypasses the required CI check."
