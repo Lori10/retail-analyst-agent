@@ -1,30 +1,33 @@
 ---
 name: finish-branch
-description: Commit, push, and merge the current feature branch into main following this project's git workflow — simple merge, explicit confirmation required before every commit, push, and merge. Use when a piece of work is ready to land on main.
+description: Commit, push, open a PR, watch CI until green, and merge the current feature branch into main following this project's git workflow — merge commit only, explicit confirmation required before the merge. Use when a piece of work is ready to land on main.
 ---
 
 # Finish branch
 
-Use when work on a feature branch is ready to land on `main`. Every step below
-requires explicit user approval before running — never chain them into a
-single "ok to do all of this?" ask.
+Use when work on a feature branch is ready to land on `main`. `main` is protected by a
+GitHub ruleset (PR + green `checks` job required, no bypass), so the merge happens on
+GitHub, never locally. Commits and feature-branch pushes need no confirmation; the
+merge does.
 
-1. Confirm we are NOT on `main` (`git branch --show-current`). If we are,
-   stop — this workflow never commits or pushes to `main` directly.
-2. Show `git status` and `git diff` (staged + unstaged) so the user can see
-   exactly what will be committed.
-3. Propose a commit message and get explicit approval before running
-   `git commit`. Do not add a `Co-Authored-By: Claude` trailer unless asked.
-4. After committing, get explicit approval before running
-   `git push -u origin <branch>` (push the feature branch, never `main`).
-5. Once pushed, ask whether to merge into `main` now. On approval:
+1. Confirm we are NOT on `main` (`git branch --show-current`). If we are, stop.
+2. Run `/verify`. Don't continue on FAIL.
+3. Commit any remaining work with a conventional message (`feat: …`, `fix: …`, `chore: …`).
+   No `Co-Authored-By: Claude` trailer.
+4. `git push -u origin <branch>`. Then show what went out:
+   `git log --oneline --stat origin/main..HEAD`.
+5. Open the PR if none exists: `gh pr create --base main --title "<conventional title>" --body …`.
+   For an OpenSpec change, the body summarises its `proposal.md` and links the change folder.
+   No "Generated with Claude Code" line.
+6. `gh pr checks --watch --fail-fast`.
+   - Red: `gh run view --log-failed`, fix the cause on the branch, commit, push, watch again.
+     Never weaken a test, skip a check, or use `--admin` / `--no-verify` to get green.
+   - Same failure twice after a fix: stop and show the user the log.
+7. Green: show the PR URL and the checks, and ask whether to merge. On approval:
    ```
+   gh pr merge --merge --delete-branch
    git checkout main
    git pull origin main
-   git merge --no-ff <feature-branch>
-   git push origin main
    ```
-   Use a simple merge — no rebase or squash — unless the user explicitly
-   asks for one.
-6. After merging, ask whether to delete the merged feature branch (local and
-   remote).
+   Merge commit only; no rebase or squash unless the user explicitly asks.
+8. Confirm the CI run on `main` for the merge commit: `gh run list --branch main --limit 1`.

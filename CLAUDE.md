@@ -27,13 +27,13 @@ and MCP client (`mcp_client.py`, `AGENT_MCP_SERVERS`).
 - Lint: `uv run ruff check` (E9 + F only).
 
 ## Enforced by hooks (`.claude/hooks/`, wired in `.claude/settings.json`)
-- `guard_git.sh`: no commit on `main`, no force-push or rebase; every commit, push and merge asks for confirmation. Show the diff before asking, one step at a time.
+- `guard_git.sh`: no commit or push on `main`, no force-push, rebase, `--no-verify` or `gh pr merge --admin`; a push adding secret-looking files asks; every merge asks. Commits and feature-branch pushes run without asking (user decision, 2026-10-26).
 - `guard_deps.sh`: adding, removing or editing a dependency asks first.
 - `pin_openspec.sh`: a bare `openspec` is rewritten to `npx @fission-ai/openspec@1.14.1`.
 - `lint_py.sh` (after each edit) and `stop_tests.sh` (pytest before a turn ends).
 
 ## Git
-- Branch off up-to-date `main` (`feat/…`, `fix/…`, `chore/…`, `docs/…`). Merge back with `--no-ff`; no rebase or squash unless asked.
+- Branch off up-to-date `main` (`feat/…`, `fix/…`, `chore/…`, `docs/…`). Commit after each task group that passes `/verify`. `main` is protected on GitHub (PR + green `checks` required, no bypass); land work with `/finish-branch`. No rebase or squash unless asked.
 - No `Co-Authored-By: Claude` trailer on commits and no "Generated with Claude Code" line on PRs (user decision, 2026-10-13).
 
 ## Data
