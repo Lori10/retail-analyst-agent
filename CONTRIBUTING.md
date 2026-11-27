@@ -9,7 +9,7 @@ The rules themselves live elsewhere and are not repeated here:
 - [`CLAUDE.md`](CLAUDE.md) — constraints, build order, git rules.
 - [`openspec/config.yaml`](openspec/config.yaml) — what each artifact must contain.
 - [`.claude/skills/`](.claude/skills/) and [`.claude/commands/opsx/`](.claude/commands/opsx/) — what each command does.
-- [`.claude/settings.json`](.claude/settings.json) + [`.claude/hooks/`](.claude/hooks/) — the rules that are enforced, not just asked for (git gates, dependency gate, pinned openspec, ruff after edits, pytest before a turn ends).
+- [`.claude/settings.json`](.claude/settings.json) + [`.claude/hooks/`](.claude/hooks/) — the rules that are enforced, not just asked for (git gates, dependency gate, billed-run gate, pinned openspec, ruff after edits, pytest before a turn ends).
 
 ## The loop
 

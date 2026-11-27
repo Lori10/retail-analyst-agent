@@ -29,6 +29,7 @@ and MCP client (`mcp_client.py`, `AGENT_MCP_SERVERS`).
 ## Enforced by hooks (`.claude/hooks/`, wired in `.claude/settings.json`)
 - `guard_git.sh`: no commit or push on `main`, no force-push, rebase, `--no-verify` or `gh pr merge --admin`; a push adding secret-looking files asks; every merge asks. Commits and feature-branch pushes run without asking (user decision, 2026-10-26).
 - `guard_deps.sh`: adding, removing or editing a dependency asks first.
+- `guard_billed.sh`: live or billed runs ask first: `run_eval.py`, `approve_trio.py`, `pytest tests/integration`, `uv run retail-agent`/`retail-mcp`, loading `.env` or live keys into the shell, `bq`, `gcloud`.
 - `pin_openspec.sh`: a bare `openspec` is rewritten to `npx @fission-ai/openspec@1.14.1`.
 - `lint_py.sh` (after each edit) and `stop_tests.sh` (pytest before a turn ends).
 
